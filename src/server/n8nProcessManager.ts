@@ -8,6 +8,7 @@ import {
   type N8nProxyStatus,
   type N8nRuntimeConfig,
 } from './n8nConfig.ts';
+import { syncOrchestratorWorkflow } from '../orchestrator/workflowSync.ts';
 
 const HEALTH_POLL_INTERVAL_MS = 1000;
 const HEALTH_REQUEST_TIMEOUT_MS = 1500;
@@ -28,6 +29,7 @@ export class N8nProcessManager {
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private startPromise: Promise<void> | null = null;
+  private postBootSeedChecked = false;
 
   constructor(config: N8nRuntimeConfig, cwd: string) {
     this.config = config;
@@ -141,6 +143,23 @@ export class N8nProcessManager {
       this.error = 'n8n binary could not be located after runtime setup.';
       console.error(`[n8n-proxy] ${this.error}`);
       return;
+    }
+
+    try {
+      const syncResult = syncOrchestratorWorkflow({
+        cwd: this.cwd,
+        userFolder: this.config.userFolder,
+        overwriteExisting: false,
+      });
+      if (syncResult.imported) {
+        console.log(
+          `[n8n-proxy] Seeded workflow "${syncResult.workflowName}" (${syncResult.workflowId}, published=${syncResult.published})`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[n8n-proxy] Skipping automatic workflow seed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     this.spawnN8n(n8nBinary);
@@ -297,6 +316,28 @@ export class N8nProcessManager {
       const healthy = await this.probeHealth();
       if (healthy) {
         if (this.phase !== 'ready') {
+          if (!this.postBootSeedChecked) {
+            this.postBootSeedChecked = true;
+            try {
+              const postSync = syncOrchestratorWorkflow({
+                cwd: this.cwd,
+                userFolder: this.config.userFolder,
+                overwriteExisting: false,
+              });
+              if (postSync.imported) {
+                console.log(
+                  `[n8n-proxy] Post-init seeded workflow "${postSync.workflowName}" (${postSync.workflowId}, published=${postSync.published}); reloading n8n...`,
+                );
+                void this.restart();
+                return;
+              }
+            } catch (err) {
+              console.warn(
+                `[n8n-proxy] Post-init workflow check warning: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+
           this.phase = 'ready';
           this.readyAt = Date.now();
           this.error = null;

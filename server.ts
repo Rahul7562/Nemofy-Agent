@@ -28,6 +28,8 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
   changeOrigin: false,
   preserveHeaderKeyCase: true,
+  proxyTimeout: 600_000,
+  timeout: 600_000,
 });
 
 proxy.on('proxyReq', (proxyReq, req) => {
@@ -163,6 +165,7 @@ async function startServer(): Promise<void> {
   }
 
   const server = http.createServer(app);
+  server.requestTimeout = 600_000;
 
   server.on('upgrade', (req, socket: Duplex, head: Buffer) => {
     const requestUrl = req.url || '/';
