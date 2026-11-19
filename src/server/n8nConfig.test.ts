@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildN8nChildEnv,
   isForwardedHttps,
+  isHttpsProxyRequest,
   isInternalControlPath,
   normalizePublicBaseUrl,
   resolveN8nRuntimeConfig,
@@ -55,7 +56,7 @@ test('buildN8nChildEnv sets proxy-safe n8n environment variables', () => {
   assert.equal(env.N8N_PUSH_BACKEND, 'websocket');
 });
 
-test('rewriteSetCookieValue adapts SameSite and Secure to HTTP vs HTTPS', () => {
+test('rewriteSetCookieValue adapts SameSite, Secure, and Partitioned to HTTP vs HTTPS', () => {
   const raw = 'n8n-auth=abc123; Path=/; HttpOnly; SameSite=Lax; Secure';
   assert.equal(
     rewriteSetCookieValue(raw, false),
@@ -63,7 +64,7 @@ test('rewriteSetCookieValue adapts SameSite and Secure to HTTP vs HTTPS', () => 
   );
   assert.equal(
     rewriteSetCookieValue(raw, true),
-    'n8n-auth=abc123; Path=/; HttpOnly; SameSite=None; Secure',
+    'n8n-auth=abc123; Path=/; HttpOnly; SameSite=None; Secure; Partitioned',
   );
 });
 
@@ -75,10 +76,11 @@ test('stripFrameAncestorsFromCsp removes only frame-ancestors directive', () => 
   );
 });
 
-test('sanitizeProxyResponseHeaders removes X-Frame-Options, rewrites Location and cookies', () => {
+test('sanitizeProxyResponseHeaders removes X-Frame-Options/CORP, rewrites Location and cookies', () => {
   const headers = sanitizeProxyResponseHeaders(
     {
       'x-frame-options': 'SAMEORIGIN',
+      'cross-origin-resource-policy': 'same-origin',
       'content-security-policy': "default-src 'self'; frame-ancestors 'self'",
       location: 'http://127.0.0.1:5678/setup',
       'set-cookie': ['n8n-auth=tok; Path=/; HttpOnly; SameSite=Lax'],
@@ -90,18 +92,33 @@ test('sanitizeProxyResponseHeaders removes X-Frame-Options, rewrites Location an
   );
 
   assert.equal(headers['x-frame-options'], undefined);
+  assert.equal(headers['cross-origin-resource-policy'], undefined);
   assert.equal(headers['content-security-policy'], "default-src 'self'");
   assert.equal(headers.location, '/setup');
   assert.deepEqual(headers['set-cookie'], [
-    'n8n-auth=tok; Path=/; HttpOnly; SameSite=None; Secure',
+    'n8n-auth=tok; Path=/; HttpOnly; SameSite=None; Secure; Partitioned',
   ]);
 });
 
-test('isForwardedHttps handles single and comma-separated headers', () => {
+test('isForwardedHttps and isHttpsProxyRequest detect proxy HTTPS reliably', () => {
   assert.equal(isForwardedHttps({}), false);
   assert.equal(isForwardedHttps({ 'x-forwarded-proto': 'http' }), false);
   assert.equal(isForwardedHttps({ 'x-forwarded-proto': 'https' }), true);
   assert.equal(isForwardedHttps({ 'x-forwarded-proto': 'https, http' }), true);
+  assert.equal(isForwardedHttps({ forwarded: 'for=1.2.3.4;proto=https' }), true);
+
+  assert.equal(
+    isHttpsProxyRequest({ host: 'localhost:3000' }, 'https://ais-dev.run.app/'),
+    false,
+  );
+  assert.equal(
+    isHttpsProxyRequest({ host: 'ais-dev.run.app' }, 'https://ais-dev.run.app/'),
+    true,
+  );
+  assert.equal(
+    isHttpsProxyRequest({ origin: 'https://ais-dev.run.app' }, 'http://localhost:3000/'),
+    true,
+  );
 });
 
 test('shouldProxyRequestToN8n isolates control routes and waits for ready phase', () => {

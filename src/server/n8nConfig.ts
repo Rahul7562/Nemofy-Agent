@@ -117,10 +117,66 @@ export function buildN8nChildEnv(
 export function isForwardedHttps(
   headers: Record<string, string | string[] | undefined>,
 ): boolean {
-  const raw = headers['x-forwarded-proto'];
-  if (!raw) return false;
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  return value.split(',')[0].trim().toLowerCase() === 'https';
+  const rawProto = headers['x-forwarded-proto'] ?? headers['x-forwarded-scheme'];
+  if (rawProto) {
+    const value = Array.isArray(rawProto) ? rawProto[0] : rawProto;
+    if (value.split(',')[0].trim().toLowerCase() === 'https') {
+      return true;
+    }
+  }
+
+  const rawForwarded = headers.forwarded;
+  if (rawForwarded) {
+    const value = Array.isArray(rawForwarded) ? rawForwarded[0] : rawForwarded;
+    if (/proto=https\b/i.test(value)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isLocalHostname(hostHeader: string): boolean {
+  const normalized = hostHeader.trim().toLowerCase();
+  return (
+    normalized.startsWith('localhost') ||
+    normalized.startsWith('127.0.0.1') ||
+    normalized.startsWith('[::1]') ||
+    normalized.startsWith('0.0.0.0')
+  );
+}
+
+export function isHttpsProxyRequest(
+  headers: Record<string, string | string[] | undefined>,
+  publicBaseUrl?: string,
+): boolean {
+  if (isForwardedHttps(headers)) {
+    return true;
+  }
+
+  const origin = headers.origin;
+  const originStr = Array.isArray(origin) ? origin[0] : origin;
+  if (originStr && originStr.toLowerCase().startsWith('https://')) {
+    return true;
+  }
+
+  const referer = headers.referer;
+  const refererStr = Array.isArray(referer) ? referer[0] : referer;
+  if (refererStr && refererStr.toLowerCase().startsWith('https://')) {
+    return true;
+  }
+
+  const host = headers['x-forwarded-host'] ?? headers.host;
+  const hostStr = Array.isArray(host) ? host[0] : host;
+  if (
+    hostStr &&
+    !isLocalHostname(hostStr) &&
+    publicBaseUrl?.toLowerCase().startsWith('https://')
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 export function rewriteSetCookieValue(
@@ -137,12 +193,17 @@ export function rewriteSetCookieValue(
   const [nameValue, ...rawAttributes] = parts;
   const filteredAttributes = rawAttributes.filter((attr) => {
     const lower = attr.toLowerCase();
-    return lower !== 'secure' && !lower.startsWith('samesite=');
+    return (
+      lower !== 'secure' &&
+      lower !== 'partitioned' &&
+      !lower.startsWith('samesite=')
+    );
   });
 
   if (httpsRequest) {
     filteredAttributes.push('SameSite=None');
     filteredAttributes.push('Secure');
+    filteredAttributes.push('Partitioned');
   } else {
     filteredAttributes.push('SameSite=Lax');
   }
@@ -171,6 +232,7 @@ export function sanitizeProxyResponseHeaders(
   const next: Record<string, string | string[] | undefined> = { ...headers };
 
   delete next['x-frame-options'];
+  delete next['cross-origin-resource-policy'];
 
   if (typeof next['content-security-policy'] === 'string') {
     const cleaned = stripFrameAncestorsFromCsp(next['content-security-policy']);

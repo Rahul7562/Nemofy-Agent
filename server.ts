@@ -6,7 +6,11 @@ import path from 'node:path';
 import type { Duplex } from 'node:stream';
 import httpProxy from 'http-proxy';
 import {
-  isForwardedHttps,
+  appendAuthCookieHeader,
+  AuthCookieBridge,
+} from './src/server/authCookieBridge.ts';
+import {
+  isHttpsProxyRequest,
   resolveN8nRuntimeConfig,
   sanitizeProxyResponseHeaders,
   shouldProxyRequestToN8n,
@@ -16,6 +20,7 @@ import { N8nProcessManager } from './src/server/n8nProcessManager.ts';
 const cwd = process.cwd();
 const config = resolveN8nRuntimeConfig(process.env, cwd);
 const manager = new N8nProcessManager(config, cwd);
+const authCookieBridge = new AuthCookieBridge();
 
 const proxy = httpProxy.createProxyServer({
   target: config.targetOrigin,
@@ -30,10 +35,48 @@ proxy.on('proxyReq', (proxyReq, req) => {
   if (hostHeader) {
     proxyReq.setHeader('x-forwarded-host', hostHeader);
   }
+  if (isHttpsProxyRequest(req.headers, config.publicBaseUrl)) {
+    proxyReq.setHeader('x-forwarded-proto', 'https');
+  }
+
+  const fallbackToken = authCookieBridge.resolveFallbackTokenForHttp(req.headers);
+  if (fallbackToken) {
+    proxyReq.setHeader(
+      'cookie',
+      appendAuthCookieHeader(req.headers.cookie, fallbackToken),
+    );
+  }
+});
+
+proxy.on('proxyReqWs', (proxyReq, req) => {
+  const hostHeader = req.headers.host;
+  if (hostHeader) {
+    proxyReq.setHeader('x-forwarded-host', hostHeader);
+  }
+  if (isHttpsProxyRequest(req.headers, config.publicBaseUrl)) {
+    proxyReq.setHeader('x-forwarded-proto', 'https');
+  }
+
+  const fallbackToken = authCookieBridge.resolveFallbackTokenForWebSocket(
+    req.headers,
+    req.socket?.remoteAddress,
+  );
+  if (fallbackToken) {
+    proxyReq.setHeader(
+      'cookie',
+      appendAuthCookieHeader(req.headers.cookie, fallbackToken),
+    );
+  }
 });
 
 proxy.on('proxyRes', (proxyRes, req) => {
-  const httpsRequest = isForwardedHttps(req.headers);
+  authCookieBridge.recordResponseCookies(
+    proxyRes.headers['set-cookie'],
+    req.headers,
+    req.socket?.remoteAddress,
+  );
+
+  const httpsRequest = isHttpsProxyRequest(req.headers, config.publicBaseUrl);
   const sanitized = sanitizeProxyResponseHeaders(proxyRes.headers, {
     httpsRequest,
     targetOrigin: config.targetOrigin,
