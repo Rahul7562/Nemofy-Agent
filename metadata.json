@@ -1,0 +1,6 @@
+{
+  "name": "n8n Workflow Automation",
+  "description": "Self-hosted n8n workflow automation engine connected directly to the devserver web port.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

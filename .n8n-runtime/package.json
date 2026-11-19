@@ -1,0 +1,18 @@
+{
+  "name": "n8n-runtime",
+  "private": true,
+  "description": "Isolated runtime installation of n8n compatible with Node 22",
+  "dependencies": {
+    "n8n": "2.35.7"
+  },
+  "trustedDependencies": [
+    "sqlite3",
+    "better-sqlite3",
+    "esbuild",
+    "isolated-vm",
+    "msgpackr-extract",
+    "re2",
+    "sharp",
+    "canvas"
+  ]
+}
