@@ -1,0 +1,448 @@
+{
+  "id": "lgAgentGateway01",
+  "name": "LangGraph Autonomous AI Agent Gateway",
+  "active": true,
+  "nodes": [
+    {
+      "id": "sticky-lg-gateway",
+      "name": "Gateway Architecture Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        -340
+      ],
+      "parameters": {
+        "content": "## LangGraph Autonomous AI Agent Gateway (Native OpenAI Chat Model Selector)\n- **Pick Brain Model**: Click **`Brain LLM (OpenAI Chat Model)`** -> choose any n8n OpenAI-compatible credential (River AI, OpenAI, OpenRouter, Groq, Gemini, Ollama) -> pick any model from the live dropdown.\n- **Pick Sub-Agent Model**: Click **`Sub-Agent LLM (OpenAI Chat Model)`** -> choose any credential & model independently for isolated LangGraph sub-agents.\n- **Swap Provider Nodes**: You can even swap either node for any other n8n Chat Model node.\n- **Strict Separation**: n8n only reads the selected model & credential settings; all reasoning, tools, checkpoints, and HITL approvals run in Python LangGraph.",
+        "height": 240,
+        "width": 1680,
+        "color": 4
+      }
+    },
+    {
+      "id": "node-lg-chat-trigger",
+      "name": "Chat Trigger (Agent Gateway UI)",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -600,
+        -40
+      ],
+      "webhookId": "9c4e1a20-7b12-4d9f-a101-8841f0c0b001",
+      "parameters": {
+        "public": true,
+        "mode": "hostedChat",
+        "authentication": "none",
+        "availableInChat": true,
+        "agentName": "LangGraph Autonomous AI Agent Gateway",
+        "agentDescription": "Gateway forwarding tasks to the Python LangGraph Autonomous AI Agent using models selected in the native n8n OpenAI Chat Model nodes.",
+        "initialMessages": "Connected to the Python LangGraph Autonomous AI Agent Gateway. Select Brain & Sub-Agent models using the two OpenAI Chat Model nodes in n8n (or override per message with `/brain provider:model` and `/subagent provider:model`).",
+        "options": {
+          "responseMode": "lastNode",
+          "title": "LangGraph Autonomous AI Agent Gateway",
+          "subtitle": "n8n OpenAI Model Nodes -> Python LangGraph Brain & Sub-Agents"
+        }
+      }
+    },
+    {
+      "id": "node-lg-webhook-trigger",
+      "name": "Webhook Trigger (Agent Gateway API)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -600,
+        180
+      ],
+      "webhookId": "9c4e1a20-7b12-4d9f-a101-8841f0c0b002",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "langgraph-agent/run",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "node-lg-read-brain-llm",
+      "name": "Read Brain LLM",
+      "type": "@n8n/n8n-nodes-langchain.code",
+      "typeVersion": 1,
+      "position": [
+        -340,
+        70
+      ],
+      "notes": "Reads selected model, Base URL, credential API key & temperature from the connected Brain LLM OpenAI node.",
+      "parameters": {
+        "code": {
+          "execute": {
+            "code": "const inputItems = this.getInputData();\nconst firstJson = inputItems[0]?.json ? { ...inputItems[0].json } : {};\n\nlet llm = null;\ntry {\n  const connected = await this.getInputConnectionData('ai_languageModel', 0);\n  llm = Array.isArray(connected) ? connected[0] : connected;\n} catch (_err) {\n  llm = null;\n}\n\nconst inferProvider = (baseUrl) => {\n  const u = String(baseUrl || '').toLowerCase();\n  if (!u || u.includes('api.openai.com')) return 'openai';\n  if (u.includes('river.ai')) return 'river_ai';\n  if (u.includes('openrouter.ai')) return 'openrouter';\n  if (u.includes('generativelanguage.googleapis.com')) return 'gemini';\n  if (u.includes('groq.com')) return 'groq';\n  if (u.includes('deepseek.com')) return 'deepseek';\n  if (u.includes('together.xyz')) return 'together';\n  if (u.includes('fireworks.ai')) return 'fireworks';\n  if (u.includes('anthropic.com')) return 'anthropic';\n  if (u.includes('11434') || u.includes('ollama')) return 'ollama';\n  return 'custom';\n};\n\nconst pickStr = (...vals) => {\n  for (const v of vals) {\n    if (typeof v === 'string' && v.trim()) return v.trim();\n  }\n  return '';\n};\n\nlet extracted = null;\nif (llm && typeof llm === 'object') {\n  const cfg = llm.clientConfig || llm.configuration || llm.lc_kwargs?.configuration || {};\n  const model = pickStr(\n    llm.model,\n    llm.modelName,\n    llm.lc_kwargs?.model,\n    llm.lc_kwargs?.modelName\n  );\n  const baseUrl = pickStr(\n    cfg.baseURL,\n    cfg.baseUrl,\n    llm.baseURL,\n    llm.baseUrl,\n    llm.lc_kwargs?.baseURL,\n    llm.lc_kwargs?.baseUrl,\n    'https://api.openai.com/v1'\n  );\n  const apiKey = pickStr(\n    cfg.apiKey,\n    llm.apiKey,\n    llm.openAIApiKey,\n    llm.lc_kwargs?.apiKey,\n    llm.lc_kwargs?.openAIApiKey\n  );\n  const temperature =\n    typeof llm.temperature === 'number' && Number.isFinite(llm.temperature)\n      ? llm.temperature\n      : undefined;\n  const maxTokens =\n    typeof llm.maxTokens === 'number' && Number.isFinite(llm.maxTokens) && llm.maxTokens >= 64\n      ? Math.round(llm.maxTokens)\n      : undefined;\n  const reasoningEffort = pickStr(\n    llm.modelKwargs?.reasoning_effort,\n    llm.lc_kwargs?.modelKwargs?.reasoning_effort\n  );\n\n  extracted = {\n    provider: inferProvider(baseUrl),\n    ...(model ? { model } : {}),\n    ...(baseUrl ? { base_url: baseUrl } : {}),\n    ...(apiKey ? { api_key: apiKey } : {}),\n    ...(temperature !== undefined ? { temperature } : {}),\n    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),\n    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),\n  };\n}\n\nfirstJson._n8n_brain_llm = extracted;\nreturn [{ json: firstJson }];"
+          }
+        },
+        "inputs": {
+          "input": [
+            {
+              "type": "main",
+              "maxConnections": -1,
+              "required": true
+            },
+            {
+              "type": "ai_languageModel",
+              "maxConnections": 1,
+              "required": false
+            }
+          ]
+        },
+        "outputs": {
+          "output": [
+            {
+              "type": "main"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-lg-brain-openai",
+      "name": "Brain LLM (OpenAI Chat Model)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -340,
+        320
+      ],
+      "notes": "Select Brain (Supervisor) provider credential & model from dropdown.",
+      "notesInFlow": true,
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "deepseek-ai/DeepSeek-V4.1-Flash",
+          "cachedResultName": "deepseek-ai/DeepSeek-V4.1-Flash"
+        },
+        "responsesApiEnabled": false,
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 4096
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "riverAiOpenAi01",
+          "name": "River AI (OpenAI Compatible)"
+        }
+      }
+    },
+    {
+      "id": "node-lg-read-subagent-llm",
+      "name": "Read Sub-Agent LLM",
+      "type": "@n8n/n8n-nodes-langchain.code",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        70
+      ],
+      "notes": "Reads selected model, Base URL, credential API key & temperature from the connected Sub-Agent LLM OpenAI node.",
+      "parameters": {
+        "code": {
+          "execute": {
+            "code": "const inputItems = this.getInputData();\nconst firstJson = inputItems[0]?.json ? { ...inputItems[0].json } : {};\n\nlet llm = null;\ntry {\n  const connected = await this.getInputConnectionData('ai_languageModel', 0);\n  llm = Array.isArray(connected) ? connected[0] : connected;\n} catch (_err) {\n  llm = null;\n}\n\nconst inferProvider = (baseUrl) => {\n  const u = String(baseUrl || '').toLowerCase();\n  if (!u || u.includes('api.openai.com')) return 'openai';\n  if (u.includes('river.ai')) return 'river_ai';\n  if (u.includes('openrouter.ai')) return 'openrouter';\n  if (u.includes('generativelanguage.googleapis.com')) return 'gemini';\n  if (u.includes('groq.com')) return 'groq';\n  if (u.includes('deepseek.com')) return 'deepseek';\n  if (u.includes('together.xyz')) return 'together';\n  if (u.includes('fireworks.ai')) return 'fireworks';\n  if (u.includes('anthropic.com')) return 'anthropic';\n  if (u.includes('11434') || u.includes('ollama')) return 'ollama';\n  return 'custom';\n};\n\nconst pickStr = (...vals) => {\n  for (const v of vals) {\n    if (typeof v === 'string' && v.trim()) return v.trim();\n  }\n  return '';\n};\n\nlet extracted = null;\nif (llm && typeof llm === 'object') {\n  const cfg = llm.clientConfig || llm.configuration || llm.lc_kwargs?.configuration || {};\n  const model = pickStr(\n    llm.model,\n    llm.modelName,\n    llm.lc_kwargs?.model,\n    llm.lc_kwargs?.modelName\n  );\n  const baseUrl = pickStr(\n    cfg.baseURL,\n    cfg.baseUrl,\n    llm.baseURL,\n    llm.baseUrl,\n    llm.lc_kwargs?.baseURL,\n    llm.lc_kwargs?.baseUrl,\n    'https://api.openai.com/v1'\n  );\n  const apiKey = pickStr(\n    cfg.apiKey,\n    llm.apiKey,\n    llm.openAIApiKey,\n    llm.lc_kwargs?.apiKey,\n    llm.lc_kwargs?.openAIApiKey\n  );\n  const temperature =\n    typeof llm.temperature === 'number' && Number.isFinite(llm.temperature)\n      ? llm.temperature\n      : undefined;\n  const maxTokens =\n    typeof llm.maxTokens === 'number' && Number.isFinite(llm.maxTokens) && llm.maxTokens >= 64\n      ? Math.round(llm.maxTokens)\n      : undefined;\n  const reasoningEffort = pickStr(\n    llm.modelKwargs?.reasoning_effort,\n    llm.lc_kwargs?.modelKwargs?.reasoning_effort\n  );\n\n  extracted = {\n    provider: inferProvider(baseUrl),\n    ...(model ? { model } : {}),\n    ...(baseUrl ? { base_url: baseUrl } : {}),\n    ...(apiKey ? { api_key: apiKey } : {}),\n    ...(temperature !== undefined ? { temperature } : {}),\n    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),\n    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),\n  };\n}\n\nfirstJson._n8n_subagent_llm = extracted;\nreturn [{ json: firstJson }];"
+          }
+        },
+        "inputs": {
+          "input": [
+            {
+              "type": "main",
+              "maxConnections": -1,
+              "required": true
+            },
+            {
+              "type": "ai_languageModel",
+              "maxConnections": 1,
+              "required": false
+            }
+          ]
+        },
+        "outputs": {
+          "output": [
+            {
+              "type": "main"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node-lg-subagent-openai",
+      "name": "Sub-Agent LLM (OpenAI Chat Model)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -80,
+        320
+      ],
+      "notes": "Select Sub-Agent (Worker) provider credential & model from dropdown.",
+      "notesInFlow": true,
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "deepseek-ai/DeepSeek-V4.1-Flash",
+          "cachedResultName": "deepseek-ai/DeepSeek-V4.1-Flash"
+        },
+        "responsesApiEnabled": false,
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 2048
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "riverAiOpenAi01",
+          "name": "River AI (OpenAI Compatible)"
+        }
+      }
+    },
+    {
+      "id": "node-lg-validate-input",
+      "name": "Validate Input & Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        180,
+        70
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first()?.json ?? {};\nconst isWebhook =\n  item.body !== undefined ||\n  item.headers !== undefined ||\n  item.webhookUrl !== undefined;\n\nconst payload =\n  isWebhook && item.body && typeof item.body === 'object' ? item.body : item;\n\nconst pickString = (v) => {\n  if (typeof v === 'string') return v.trim();\n  if (typeof v === 'number' && Number.isFinite(v)) return String(v);\n  return '';\n};\n\nconst pickNumber = (v) => {\n  if (v === null || v === undefined || v === '') return undefined;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : undefined;\n};\n\n// Model configurations extracted from the two connected native n8n OpenAI Chat Model nodes\nconst n8nBrainNode =\n  item._n8n_brain_llm && typeof item._n8n_brain_llm === 'object'\n    ? item._n8n_brain_llm\n    : {};\nconst n8nSubagentNode =\n  item._n8n_subagent_llm && typeof item._n8n_subagent_llm === 'object'\n    ? item._n8n_subagent_llm\n    : {};\n\nlet rawTask =\n  pickString(payload.task) ||\n  pickString(payload.chatInput) ||\n  pickString(payload.prompt) ||\n  pickString(payload.message) ||\n  pickString(payload.query) ||\n  pickString(payload.input) ||\n  pickString(item.chatInput) ||\n  '';\n\n// Optional inline chat directives (highest precedence over n8n OpenAI nodes):\n//   /brain openrouter:anthropic/claude-3.7-sonnet\n//   /subagent openai:gpt-4o-mini\n//   /model openai:gpt-4o   (sets both brain & subagent)\nconst inlineBrain = {};\nconst inlineSub = {};\nconst parseModelSpecToken = (specToken) => {\n  const cleaned = pickString(specToken);\n  if (!cleaned) return {};\n  const colonIdx = cleaned.indexOf(':');\n  if (colonIdx > 0) {\n    const prov = cleaned.slice(0, colonIdx).trim().toLowerCase();\n    const mod = cleaned.slice(colonIdx + 1).trim();\n    return { ...(prov ? { provider: prov } : {}), ...(mod ? { model: mod } : {}) };\n  }\n  return { model: cleaned };\n};\n\nif (rawTask) {\n  rawTask = rawTask\n    .replace(/(?:^|\\s)\\/(?:brain|primary)\\s+([^\\s]+)/gi, (_, tok) => {\n      Object.assign(inlineBrain, parseModelSpecToken(tok));\n      return ' ';\n    })\n    .replace(/(?:^|\\s)\\/(?:subagent|worker)\\s+([^\\s]+)/gi, (_, tok) => {\n      Object.assign(inlineSub, parseModelSpecToken(tok));\n      return ' ';\n    })\n    .replace(/(?:^|\\s)\\/model\\s+([^\\s]+)/gi, (_, tok) => {\n      const parsed = parseModelSpecToken(tok);\n      Object.assign(inlineBrain, parsed);\n      if (!inlineSub.model && !inlineSub.provider) {\n        Object.assign(inlineSub, parsed);\n      }\n      return ' ';\n    })\n    .trim();\n}\n\nconst mergeRoleModel = (rolePrefix, payloadObj, inlineObj, n8nNodeCfg) => {\n  const obj = payloadObj && typeof payloadObj === 'object' ? payloadObj : {};\n  const nodeProvider = pickString(n8nNodeCfg.provider).toLowerCase();\n\n  const requestedProvider =\n    pickString(inlineObj.provider) ||\n    pickString(obj.provider) ||\n    pickString(payload[rolePrefix + '_provider']);\n\n  const provider = (requestedProvider || nodeProvider || '').toLowerCase();\n  const switchedAwayFromNodeProvider =\n    Boolean(requestedProvider) && Boolean(nodeProvider) && provider !== nodeProvider;\n\n  const model =\n    pickString(inlineObj.model) ||\n    pickString(obj.model) ||\n    pickString(payload[rolePrefix + '_model']) ||\n    pickString(n8nNodeCfg.model);\n\n  const explicitBaseUrl =\n    pickString(obj.base_url) ||\n    pickString(obj.baseUrl) ||\n    pickString(payload[rolePrefix + '_base_url']);\n\n  const base_url =\n    explicitBaseUrl || (switchedAwayFromNodeProvider ? '' : pickString(n8nNodeCfg.base_url));\n\n  const explicitApiKey =\n    pickString(obj.api_key) ||\n    pickString(obj.apiKey) ||\n    pickString(payload[rolePrefix + '_api_key']);\n\n  const api_key =\n    explicitApiKey || (switchedAwayFromNodeProvider ? '' : pickString(n8nNodeCfg.api_key));\n\n  const temperature =\n    pickNumber(obj.temperature) ??\n    pickNumber(payload[rolePrefix + '_temperature']) ??\n    pickNumber(n8nNodeCfg.temperature);\n\n  const max_tokens =\n    pickNumber(obj.max_tokens ?? obj.maxTokens) ??\n    pickNumber(payload[rolePrefix + '_max_tokens']) ??\n    pickNumber(n8nNodeCfg.max_tokens);\n\n  const reasoning_effort =\n    pickString(obj.reasoning_effort) ||\n    pickString(obj.reasoningEffort) ||\n    pickString(payload[rolePrefix + '_reasoning_effort']) ||\n    pickString(n8nNodeCfg.reasoning_effort);\n\n  const out = {};\n  if (provider) out.provider = provider;\n  if (model) out.model = model;\n  if (base_url) out.base_url = base_url;\n  if (api_key) out.api_key = api_key;\n  if (temperature !== undefined) out.temperature = temperature;\n  if (max_tokens !== undefined) out.max_tokens = Math.round(max_tokens);\n  if (reasoning_effort) out.reasoning_effort = reasoning_effort;\n  return Object.keys(out).length > 0 ? out : undefined;\n};\n\nconst primaryModelOverride = mergeRoleModel(\n  'brain',\n  payload.primary_model || payload.brain_model_config,\n  inlineBrain,\n  n8nBrainNode\n);\nconst workerModelOverride = mergeRoleModel(\n  'subagent',\n  payload.worker_model || payload.subagent_model_config,\n  inlineSub,\n  n8nSubagentNode\n);\n\nconst decision = pickString(payload.decision).toLowerCase();\nconst isResume = ['approve', 'reject', 'edit'].includes(decision);\n\nconst threadId =\n  pickString(payload.thread_id) ||\n  pickString(payload.threadId) ||\n  pickString(payload.sessionId) ||\n  pickString(item.sessionId) ||\n  ('n8n-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));\n\nconst maxTurnsRaw = Number(payload.max_turns ?? payload.maxTurns);\nconst maxTurns =\n  Number.isInteger(maxTurnsRaw) && maxTurnsRaw >= 1 && maxTurnsRaw <= 100\n    ? maxTurnsRaw\n    : undefined;\n\nlet isValid = true;\nlet validationError = '';\n\nif (isResume) {\n  if (!pickString(payload.thread_id) && !pickString(payload.threadId) && !pickString(payload.sessionId)) {\n    isValid = false;\n    validationError = 'thread_id is required when resuming an approval decision.';\n  }\n} else if (!rawTask) {\n  isValid = false;\n  validationError = 'Task is required. Provide a non-empty task, prompt, message, or chatInput.';\n} else if (rawTask.length > 32000) {\n  isValid = false;\n  validationError = 'Task exceeds maximum allowed length of 32,000 characters.';\n}\n\nconst endpoint = isResume ? 'resume' : 'run';\nconst requestBody = isResume\n  ? {\n      thread_id: threadId,\n      decision,\n      ...(payload.arguments && typeof payload.arguments === 'object'\n        ? { arguments: payload.arguments }\n        : {}),\n      ...(pickString(payload.reason) ? { reason: pickString(payload.reason) } : {}),\n      ...(primaryModelOverride ? { primary_model: primaryModelOverride } : {}),\n      ...(workerModelOverride ? { worker_model: workerModelOverride } : {}),\n    }\n  : {\n      task: rawTask,\n      thread_id: threadId,\n      ...(maxTurns !== undefined ? { max_turns: maxTurns } : {}),\n      ...(primaryModelOverride ? { primary_model: primaryModelOverride } : {}),\n      ...(workerModelOverride ? { worker_model: workerModelOverride } : {}),\n    };\n\n// Never include api_key in selected_models metadata\nconst sanitizeSummary = (cfg) =>\n  cfg\n    ? {\n        provider: cfg.provider || 'custom',\n        model: cfg.model || '',\n        base_url: cfg.base_url || '',\n      }\n    : null;\n\nreturn [\n  {\n    json: {\n      isValid,\n      validationError,\n      source: isWebhook ? 'webhook' : 'chat',\n      endpoint,\n      thread_id: threadId,\n      task: rawTask,\n      selected_models: {\n        brain: sanitizeSummary(primaryModelOverride),\n        subagent: sanitizeSummary(workerModelOverride),\n      },\n      requestBody,\n      startedAt: Date.now(),\n    },\n  },\n];"
+      }
+    },
+    {
+      "id": "node-lg-valid-if",
+      "name": "Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        420,
+        70
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-input-valid",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "node-lg-http-request",
+      "name": "Call Python LangGraph API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "=http://127.0.0.1:8100/agent/{{ $json.endpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lgAgentApiAuth01",
+          "name": "LangGraph Agent API Bearer Auth"
+        }
+      }
+    },
+    {
+      "id": "node-lg-format-response",
+      "name": "Format Agent Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const reqMeta = $('Validate Input & Session').first().json;\nconst raw = $input.first()?.json ?? {};\n\nconst statusCode = Number(raw.statusCode ?? raw.status ?? 200);\nconst body = raw.body && typeof raw.body === 'object' ? raw.body : raw;\nconst httpError = raw.error && typeof raw.error === 'object'\n  ? (raw.error.message || JSON.stringify(raw.error))\n  : typeof raw.error === 'string'\n    ? raw.error\n    : '';\n\nconst isHttpFailure =\n  (Number.isFinite(statusCode) && statusCode >= 400) ||\n  Boolean(httpError && !body.thread_id && !body.final_response);\n\nconst latencyMs = Math.max(0, Date.now() - (Number(reqMeta.startedAt) || Date.now()));\n\nif (isHttpFailure) {\n  const detail =\n    (typeof body.detail === 'string' && body.detail) ||\n    httpError ||\n    ('Python LangGraph API returned HTTP ' + statusCode);\n  return [\n    {\n      json: {\n        ok: false,\n        status: 'error',\n        http_status: Number.isFinite(statusCode) ? statusCode : 502,\n        thread_id: reqMeta.thread_id,\n        output: 'Gateway error: ' + detail,\n        text: 'Gateway error: ' + detail,\n        final_response: '',\n        plan: [],\n        active_skills: [],\n        turn_count: 0,\n        pending_approval: null,\n        error: detail,\n        latency_ms: latencyMs,\n      },\n    },\n  ];\n}\n\nconst agentStatus = String(body.status || 'completed');\nconst finalResponse = String(body.final_response || '');\nconst pendingApproval = body.pending_approval ?? null;\n\nlet displayText = finalResponse;\nif (agentStatus === 'awaiting_approval' && pendingApproval) {\n  displayText =\n    'Approval required before executing sensitive tool `' +\n    String(pendingApproval.tool_name || 'unknown') +\n    '`.\\n' +\n    'Thread ID: `' + String(body.thread_id || reqMeta.thread_id) + '`\\n' +\n    'Expected effect: ' + String(pendingApproval.expected_effect || '') + '\\n' +\n    'Arguments:\\n```json\\n' +\n    JSON.stringify(pendingApproval.arguments || {}, null, 2) +\n    '\\n```\\n' +\n    'Send `{ \"thread_id\": \"' +\n    String(body.thread_id || reqMeta.thread_id) +\n    '\", \"decision\": \"approve\" | \"reject\" | \"edit\" }` to continue.';\n}\n\nreturn [\n  {\n    json: {\n      ok: agentStatus !== 'error',\n      status: agentStatus,\n      http_status: Number.isFinite(statusCode) ? statusCode : 200,\n      thread_id: String(body.thread_id || reqMeta.thread_id),\n      output: displayText,\n      text: displayText,\n      final_response: finalResponse,\n      plan: Array.isArray(body.plan) ? body.plan : [],\n      active_skills: Array.isArray(body.active_skills) ? body.active_skills : [],\n      turn_count: Number(body.turn_count || 0),\n      pending_approval: pendingApproval,\n      subagent_reports: Array.isArray(body.subagent_reports) ? body.subagent_reports : [],\n      active_models: body.active_models ?? reqMeta.selected_models ?? null,\n      error: body.error ?? null,\n      latency_ms: latencyMs,\n    },\n  },\n];"
+      }
+    },
+    {
+      "id": "node-lg-format-validation-error",
+      "name": "Format Validation Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const reqMeta = $('Validate Input & Session').first().json;\nconst msg = String(reqMeta.validationError || 'Invalid input payload.');\nreturn [\n  {\n    json: {\n      ok: false,\n      status: 'validation_error',\n      http_status: 400,\n      thread_id: reqMeta.thread_id,\n      output: 'Validation error: ' + msg,\n      text: 'Validation error: ' + msg,\n      final_response: '',\n      plan: [],\n      active_skills: [],\n      turn_count: 0,\n      pending_approval: null,\n      error: msg,\n    },\n  },\n];"
+      }
+    }
+  ],
+  "connections": {
+    "Chat Trigger (Agent Gateway UI)": {
+      "main": [
+        [
+          {
+            "node": "Read Brain LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger (Agent Gateway API)": {
+      "main": [
+        [
+          {
+            "node": "Read Brain LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Brain LLM (OpenAI Chat Model)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Read Brain LLM",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Brain LLM": {
+      "main": [
+        [
+          {
+            "node": "Read Sub-Agent LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sub-Agent LLM (OpenAI Chat Model)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Read Sub-Agent LLM",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Sub-Agent LLM": {
+      "main": [
+        [
+          {
+            "node": "Validate Input & Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input & Session": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Call Python LangGraph API",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Validation Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Python LangGraph API": {
+      "main": [
+        [
+          {
+            "node": "Format Agent Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "versionId": "10b7f378-bcda-52b6-a587-9b826d171b5e"
+}

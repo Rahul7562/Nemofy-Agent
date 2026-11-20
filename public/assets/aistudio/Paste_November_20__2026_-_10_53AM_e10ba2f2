@@ -1,0 +1,1239 @@
+# PROJECT: Production-Grade Autonomous AI Agent
+## Sequential Phase-Based Implementation — LangGraph + Docker + n8n MCP
+
+Act as a senior AI systems architect, Python engineer, infrastructure engineer, and autonomous-agent developer.
+
+Your responsibility is to transform my existing repository into a fully functional, modular, production-grade multipurpose autonomous AI agent.
+
+**You MUST implement the entire project phase by phase, in the exact order specified below. Do not stop after presenting the architecture or generating example files. Complete every phase, including the final HARDCORE VERIFICATION AND DEBUGGING PHASE.**
+
+---
+
+# GLOBAL ARCHITECTURAL REQUIREMENTS
+
+## 1. Non-negotiable architecture
+
+Maintain strict separation between three systems:
+
+**BRAIN — LangGraph**
+- All reasoning, planning, reflection, decision-making, task decomposition, state transitions, sub-agent delegation, skill selection, and checkpointing.
+- Use `langgraph.graph.StateGraph`.
+- Implement cyclic Plan → Act → Observe → Reflect orchestration.
+- Never use deprecated `AgentExecutor` or legacy chain-based orchestration.
+
+**LOCAL HANDS — Docker Sandbox**
+- Code execution.
+- Python execution.
+- Bash and terminal commands.
+- File management.
+- Web browsing and page extraction.
+- Data processing.
+
+**SAAS ARM — n8n through MCP**
+- Gmail.
+- Google Sheets.
+- Google Calendar.
+- Slack.
+- Webhooks.
+- Other configured n8n integrations.
+
+n8n is strictly a remote MCP tool server and user-facing workflow gateway. It must NOT contain the agent's core reasoning or autonomous planning logic.
+
+## 2. Model requirements
+
+Use **DeepSeek V4.1 Flash through River AI** as the primary model.
+
+- Environment variable: `RIVER_AI_API`.
+- Verify the actual River AI API endpoint and exact supported model identifier.
+- Determine whether River AI supports the OpenAI-compatible interface and configure the adapter accordingly.
+- Never invent an API endpoint or silently substitute another model.
+- Keep the integration provider-agnostic.
+
+Configure:
+
+- `PRIMARY_MODEL`: DeepSeek V4.1 Flash through River AI.
+- `WORKER_MODEL`: Configurable, economical model for isolated workers and summarization.
+
+## 3. Preserve existing infrastructure
+
+This is an upgrade, not a fresh installation.
+
+Before modifying anything:
+
+- Inspect the repository thoroughly.
+- Inspect existing Docker containers, networks, volumes, and configurations.
+- Inspect the running n8n installation.
+- Inspect existing workflows and integration configurations.
+- Identify reusable components.
+
+**Critical preservation rules:**
+
+- Preserve all existing project functionality.
+- Preserve existing n8n workflows, credentials, and persistent data.
+- Do not recreate or replace the existing n8n instance.
+- Never delete existing volumes or containers unnecessarily.
+- Keep the n8n web interface port mapping exactly as it currently exists: **host 5678 → container 3000**.
+- Make additive changes wherever possible.
+- Back up configurations before necessary modifications.
+
+---
+
+# IMPLEMENTATION ROADMAP
+
+You MUST complete these phases sequentially.
+
+For every phase:
+
+1. Inspect the relevant existing implementation.
+2. Implement the required functionality.
+3. Perform phase-specific tests.
+4. Fix discovered issues.
+5. Record completed files, test results, and remaining limitations.
+6. Update `IMPLEMENTATION_STATUS.md`.
+7. Proceed automatically to the next phase.
+
+Do not wait for my confirmation between phases.
+
+If an external dependency or credential is unavailable, implement everything that can safely be completed, record the precise blocker, and continue with the remaining phases.
+
+Do not mark an incomplete feature as completed.
+
+---
+
+# PHASE 0 — REPOSITORY AUDIT AND ARCHITECTURAL PLANNING
+
+<description>Understand the existing environment before changing anything.</description>
+
+### Tasks
+
+1. Inspect the entire repository.
+2. Understand its existing architecture, Python environment, Docker setup, and deployment configuration.
+3. Identify the current n8n container, service configuration, volumes, port mappings, and networking.
+4. Inspect available existing workflows and determine how MCP connectivity can be introduced.
+5. Identify existing source code that can be reused.
+6. Identify potential dependency conflicts.
+7. Determine the correct architecture for connecting the Python agent to n8n.
+
+### Produce
+
+A proposed directory tree similar to:
+
+```text
+project/
+├── main.py
+├── src/
+│   ├── models.py
+│   ├── state.py
+│   ├── graph.py
+│   ├── planner.py
+│   ├── sandbox.py
+│   ├── subagents.py
+│   ├── skills.py
+│   ├── guardrails.py
+│   ├── api.py
+│   └── tools/
+│       ├── local.py
+│       └── mcp_n8n.py
+├── skills/
+│   ├── deep_research.md
+│   └── code_and_data.md
+├── workspace/
+├── data/
+├── tests/
+│   └── self_test.py
+├── Dockerfile.sandbox
+├── pyproject.toml
+├── .env.example
+├── .gitignore
+├── README.md
+└── IMPLEMENTATION_STATUS.md
+```
+
+Adapt it to the existing repository instead of forcing this exact structure.
+
+### Phase exit criteria
+
+- Repository architecture documented.
+- Existing infrastructure identified.
+- Preservation strategy established.
+- Implementation roadmap recorded.
+- No existing functionality unnecessarily modified.
+
+**After completing this phase, automatically begin Phase 1.**
+
+---
+
+# PHASE 1 — FOUNDATION, CONFIGURATION AND MODEL LAYER
+
+### Objective
+
+Create the foundational environment and establish reliable model connectivity.
+
+### Tasks
+
+Implement `src/models.py`.
+
+Requirements:
+
+1. Build a provider-agnostic chat model adapter.
+2. Configure River AI using `RIVER_AI_API`.
+3. Verify the DeepSeek V4.1 Flash model identifier.
+4. Support an OpenAI-compatible endpoint where available.
+5. Implement `PRIMARY_MODEL` and `WORKER_MODEL`.
+6. Add configurable request timeouts and error handling.
+7. Handle connection failures, rate limits, and invalid credentials.
+8. Never expose credentials in logs.
+9. Support changing providers through environment variables without restructuring the agent.
+
+Create or update:
+
+- `pyproject.toml`
+- `.env.example`
+- `.gitignore`
+
+Install compatible dependencies into the existing environment without unnecessarily breaking existing packages.
+
+### Phase exit criteria
+
+- Dependencies installed or documented if blocked.
+- Environment variables validated.
+- Primary model configuration implemented.
+- Worker model configuration implemented.
+- Actual model connectivity tested when credentials are available.
+- Configuration errors reported accurately.
+
+---
+
+# PHASE 2 — LANGGRAPH BRAIN, STATE AND DURABLE MEMORY
+
+### Objective
+
+Build the actual autonomous reasoning and orchestration engine.
+
+### Files
+
+- `src/state.py`
+- `src/graph.py`
+- `src/planner.py`
+
+### Tasks
+
+Implement a typed `AgentState` containing:
+
+- `messages`
+- `plan`
+- `active_skills`
+- `turn_count`
+- `pending_approval`
+
+Implement structured plans containing:
+
+- Step ID.
+- Description.
+- Execution status.
+- Tool or action.
+- Execution result.
+
+Use LangGraph `StateGraph` to implement:
+
+```text
+             USER INPUT
+                 |
+                 v
+                PLAN
+                 |
+                 v
+                 ACT
+                 |
+                 v
+              OBSERVE
+                 |
+                 v
+               REFLECT
+                 |
+         +-------+-------+
+         |               |
+       CONTINUE        COMPLETE
+         |               |
+         v               v
+        PLAN          RESPONSE
+```
+
+The agent must be able to:
+
+- Decompose requests into structured plans.
+- Choose appropriate tools.
+- Track completed and pending steps.
+- Reflect on execution results.
+- Recover from errors.
+- Re-plan when necessary.
+- Recognize task completion.
+- Maintain conversation context.
+
+### Durable checkpointing
+
+Use:
+
+`AsyncSqliteSaver`
+
+Database:
+
+`./data/checkpoints.db`
+
+Use `thread_id` to uniquely identify sessions.
+
+Support:
+
+- Persisting graph execution state.
+- Recovering interrupted tasks.
+- Resuming existing sessions.
+- Preserving pending approvals.
+- Surviving application restarts.
+
+### Context compaction
+
+Whenever a tool returns more than 4,000 characters:
+
+1. Save the complete raw result inside `/workspace/.logs/`.
+2. Use a safe timestamped filename.
+3. Return a concise summary and saved-file path to the model.
+4. Retain the original result for subsequent inspection.
+
+### Loop protection
+
+Implement configurable `MAX_TURNS`, default `30`, together with sensible tool retry and execution limits.
+
+### Phase exit criteria
+
+- LangGraph supervisor operational.
+- Typed state implemented.
+- Cyclic orchestration operational.
+- SQLite checkpointing functional.
+- Session pause/resume demonstrated.
+- Context compaction tested.
+- Maximum-turn enforcement tested.
+
+---
+
+# PHASE 3 — DYNAMIC SKILLS AND ISOLATED SUB-AGENTS
+
+### Objective
+
+Make the agent extensible and capable of delegating complex independent tasks.
+
+### A. Skill system — `src/skills.py`
+
+Store Markdown skills under `./skills/`.
+
+At startup, inject only the skill name and its one-line description into the supervisor prompt.
+
+Implement:
+
+`load_skill(name)`
+
+Load full instructions only when required.
+
+Create:
+
+**`deep_research.md`**
+
+Include:
+- Multi-source research.
+- Evidence evaluation.
+- Fact verification.
+- Source attribution.
+- Research synthesis.
+- Report generation.
+
+**`code_and_data.md`**
+
+Include:
+- Repository inspection.
+- Python programming.
+- Debugging.
+- Testing.
+- Data analysis.
+- Safe file operations.
+
+Allow additional skills to be installed by adding Markdown files without changing the orchestration engine.
+
+### B. Sub-agent system — `src/subagents.py`
+
+Implement:
+
+`spawn_subagent`
+
+Requirements:
+
+- Each worker runs an independent LangGraph execution.
+- Separate message history.
+- Independent task context.
+- Worker model by default.
+- Explicitly assigned tools and permissions.
+- Structured result returned to the supervisor.
+- No unnecessary transfer of the worker's full conversation history.
+
+Support independent tasks such as:
+
+- Deep web research.
+- Large repository inspection.
+- Code review.
+- Data analysis.
+- Documentation generation.
+
+The parent supervisor must retain overall orchestration and final decision-making authority.
+
+Sub-agents must inherit the same central safety restrictions and cannot bypass sensitive-operation approvals.
+
+### Phase exit criteria
+
+- Skill discovery works.
+- Dynamic skill loading works.
+- Both starter skills exist.
+- Additional Markdown skills are discoverable.
+- Sub-agents execute isolated tasks.
+- Structured reports return to the supervisor.
+- Tool permissions are restricted appropriately.
+
+---
+
+# PHASE 4 — DOCKER SANDBOX AND LOCAL EXECUTION TOOLS
+
+### Objective
+
+Give the agent reliable execution capabilities in an isolated environment.
+
+### Files
+
+- `src/sandbox.py`
+- `src/tools/local.py`
+- `Dockerfile.sandbox`
+
+### Docker requirements
+
+Use `python:3.12-slim` as the base image.
+
+Configure:
+
+- Persistent per-session containers.
+- Workspace mounting at `/workspace`.
+- CPU limits.
+- Memory limits.
+- Execution timeouts.
+- Container lifecycle management.
+- Failure detection and recovery.
+
+Install suitable common Python, data, and web libraries.
+
+Use Playwright inside the sandbox for headless browsing where appropriate.
+
+Do not expose the Docker socket to the agent's execution container.
+
+### Required local tools
+
+Implement:
+
+| Tool | Purpose |
+|---|---|
+| `bash_exec(command)` | Run shell commands |
+| `read_file(path)` | Read workspace files |
+| `write_file(path, content)` | Create/write files |
+| `edit_file(path, old_text, new_text)` | Modify existing files |
+| `list_dir(path)` | Inspect directories |
+| `web_fetch(url)` | Extract webpage content |
+
+Security requirements:
+
+- Restrict file operations to `/workspace`.
+- Reject path traversal.
+- Validate file operations.
+- Protect against command execution escaping the sandbox.
+- Enforce execution timeouts.
+- Handle container failures without crashing the supervisor.
+
+Web extraction should produce clean Markdown or accessibility-oriented text rather than excessive raw HTML.
+
+### Phase exit criteria
+
+- Sandbox starts successfully.
+- Python execution works.
+- Bash execution works.
+- Workspace read/write operations work.
+- Path traversal is rejected.
+- Timeouts work.
+- Web extraction works.
+- Resource restrictions are active.
+
+---
+
+# PHASE 5 — n8n MCP SAAS INTEGRATION
+
+### Objective
+
+Connect the autonomous agent to existing n8n workflows through MCP.
+
+### File
+
+`src/tools/mcp_n8n.py`
+
+Endpoint:
+
+```env
+N8N_MCP_URL=http://localhost:5678/mcp-server/http
+N8N_MCP_TOKEN=<configured-token>
+```
+
+Use:
+
+- Streamable HTTP transport.
+- `langchain-mcp-adapters`.
+- `MultiServerMCPClient`.
+- Bearer-token authentication.
+
+### Implementation
+
+1. Connect to the existing n8n MCP endpoint.
+2. Discover available tools.
+3. Cache tool schemas at startup.
+4. Apply optional `ALLOWED_N8N_TOOLS`.
+5. Expose approved tools to the LangGraph supervisor.
+6. Implement reconnection and timeouts.
+7. Handle n8n offline states gracefully.
+8. Preserve local agent functionality if MCP is unavailable.
+
+Integrations should include the existing configured workflows for:
+
+- Gmail.
+- Google Sheets.
+- Google Calendar.
+- Slack.
+- Webhooks.
+- Other explicitly permitted services.
+
+Do not assume that all n8n workflows are available as MCP tools. Verify actual tool discovery against the installed n8n version and configuration.
+
+### Important networking rule
+
+Verify how the Python service reaches n8n.
+
+Do not blindly use `localhost` between different Docker containers. Use the correct Docker service name or reachable network address.
+
+Preserve the original n8n web interface mapping:
+
+**5678 → 3000**
+
+### Phase exit criteria
+
+- MCP connection established where credentials and endpoint are available.
+- Tool discovery works.
+- Tool schemas are cached.
+- Allowlist filtering works.
+- Tool invocations work where test workflows are available.
+- Offline handling works.
+- Existing n8n instance remains intact.
+
+---
+
+# PHASE 6 — CENTRAL GUARDRAILS AND HUMAN APPROVAL SYSTEM
+
+### Objective
+
+Integrate safety restrictions into every path through which the agent can execute tools.
+
+### File
+
+`src/guardrails.py`
+
+Classify tools centrally.
+
+**SAFE**
+- Read-only workspace operations.
+- Directory listing.
+- Research.
+- Web fetching.
+- Other explicitly non-mutating operations.
+
+**SENSITIVE**
+- Sending emails.
+- Sending Slack messages.
+- External data modification.
+- Calendar event creation or modification.
+- Deletion operations.
+- Destructive shell commands.
+- External network mutations.
+- Other consequential external operations.
+
+Use LangGraph's `interrupt` mechanism.
+
+Before executing a sensitive operation:
+
+1. Pause execution.
+2. Display the exact tool name.
+3. Display complete JSON arguments.
+4. Explain the expected effect.
+5. Request `approve`, `reject`, or `edit`.
+6. Validate edited arguments.
+7. Present modified arguments for approval.
+8. Execute only after explicit approval.
+9. Resume from the checkpoint.
+
+Never execute a sensitive action before requesting approval.
+
+Approvals must apply to the actual action and arguments being executed. Do not allow a sub-agent or an alternative execution path to bypass the gate.
+
+Ensure rejected operations are never executed.
+
+### Phase exit criteria
+
+- Central tool classification works.
+- Sensitive actions interrupt graph execution.
+- Full arguments are displayed.
+- Approval works.
+- Rejection works.
+- Editing and reapproval work.
+- Checkpoint-based resume works.
+- Sub-agents cannot bypass guardrails.
+
+---
+
+# PHASE 7 — COMPLETE SUPERVISOR INTEGRATION
+
+### Objective
+
+Combine all previous systems into one operational autonomous agent.
+
+Connect:
+
+- Primary model.
+- Worker model.
+- LangGraph supervisor.
+- Structured plans.
+- Durable memory.
+- Context compaction.
+- Dynamic skills.
+- Isolated sub-agents.
+- Docker local tools.
+- n8n MCP tools.
+- Central guardrails.
+- Checkpoint/resume functionality.
+
+The supervisor must decide dynamically whether to:
+
+- Execute a local tool.
+- Use an n8n MCP integration.
+- Load a skill.
+- Spawn a sub-agent.
+- Ask for approval.
+- Re-plan.
+- Return a final answer.
+
+Do not force every request through every subsystem.
+
+Implement intelligent failure recovery and bounded retries.
+
+### Phase exit criteria
+
+Demonstrate actual tasks involving:
+
+1. Planning and executing multiple steps.
+2. Using local Docker tools.
+3. Loading a skill.
+4. Delegating a task.
+5. Calling an n8n MCP tool.
+6. Handling a failed tool.
+7. Pausing for sensitive-operation approval.
+8. Resuming a previously interrupted task.
+
+---
+
+# PHASE 8 — CLI, AUTHENTICATED API AND SESSION MANAGEMENT
+
+### Objective
+
+Make the complete agent usable through both terminal and HTTP interfaces.
+
+### A. Interactive CLI — `main.py`
+
+Use Python async execution and Rich.
+
+Display:
+
+- Model information.
+- Current thread ID.
+- Streaming responses.
+- Current plan.
+- Checklist progress.
+- Tool execution status.
+- Sub-agent activity.
+- Errors.
+- Approval prompts.
+
+Support:
+
+```bash
+python main.py
+python main.py --thread-id <existing_thread_id>
+```
+
+The CLI must be capable of resuming interrupted tasks.
+
+### B. FastAPI — `src/api.py`
+
+Implement:
+
+`POST /agent/run`
+
+Accept a task and optional `thread_id`.
+
+`GET /health`
+
+Return service and dependency status.
+
+Requirements:
+
+- Authentication using an environment-configured token.
+- Ongoing session continuity.
+- Checkpoint-based recovery.
+- Proper validation.
+- Structured responses.
+- Error handling.
+- No unauthenticated agent execution endpoint.
+
+Design the API so n8n can communicate with the Python agent reliably.
+
+### Phase exit criteria
+
+- CLI works.
+- Session resumption works.
+- Streaming and progress display work.
+- API starts successfully.
+- Authentication works.
+- Health endpoint reports dependency status.
+- Agent execution endpoint works.
+
+---
+
+# PHASE 9 — CREATE THE n8n AUTONOMOUS AGENT GATEWAY WORKFLOW
+
+<description>Integrate the completed Python agent into the existing n8n environment.</description>
+
+### Workflow name
+
+**LangGraph Autonomous AI Agent Gateway**
+
+Create this as a new workflow inside the existing n8n installation.
+
+Do not modify or replace existing workflows.
+
+### Workflow architecture
+
+```text
+User / Webhook / Chat Trigger
+              |
+              v
+          n8n Workflow
+              |
+              v
+        Input Validation
+              |
+              v
+        HTTP Request Node
+              |
+              v
+       Python LangGraph API
+              |
+              v
+        LangGraph Brain
+              |
+      +-------+--------+
+      |                |
+      v                v
+ Docker Sandbox     Skills/Subagents
+      |                |
+      +-------+--------+
+              |
+              v
+       Tool Selection
+              |
+              v
+         n8n MCP
+              |
+      +-------+---------+
+      |       |         |
+    Gmail   Sheets   Calendar
+              |
+              v
+       Structured Result
+              |
+              v
+        n8n Response
+```
+
+### Required functionality
+
+- Accept user tasks.
+- Accept or generate conversation/thread IDs.
+- Forward requests to the Python agent.
+- Preserve session continuity.
+- Return structured execution results.
+- Handle errors and API timeouts.
+- Support a practical user-facing interaction through the existing n8n interface.
+- Avoid exposing credentials in execution logs.
+
+The HTTP node must use the actual reachable address of the Python API.
+
+The Python agent independently connects to n8n through MCP to discover and invoke permitted workflows.
+
+**Do not create a second AI reasoning agent inside n8n.**
+
+### Phase exit criteria
+
+- Workflow actually exists in n8n.
+- Workflow is configured correctly.
+- Workflow activation status is verified.
+- User task reaches the Python API.
+- Python agent returns a result to n8n.
+- Thread ID continuity works.
+- Errors are handled.
+- Existing n8n workflows and web interface remain intact.
+
+---
+
+# PHASE 10 — DOCUMENTATION, DEPLOYMENT AND OPERATIONAL READINESS
+
+### Objective
+
+Make the system understandable, maintainable, and reproducible.
+
+Create or update:
+
+- `README.md`
+- `pyproject.toml`
+- `.env.example`
+- `.gitignore`
+- `Dockerfile.sandbox`
+
+Document:
+
+1. Complete architecture.
+2. Installation instructions.
+3. River AI configuration.
+4. Primary and worker model setup.
+5. Docker sandbox configuration.
+6. n8n MCP endpoint and authentication setup.
+7. Network configuration.
+8. Starting and stopping services.
+9. CLI usage.
+10. API usage.
+11. Adding new skills.
+12. Configuring MCP tool allowlists.
+13. Creating sub-agents.
+14. HITL approval and resume procedures.
+15. Session checkpointing and recovery.
+16. Troubleshooting.
+
+Include exact startup commands and configuration examples.
+
+Do not expose real credentials in documentation.
+
+### Phase exit criteria
+
+- Documentation is complete.
+- Configuration examples are accurate.
+- Startup instructions are tested.
+- Deployment dependencies are documented.
+- Existing infrastructure remains preserved.
+
+---
+
+# PHASE 11 — HARDCORE VERIFICATION, STRESS TESTING AND DEBUGGING
+
+<description>FINAL PHASE — This phase determines whether the entire project is actually complete.</description>
+
+<description>Do not treat successful code generation or successful application startup as proof of completion.</description>
+
+**This phase is mandatory and must be the final phase. Do not skip, shorten, or replace it with a basic smoke test.**
+
+At this stage, stop adding unnecessary features. Focus entirely on finding defects, debugging them, correcting them, and proving that the complete system works.
+
+Create a comprehensive automated test suite under `tests/`.
+
+Use pytest and pytest-asyncio where appropriate.
+
+## A. Static analysis and code quality
+
+Inspect every implemented module.
+
+Run appropriate tools for:
+
+- Syntax validation.
+- Python type checking.
+- Ruff linting.
+- Import validation.
+- Dependency consistency.
+- Configuration validation.
+- Dockerfile validation.
+- Security-sensitive code review.
+
+Check for:
+
+- Missing imports.
+- Circular imports.
+- Incorrect async usage.
+- Broken graph transitions.
+- Invalid state updates.
+- Incorrect checkpoint configuration.
+- Unbounded retries.
+- Resource leaks.
+- Unhandled exceptions.
+- Hardcoded credentials.
+- Unsafe path operations.
+- Improper cleanup.
+
+Fix every actionable defect.
+
+## B. Model integration verification
+
+Test:
+
+1. River AI connectivity.
+2. Primary model identifier.
+3. API authentication.
+4. Actual model responses.
+5. Worker model configuration.
+6. Invalid API keys.
+7. Connection timeouts.
+8. Rate limits and provider errors.
+9. Missing or incorrect model configuration.
+
+Never treat a mocked model response as proof of real provider connectivity.
+
+When the River AI credentials are unavailable, report that limitation clearly.
+
+## C. LangGraph brain verification
+
+Run tests covering:
+
+- Plan → Act → Observe → Reflect cycles.
+- Conditional routing.
+- Structured plans.
+- Plan status updates.
+- Tool selection.
+- Multiple-step tasks.
+- Replanning.
+- Failed-tool recovery.
+- `MAX_TURNS`.
+- Context compaction.
+- Session isolation.
+- Session restart and recovery.
+
+Verify that completed steps do not accidentally execute again after checkpoint resumption.
+
+## D. Docker sandbox security and reliability
+
+Test:
+
+- Container startup.
+- Python execution.
+- Bash execution.
+- Workspace file creation.
+- File editing.
+- File reading.
+- Directory listing.
+- Path traversal attempts.
+- Absolute path attacks.
+- Symbolic-link escape attempts.
+- Command timeouts.
+- Memory and CPU restrictions.
+- Container termination.
+- Container recovery.
+- Concurrent session isolation.
+
+Try deliberately malformed and malicious inputs.
+
+The agent must not escape its permitted workspace through local file tools or execute commands outside the intended sandbox boundaries.
+
+Distinguish between Docker container isolation and application-level file restrictions; verify both.
+
+## E. Sub-agent verification
+
+Test:
+
+- Worker creation.
+- Independent worker state.
+- Independent conversation history.
+- Worker model selection.
+- Tool permission restrictions.
+- Structured report generation.
+- Worker failure recovery.
+- Multiple delegated tasks.
+- Parent agent control.
+- Guardrail inheritance.
+
+Ensure workers cannot obtain unrestricted access to tools that were not assigned to them.
+
+## F. Skills verification
+
+Test:
+
+- Skill directory scanning.
+- Skill metadata extraction.
+- Compact skill catalog injection.
+- Dynamic loading.
+- Invalid skill names.
+- Missing skill files.
+- Malformed Markdown.
+- Additional user-created skills.
+
+Verify that full skill instructions are not unnecessarily loaded at startup.
+
+## G. n8n MCP integration verification
+
+Connect to the actual existing n8n MCP server.
+
+Verify:
+
+- Correct endpoint.
+- Streamable HTTP transport.
+- Bearer authentication.
+- Tool discovery.
+- Tool schema correctness.
+- Schema caching.
+- Allowlist filtering.
+- Tool invocation.
+- Timeout handling.
+- Reconnection.
+- Offline behaviour.
+
+Test a harmless read-only integration first.
+
+Use an explicitly configured test workflow for writes, if available, and require the appropriate approval.
+
+Do not fabricate MCP connection results if the server is unreachable.
+
+## H. HARDCORE HITL verification
+
+This is one of the most important parts.
+
+Run real graph tests for:
+
+**Scenario 1 — Approval**
+
+- Submit a task requiring a sensitive tool.
+- Confirm that the graph pauses before execution.
+- Verify the exact tool name and JSON arguments.
+- Approve it.
+- Resume from the existing checkpoint.
+- Verify that the action executes exactly once.
+
+**Scenario 2 — Rejection**
+
+- Trigger another sensitive operation.
+- Reject it.
+- Verify that the operation is never executed.
+- Verify that the graph continues or terminates correctly.
+
+**Scenario 3 — Edited arguments**
+
+- Trigger a sensitive operation.
+- Edit its arguments.
+- Ensure validation occurs.
+- Ensure the edited arguments are displayed again.
+- Require approval for the modified action.
+- Verify that only the approved arguments are executed.
+
+**Scenario 4 — Restart during approval**
+
+- Trigger a pending approval.
+- Stop the application.
+- Restart it.
+- Resume using the original thread ID.
+- Verify that the approval state is recovered correctly.
+
+**Scenario 5 — Sub-agent safety**
+
+- Have a sub-agent request a sensitive operation.
+- Verify that the central approval mechanism catches it.
+- Confirm that the sub-agent cannot bypass approval.
+
+Any failure in these tests must be fixed before declaring completion.
+
+## I. n8n gateway end-to-end testing
+
+Test the actual workflow:
+
+1. Trigger the gateway through its configured input.
+2. Verify input validation.
+3. Verify thread ID creation or preservation.
+4. Verify the HTTP request reaches the Python API.
+5. Verify LangGraph receives the task.
+6. Verify local and MCP tool routing.
+7. Verify response propagation to n8n.
+8. Verify timeout and API error handling.
+9. Verify a follow-up request resumes the same conversation.
+
+Confirm that the workflow exists and its actual activation state is correctly reported.
+
+## J. Failure injection and resilience testing
+
+Deliberately simulate:
+
+- River AI becoming unavailable.
+- n8n becoming unavailable.
+- Docker container termination.
+- Invalid MCP responses.
+- Invalid tool arguments.
+- Malformed user input.
+- Empty model responses.
+- Model timeouts.
+- Tool execution timeouts.
+- Corrupted or unavailable checkpoint storage.
+- Duplicate requests.
+- Interrupted executions.
+
+Verify that the system fails safely and reports meaningful errors.
+
+Local execution must remain available when n8n is offline.
+
+## K. Resource and concurrency testing
+
+Test:
+
+- Multiple independent thread IDs.
+- Concurrent agent sessions within configured resource limits.
+- Docker session separation.
+- SQLite checkpoint behaviour under the application's expected concurrency.
+- Memory growth during long-running tasks.
+- Context growth and compaction.
+- Container cleanup.
+
+Identify practical limitations and fix resource leaks or concurrency defects.
+
+## L. Regression testing and infrastructure preservation
+
+Compare the final environment against the Phase 0 audit.
+
+Verify:
+
+- Original n8n instance remains intact.
+- Original n8n credentials and persistent volumes remain intact.
+- Existing workflows remain intact.
+- Existing web interface is accessible.
+- The `5678 → 3000` mapping is unchanged.
+- Existing project functionality still works.
+- No unrelated services were unnecessarily modified.
+
+## M. Final debugging loop
+
+Use this mandatory process:
+
+```text
+RUN TESTS
+    |
+    v
+COLLECT FAILURES
+    |
+    v
+IDENTIFY ROOT CAUSES
+    |
+    v
+FIX IMPLEMENTATION
+    |
+    v
+RERUN FAILED TESTS
+    |
+    v
+RUN REGRESSION TESTS
+    |
+    v
+REPEAT UNTIL STABLE
+```
+
+Do not hide failures by weakening tests, skipping assertions, replacing real integrations with mocks, or changing expected results merely to make the test suite pass.
+
+Prioritize fixing root causes rather than adding superficial workarounds.
+
+If a problem depends on an unavailable external service or credential, isolate that as a clearly documented external blocker and continue validating all locally testable functionality.
+
+### Final acceptance conditions
+
+The project can only be declared complete when:
+
+- The LangGraph brain operates correctly.
+- The primary model is correctly configured.
+- The Docker execution layer works.
+- Skills load dynamically.
+- Sub-agents execute in isolated contexts.
+- n8n MCP tool discovery and invocation work.
+- Central HITL enforcement works.
+- Durable checkpoint recovery works.
+- The CLI operates.
+- The authenticated API operates.
+- The n8n gateway workflow actually communicates with the agent.
+- Existing infrastructure is preserved.
+- The complete regression test suite passes, excluding only explicitly documented external blockers.
+
+### Final deliverable
+
+Produce a detailed `FINAL_VERIFICATION_REPORT.md` containing:
+
+| Category | Required information |
+|---|---|
+| Model | Provider, model identifier, actual connection result |
+| LangGraph | Graph execution, state and checkpoint tests |
+| Docker | Execution, isolation, limits and recovery |
+| Sub-agents | Isolation, delegation and permission tests |
+| Skills | Discovery and dynamic loading |
+| n8n MCP | Connection, discovery and invocation |
+| HITL | Approve, reject, edit and resume |
+| API | Authentication and endpoint verification |
+| CLI | Execution and session recovery |
+| Gateway | Actual workflow and end-to-end results |
+| Security | Vulnerabilities found and fixes |
+| Regression | Existing infrastructure preservation |
+| Performance | Resource and concurrency findings |
+
+Include:
+- Tests executed.
+- Passed tests.
+- Failed tests.
+- Fixes applied.
+- Remaining blockers.
+- Actual service status.
+- Exact reproduction commands.
+
+**Never report 100% success unless the evidence supports it.**
+
+---
+
+# GLOBAL EXECUTION RULES
+
+These rules apply to every phase.
+
+1. Work directly inside my existing repository.
+2. Complete phases sequentially and automatically.
+3. Do not stop after planning or generating a directory tree.
+4. Do not ask for confirmation between ordinary implementation phases.
+5. Validate each phase before moving forward.
+6. Preserve existing configurations and functionality.
+7. Do not create duplicate services unnecessarily.
+8. Use current, compatible LangGraph and MCP APIs.
+9. Use strict Python type hints and clear error handling.
+10. Implement real functionality rather than placeholders.
+11. Never fabricate successful installations, integrations, or tests.
+12. Keep an updated `IMPLEMENTATION_STATUS.md` throughout the project.
+13. Avoid unnecessary abstractions, dependencies, and complexity.
+14. Prioritize security, maintainability, fault tolerance, and correctness.
+15. Require runtime approval for sensitive actions, regardless of which component initiates them.
+
+## FINAL COMPLETION DIRECTIVE
+
+Your task is to finish ALL 12 phases, from Phase 0 through Phase 11.
+
+The final phase MUST be the HARDCORE VERIFICATION, STRESS TESTING AND DEBUGGING PHASE.
+
+Do not consider the project complete merely because the code has been generated, the application starts, or individual features appear to work.
+
+The objective is a genuinely integrated autonomous agent in which the LangGraph brain, Docker execution environment, dynamic skills, isolated sub-agents, n8n MCP integrations, safety mechanisms, API, CLI, and new n8n gateway workflow all operate together.
+
+**Build → Integrate → Test → Debug → Verify → Deliver.**

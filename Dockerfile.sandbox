@@ -1,0 +1,62 @@
+# Phase 4: Isolated Docker Sandbox Image for Local Hands
+# Base image: python:3.12-slim (no Docker socket, non-root user, workspace mounted at /workspace)
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# System packages required for Python data tools, bash utilities, and headless Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    procps \
+    ripgrep \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install common Python, data processing, web extraction, and Playwright libraries
+RUN pip install --upgrade pip && pip install \
+    numpy \
+    pandas \
+    scipy \
+    httpx \
+    beautifulsoup4 \
+    markdownify \
+    lxml \
+    pydantic \
+    pytest \
+    playwright
+
+# Install headless Chromium browser for Playwright inside the sandbox
+RUN playwright install chromium && chmod -R a+rx /ms-playwright
+
+# Create unprivileged sandbox user and /workspace mountpoint
+RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
+    && mkdir -p /workspace /workspace/.logs \
+    && chown -R agent:agent /workspace /home/agent
+
+USER agent
+WORKDIR /workspace
+
+# Keep per-session container alive for persistent exec calls without exposing privileged ports
+CMD ["sleep", "infinity"]

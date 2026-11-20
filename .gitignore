@@ -9,3 +9,15 @@ coverage/
 .n8n-data/
 .n8n-runtime/node_modules/
 
+# Python & Agent Runtime
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+data/
+workspace/
+.playwright-cli/

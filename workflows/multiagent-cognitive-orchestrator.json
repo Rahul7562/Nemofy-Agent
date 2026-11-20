@@ -213,8 +213,8 @@
       },
       "credentials": {
         "openAiApi": {
-          "id": "riverAiCredV4101",
-          "name": "River AI"
+          "id": "riverAiOpenAi01",
+          "name": "River AI (OpenAI Compatible)"
         }
       }
     },
