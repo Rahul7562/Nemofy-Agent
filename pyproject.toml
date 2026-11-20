@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "autonomous-langgraph-agent"
-version = "1.0.0"
-description = "Production-grade multipurpose autonomous AI agent powered by LangGraph, Docker Sandbox, and n8n MCP."
+name = "nemofy-agent-core"
+version = "2.0.0"
+description = "Pure-Python autonomous AI agent core powered by LangGraph, Docker Sandbox, Skills, and direct MCP servers."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -36,16 +36,13 @@ dev = [
     "mypy>=1.13.0,<2.0.0",
 ]
 
-[project.scripts]
-autonomous-agent = "main:cli_entrypoint"
-
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["Agent-Core", "."]
+include = ["agent_core*", "MCPs*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+testpaths = ["Agent-Core/tests"]
+pythonpath = ["Agent-Core", "."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
@@ -55,20 +52,20 @@ filterwarnings = [
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests", "main.py"]
+src = ["Agent-Core", "MCPs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "ASYNC", "S"]
 ignore = [
-    "E501",     # code line-length enforced by ruff format; allows readable regexes/prompts/URLs
-    "S101",     # assert allowed in tests
-    "S603",     # controlled subprocess usage in sandbox
-    "S607",     # controlled executable resolution
-    "ASYNC109", # timeout parameter required in bash_exec tool and sandbox command API
+    "E501",
+    "S101",
+    "S603",
+    "S607",
+    "ASYNC109",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S105", "S106", "S108", "S311"]
+"Agent-Core/tests/*" = ["S105", "S106", "S108", "S311"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -77,4 +74,4 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 check_untyped_defs = true
 ignore_missing_imports = true
-exclude = ["^\\.n8n-runtime/", "^node_modules/", "^dist/", "^\\.venv/"]
+exclude = ["^node_modules/", "^dist/", "^\\.venv/", "^Nemofy Agent/"]

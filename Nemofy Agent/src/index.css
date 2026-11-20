@@ -1,0 +1,69 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Nemofy Brand Design System (synced with https://nemofy.tech/) */
+:root {
+  --paper: #ffffff;
+  --paper-raised: #ffffff;
+  --paper-sunk: #f4f7fa;
+  --ink: #161c2d;
+  --ink-soft: #5a6474;
+  --ink-faint: #8c95a4;
+  --rule: #e7e9ed;
+  --rule-strong: #cfd5df;
+  --signal: #473bf0;
+  --signal-hover: #372bd6;
+  --blush: #eef0ff;
+  --flare: #f64b4b;
+  --honey: #f59e0b;
+  --jade: #10b981;
+  --iris: #7c3aed;
+  --font-display: 'Outfit', system-ui, -apple-system, sans-serif;
+  --font-body: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.dark {
+  --paper: #0b0f19;
+  --paper-raised: #131926;
+  --paper-sunk: #182032;
+  --ink: #f8fafc;
+  --ink-soft: #94a3b8;
+  --ink-faint: #64748b;
+  --rule: rgba(255, 255, 255, 0.09);
+  --rule-strong: rgba(255, 255, 255, 0.18);
+  --signal: #635bff;
+  --signal-hover: #7c75ff;
+  --blush: #1e2438;
+  --flare: #f87171;
+  --honey: #fbbf24;
+  --jade: #34d399;
+  --iris: #a78bfa;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+}

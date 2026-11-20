@@ -3,16 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>n8n Workflow Automation</title>
-    <meta name="description" content="Self-hosted n8n workflow automation engine connected directly to the devserver web port." />
-    <meta property="og:title" content="n8n Workflow Automation" />
-    <meta property="og:description" content="Self-hosted n8n workflow automation engine connected directly to the devserver web port." />
+    <title>Nemofy Agent</title>
+    <meta
+      name="description"
+      content="Nemofy Agent — Protected pure-Python autonomous AI agent workspace with Chat, Filesystem, and dual-model LLM configuration."
+    />
+    <meta property="og:title" content="Nemofy Agent" />
+    <meta
+      property="og:description"
+      content="Protected pure-Python autonomous AI agent workspace synced with Nemofy design."
+    />
     <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('nemofy_theme');
+          var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (saved === 'dark' || (!saved && prefersDark)) {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

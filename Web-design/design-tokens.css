@@ -1,0 +1,48 @@
+/* Nemofy Design System Tokens — Synchronized with https://nemofy.tech/ */
+
+:root {
+  color-scheme: light;
+  --paper: #ffffff;
+  --paper-raised: #ffffff;
+  --paper-sunk: #f4f7fa;
+  --paper-glass: rgba(255, 255, 255, 0.88);
+  --ink: #161c2d;
+  --ink-soft: #5a6474;
+  --ink-faint: #8c95a4;
+  --rule: #e7e9ed;
+  --rule-strong: #cfd5df;
+  --signal: #473bf0;
+  --signal-hover: #3b2fd6;
+  --on-signal: #ffffff;
+  --blush: #eef0ff;
+  --flare: #f64b4b;
+  --honey: #f59e0b;
+  --jade: #10b981;
+  --iris: #7c3aed;
+  --plate-shadow: rgba(22, 28, 45, 0.08);
+  --bench-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --bench-dur: 0.18s;
+  --bench-radius: 16px;
+}
+
+.dark {
+  color-scheme: dark;
+  --paper: #0b0f19;
+  --paper-raised: #131926;
+  --paper-sunk: #182032;
+  --paper-glass: rgba(11, 15, 25, 0.85);
+  --ink: #f8fafc;
+  --ink-soft: #94a3b8;
+  --ink-faint: #64748b;
+  --rule: rgba(255, 255, 255, 0.09);
+  --rule-strong: rgba(255, 255, 255, 0.18);
+  --signal: #635bff;
+  --signal-hover: #766fff;
+  --on-signal: #ffffff;
+  --blush: #1e2438;
+  --flare: #f87171;
+  --honey: #fbbf24;
+  --jade: #34d399;
+  --iris: #a78bfa;
+  --plate-shadow: rgba(0, 0, 0, 0.45);
+}

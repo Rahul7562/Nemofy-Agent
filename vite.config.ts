@@ -6,7 +6,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    base: '/_n8n_proxy/boot/',
+    base: '/',
     plugins: [
       react(),
       tailwindcss(),
