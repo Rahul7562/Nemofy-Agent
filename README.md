@@ -248,33 +248,49 @@ curl -s -X POST http://127.0.0.1:8100/agent/resume \
   -d '{"thread_id": "session-101", "decision": "approve"}'
 ```
 
-### Trigger via n8n Gateway Workflow Webhook & Native OpenAI Model Selection
+### Trigger via n8n Gateway Workflow, Native Model Selection, Heartbeat Watchdog & Plug-and-Play Canvas Slots
 
-You can select or switch the **Brain (supervisor)** and **Sub-Agent (worker)** LLMs directly from n8n across any OpenAI-compatible provider (`river_ai`, `openai`, `openrouter`, `gemini`, `groq`, `deepseek`, `together`, `fireworks`, `ollama`, `vllm`, or any custom `base_url`) in three ways:
+The `"LangGraph Autonomous AI Agent Gateway"` workflow (`lgAgentGateway01`) uses an asynchronous **Heartbeat + Stall Watchdog** job protocol (`/agent/jobs/create` -> `/agent/jobs/{id}/start` -> long-poll `GET /agent/jobs/{id}` -> `/agent/jobs/{id}/tool-result`) so long-running multi-step tasks never fail with an arbitrary `120000ms` HTTP timeout while the agent is actively making progress. Execution only aborts with `status: "stalled"` if the agent makes zero forward progress for `AGENT_STALL_TIMEOUT_SECONDS` (default `180s`, overridable per request via `stall_timeout_seconds`).
 
-1. **Native n8n OpenAI Chat Model Nodes (Visual Dropdown)**: Open `"LangGraph Autonomous AI Agent Gateway"` in n8n and click:
-   - **`Brain LLM (OpenAI Chat Model)`** -> pick any n8n OpenAI-compatible credential (e.g., `River AI (OpenAI Compatible)`, OpenAI, OpenRouter, Groq, Ollama) and choose your Brain model from the live dropdown.
+Open `"LangGraph Autonomous AI Agent Gateway"` in n8n to plug in models, skills, and MCP servers visually:
+
+1. **Brain & Sub-Agent LLM Slots (`ai_languageModel`)**:
+   - **`Brain LLM (OpenAI Chat Model)`** -> pick any n8n OpenAI-compatible credential (e.g., `River AI (OpenAI Compatible)`, OpenAI, OpenRouter, Groq, Ollama) and choose your Brain model from the dropdown.
    - **`Sub-Agent LLM (OpenAI Chat Model)`** -> pick any credential & model independently for isolated LangGraph sub-agents.
-2. **Inline Chat Directives**: Prefix any message in the n8n Chat Trigger with `/brain provider:model` and/or `/subagent provider:model` (or `/model provider:model`).
-3. **Webhook / API JSON Payload**:
+2. **Plug-and-Play Skills Slot (`ai_document`, unlimited connections)**:
+   - Wire any number of n8n **`Default Data Loader`** nodes (`typeVersion: 1.1`, e.g., the pre-wired **`Skill: Executive Brief`**) into **`Read Canvas Skills`**.
+   - Put YAML frontmatter (`name` + `description`) and Markdown instructions in the node's Custom Data text; LangGraph automatically exposes them alongside `./skills/*.md` via `load_skill` (tagged `[n8n canvas]`).
+3. **Plug-and-Play MCP Servers Slot (`ai_tool`, unlimited connections)**:
+   - Wire any number of n8n **`MCP Client Tool`** nodes (e.g., the pre-wired **`MCP Server: n8n Canvas`**) or other n8n AI Tool nodes directly into **`Agent Heartbeat & MCP Bridge`**.
+   - When the LangGraph Brain or a Sub-Agent calls any connected canvas MCP tool, the job pauses only that tool call, emits `pending_tool_call` on the active heartbeat poll, n8n executes the live authenticated MCP tool, and posts the result back to `/agent/jobs/{id}/tool-result`.
+4. **Inline Chat Directives & Webhook JSON Overrides**:
+   - Prefix any Chat Trigger message with `/brain provider:model` and/or `/subagent provider:model` (or `/model provider:model`).
+   - Or call the webhook directly:
 ```bash
 curl -s -X POST http://127.0.0.1:5678/webhook/langgraph-agent/run \
   -H "Content-Type: application/json" \
   -d '{
     "task": "Inspect /workspace and summarize active n8n workflows",
     "thread_id": "n8n-session-01",
+    "stall_timeout_seconds": 180,
     "primary_model": { "provider": "openrouter", "model": "anthropic/claude-3.7-sonnet" },
     "worker_model": { "provider": "openai", "model": "gpt-4o-mini" }
   }'
 ```
 
-Inspect available provider presets at `GET http://127.0.0.1:8100/models/presets`.
+Inspect available provider presets at `GET http://127.0.0.1:8100/models/presets`, or run the live 6-task end-to-end accuracy benchmark suite via:
+
+```bash
+.venv/bin/python tests/benchmark_accuracy.py
+```
 
 ---
 
 ## 11. Adding New Skills
 
-Drop any Markdown file into `./skills/` with optional YAML frontmatter:
+You can add skills either on disk or directly on the n8n canvas:
+
+1. **On disk**: Drop any Markdown file into `./skills/` with optional YAML frontmatter:
 
 ```markdown
 ---
@@ -286,7 +302,9 @@ description: Static security review checklist for Python and TypeScript reposito
 ...
 ```
 
-At startup, only `name` and the one-line `description` are injected into the supervisor prompt. Full instructions load lazily when the agent calls `load_skill("security_audit")`. No orchestration code changes are required.
+2. **On the n8n canvas**: Add a native **`Default Data Loader`** node with the same Markdown frontmatter/instructions and connect its output to **`Read Canvas Skills`** inside `"LangGraph Autonomous AI Agent Gateway"`.
+
+Only `name` and the one-line `description` are injected into the supervisor prompt. Full instructions load lazily when the agent calls `load_skill("security_audit")`. No orchestration code changes are required.
 
 ---
 

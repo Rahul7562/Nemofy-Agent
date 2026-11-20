@@ -44,6 +44,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from src.guardrails import execute_tool_with_guardrails
+from src.jobs import ProgressCallback, current_progress_callback, emit_progress
 from src.models import (
     ModelOverride,
     ModelSpec,
@@ -60,7 +61,14 @@ from src.planner import (
     update_plan_step,
 )
 from src.sandbox import SandboxManager
-from src.skills import SkillRegistry, build_loaded_skills_context, make_load_skill_tool
+from src.skills import (
+    CanvasSkill,
+    SkillRegistry,
+    build_loaded_skills_context,
+    current_canvas_skills,
+    make_load_skill_tool,
+    parse_canvas_skills_payload,
+)
 from src.state import (
     DEFAULT_MAX_TOOL_RETRIES,
     DEFAULT_MAX_TURNS,
@@ -77,12 +85,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
 
-# Async-safe per-request dynamic model ContextVars (enables n8n/API model switching per run)
+# Async-safe per-request ContextVars for dynamic models, n8n canvas MCP tools, and canvas skills
 current_primary_model: ContextVar[BaseChatModel | None] = ContextVar(
     "current_primary_model", default=None
 )
 current_worker_model: ContextVar[BaseChatModel | None] = ContextVar(
     "current_worker_model", default=None
+)
+current_extra_tools: ContextVar[dict[str, BaseTool] | None] = ContextVar(
+    "current_extra_tools", default=None
+)
+current_extra_mcp_names: ContextVar[set[str] | None] = ContextVar(
+    "current_extra_mcp_names", default=None
 )
 
 
@@ -174,8 +188,12 @@ class AgentRuntime:
         | ModelOverride
         | dict[str, Any]
         | None = None,
+        extra_tools: dict[str, BaseTool] | None = None,
+        extra_mcp_tool_names: set[str] | None = None,
+        canvas_skills: dict[str, CanvasSkill] | list[dict[str, Any]] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        """Run or continue an agent task on ``thread_id`` with optional dynamic Brain/Sub-Agent models."""
+        """Run or continue an agent task on ``thread_id`` with optional dynamic models, MCP tools & skills."""
         if not task or not task.strip():
             raise ValueError("Task must be a non-empty string.")
 
@@ -199,9 +217,19 @@ class AgentRuntime:
             ),
         }
 
+        parsed_canvas_skills: dict[str, CanvasSkill] | None = None
+        if isinstance(canvas_skills, dict):
+            parsed_canvas_skills = canvas_skills
+        elif isinstance(canvas_skills, list):
+            parsed_canvas_skills = parse_canvas_skills_payload(canvas_skills)
+
         token = current_session_id.set(thread_id)
         prim_tok = current_primary_model.set(prim_model)
         work_tok = current_worker_model.set(work_model)
+        tools_tok = current_extra_tools.set(extra_tools or None)
+        mcp_tok = current_extra_mcp_names.set(extra_mcp_tool_names or None)
+        skills_tok = current_canvas_skills.set(parsed_canvas_skills or None)
+        prog_tok = current_progress_callback.set(progress_callback)
         try:
             config = self.make_config(thread_id)
             existing = await self.graph.aget_state(config)
@@ -232,6 +260,10 @@ class AgentRuntime:
             result["active_models"] = active_models
             return result
         finally:
+            current_progress_callback.reset(prog_tok)
+            current_canvas_skills.reset(skills_tok)
+            current_extra_mcp_names.reset(mcp_tok)
+            current_extra_tools.reset(tools_tok)
             current_worker_model.reset(work_tok)
             current_primary_model.reset(prim_tok)
             current_session_id.reset(token)
@@ -251,6 +283,10 @@ class AgentRuntime:
         | ModelOverride
         | dict[str, Any]
         | None = None,
+        extra_tools: dict[str, BaseTool] | None = None,
+        extra_mcp_tool_names: set[str] | None = None,
+        canvas_skills: dict[str, CanvasSkill] | list[dict[str, Any]] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         """Resume a checkpointed graph paused at a HITL ``interrupt()`` gate."""
         prim_model, prim_spec = _resolve_override_model(
@@ -273,9 +309,19 @@ class AgentRuntime:
             ),
         }
 
+        parsed_canvas_skills: dict[str, CanvasSkill] | None = None
+        if isinstance(canvas_skills, dict):
+            parsed_canvas_skills = canvas_skills
+        elif isinstance(canvas_skills, list):
+            parsed_canvas_skills = parse_canvas_skills_payload(canvas_skills)
+
         token = current_session_id.set(thread_id)
         prim_tok = current_primary_model.set(prim_model)
         work_tok = current_worker_model.set(work_model)
+        tools_tok = current_extra_tools.set(extra_tools or None)
+        mcp_tok = current_extra_mcp_names.set(extra_mcp_tool_names or None)
+        skills_tok = current_canvas_skills.set(parsed_canvas_skills or None)
+        prog_tok = current_progress_callback.set(progress_callback)
         try:
             config = self.make_config(thread_id)
             await self.graph.ainvoke(Command(resume=decision), config=config)
@@ -283,6 +329,10 @@ class AgentRuntime:
             result["active_models"] = active_models
             return result
         finally:
+            current_progress_callback.reset(prog_tok)
+            current_canvas_skills.reset(skills_tok)
+            current_extra_mcp_names.reset(mcp_tok)
+            current_extra_tools.reset(tools_tok)
             current_worker_model.reset(work_tok)
             current_primary_model.reset(prim_tok)
             current_session_id.reset(token)
@@ -368,10 +418,22 @@ def build_supervisor_graph(
     for t in [*local_tools, load_skill_tool, *mcp_list, *(extra_tools or [])]:
         base_tools[t.name] = t
 
+    def _active_base_tools() -> dict[str, BaseTool]:
+        dyn = current_extra_tools.get()
+        if not dyn:
+            return base_tools
+        return {**base_tools, **dyn}
+
+    def _active_mcp_names() -> set[str]:
+        dyn_mcp = current_extra_mcp_names.get()
+        if not dyn_mcp:
+            return mcp_names
+        return mcp_names | dyn_mcp
+
     spawn_tool = make_spawn_subagent_tool(
         worker_model_factory=lambda: current_worker_model.get() or resolved_worker_model,
-        available_tools=base_tools,
-        mcp_tool_names=mcp_names,
+        available_tools=_active_base_tools,
+        mcp_tool_names=_active_mcp_names,
         workspace_dir=str(resolved_sandbox.config.workspace_dir),
     )
 
@@ -383,7 +445,11 @@ def build_supervisor_graph(
         else primary_model
     )
 
-    skill_catalog_text = resolved_skills.format_catalog_for_prompt()
+    def _active_tools_map() -> dict[str, BaseTool]:
+        dyn = current_extra_tools.get()
+        if not dyn:
+            return tools_by_name
+        return {**tools_by_name, **dyn}
 
     # ------------------------------------------------------------------
     # NODE 1: PLAN — Decompose/update plan and choose next action
@@ -395,6 +461,14 @@ def build_supervisor_graph(
         current_plan: list[PlanStep] = list(state.get("plan", []))
         active_skills: list[str] = list(state.get("active_skills", []))
         last_observations = list(state.get("last_observations", []))
+
+        completed_count = sum(1 for s in current_plan if s["status"] == "completed")
+        emit_progress(
+            "plan_start",
+            turn_count=turn_count,
+            steps_completed=completed_count,
+            detail=f"Planning turn {turn_count}/{effective_max}",
+        )
 
         if turn_count > effective_max:
             return {
@@ -413,12 +487,22 @@ def build_supervisor_graph(
         updated_plan = list(current_plan)
         if needs_new_plan:
             step_num = len(updated_plan) + 1
+            step_desc = (
+                user_goal[:240]
+                if not current_plan or turn_count == 1
+                else "Continue task based on observed tool results or synthesize final answer."
+            )
+            step_action = (
+                "supervisor_decide"
+                if not current_plan or turn_count == 1
+                else "supervisor_continue_or_synthesize"
+            )
             updated_plan.append(
                 PlanStep(
                     step_id=f"step-{step_num}",
-                    description=user_goal[:240],
+                    description=step_desc,
                     status="in_progress",
-                    tool_or_action="supervisor_decide",
+                    tool_or_action=step_action,
                     result="",
                 )
             )
@@ -447,23 +531,32 @@ def build_supervisor_graph(
                 else:
                     current_step_id = updated_plan[-1]["step_id"]
 
+        active_tools = _active_tools_map()
+        active_tool_list = list(active_tools.values())
+        dynamic_skill_catalog = resolved_skills.format_catalog_for_prompt()
         loaded_skills_text = build_loaded_skills_context(active_skills, resolved_skills)
         sys_prompt = build_supervisor_system_prompt(
-            skill_catalog_text=skill_catalog_text,
+            skill_catalog_text=dynamic_skill_catalog,
             loaded_skills_text=loaded_skills_text,
-            available_tool_names=list(tools_by_name.keys()),
+            available_tool_names=list(active_tools.keys()),
             plan=updated_plan,
             turn_count=turn_count,
             max_turns=effective_max,
         )
 
-        # Invoke primary model (default or per-request n8n/API override)
+        # Invoke primary model (default or per-request n8n/API override, with dynamic canvas tools)
         override_primary = current_primary_model.get()
-        active_bound_model: Any = (
-            override_primary.bind_tools(all_tool_list)
-            if override_primary is not None and hasattr(override_primary, "bind_tools")
-            else (override_primary if override_primary is not None else default_bound_model)
-        )
+        has_dynamic_tools = bool(current_extra_tools.get())
+        if override_primary is not None:
+            active_bound_model: Any = (
+                override_primary.bind_tools(active_tool_list)
+                if hasattr(override_primary, "bind_tools")
+                else override_primary
+            )
+        elif has_dynamic_tools and hasattr(primary_model, "bind_tools"):
+            active_bound_model = primary_model.bind_tools(active_tool_list)
+        else:
+            active_bound_model = default_bound_model
         try:
             ai_reply = await active_bound_model.ainvoke(
                 [SystemMessage(content=sys_prompt), *messages]
@@ -487,9 +580,20 @@ def build_supervisor_graph(
         if not isinstance(ai_reply, AIMessage):
             ai_reply = AIMessage(content=str(getattr(ai_reply, "content", "") or ""))
 
-        # If model embedded an explicit JSON plan inside its content without tool calls, parse it
+        tool_calls = getattr(ai_reply, "tool_calls", None) or []
+        emit_progress(
+            "plan_llm_done",
+            turn_count=turn_count,
+            detail=(
+                f"Planned {len(tool_calls)} tool call(s)"
+                if tool_calls
+                else "Produced direct response"
+            ),
+        )
+
+        # Parse embedded structured plan JSON only when it explicitly matches the plan schema
         raw_content = str(ai_reply.content or "")
-        if '"plan"' in raw_content or '"steps"' in raw_content:
+        if '"step_id"' in raw_content and ('"plan"' in raw_content or '"steps"' in raw_content):
             parsed_steps, _ = parse_structured_plan(
                 raw_content,
                 existing_plan=current_plan,
@@ -505,7 +609,6 @@ def build_supervisor_graph(
                     )
 
         # Record tool names planned on the active step if model issued tool_calls
-        tool_calls = getattr(ai_reply, "tool_calls", None) or []
         if tool_calls:
             planned_tools = ", ".join(str(tc.get("name", "tool")) for tc in tool_calls)
             updated_plan = [
@@ -543,6 +646,8 @@ def build_supervisor_graph(
         if not tool_calls:
             return {"last_observations": [], "pending_approval": None}
 
+        active_tools = _active_tools_map()
+        active_mcp_names = _active_mcp_names()
         retry_counts = dict(state.get("tool_retry_counts", {}))
         active_skills = list(state.get("active_skills", []))
         subagent_reports = list(state.get("subagent_reports", []))
@@ -574,11 +679,11 @@ def build_supervisor_graph(
                 )
                 continue
 
-            tool_obj = tools_by_name.get(tc_name)
+            tool_obj = active_tools.get(tc_name)
             if tool_obj is None:
                 err_text = (
                     f"ERROR: Unknown tool '{tc_name}'. Available tools: "
-                    f"{sorted(tools_by_name.keys())}"
+                    f"{sorted(active_tools.keys())}"
                 )
                 retry_counts[retry_key] = prior_failures + 1
                 tool_messages.append(
@@ -589,11 +694,16 @@ def build_supervisor_graph(
                 )
                 continue
 
+            emit_progress(
+                "act_tool_start",
+                tool=tc_name,
+                detail=f"Running tool '{tc_name}' ({idx + 1}/{len(tool_calls)})",
+            )
             try:
                 raw_output, audit = await execute_tool_with_guardrails(
                     tool_obj,
                     tc_args,
-                    is_mcp_tool=(tc_name in mcp_names),
+                    is_mcp_tool=(tc_name in active_mcp_names),
                     source="supervisor",
                 )
             except GraphInterrupt:
@@ -609,6 +719,12 @@ def build_supervisor_graph(
                     {"tool": tc_name, "status": "error", "summary": err_text, "archived_log": None}
                 )
                 continue
+
+            emit_progress(
+                "act_tool_done",
+                tool=tc_name,
+                detail=f"Finished tool '{tc_name}'",
+            )
 
             # Track rejected vs error vs success
             if not audit.get("approved", True):
@@ -692,6 +808,12 @@ def build_supervisor_graph(
                     plan, current_step_id, status="completed", result=final_snippet
                 )
 
+        completed_steps = sum(1 for s in plan if s["status"] == "completed")
+        emit_progress(
+            "observe",
+            steps_completed=completed_steps,
+            detail=f"Observed {len(observations)} tool result(s); completed steps={completed_steps}",
+        )
         return {"plan": plan}
 
     # ------------------------------------------------------------------
@@ -702,6 +824,9 @@ def build_supervisor_graph(
         effective_max = int(state.get("max_turns", max_turns))
         observations = list(state.get("last_observations", []))
         last_ai = _latest_ai_message(list(state.get("messages", [])))
+        emit_progress(
+            "reflect", turn_count=turn_count, detail=f"Reflecting after turn {turn_count}"
+        )
 
         if state.get("error"):
             return {

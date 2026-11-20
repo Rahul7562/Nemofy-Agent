@@ -24,6 +24,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from src.guardrails import execute_tool_with_guardrails
+from src.jobs import emit_progress
 from src.state import compact_tool_output
 
 logger = logging.getLogger(__name__)
@@ -32,12 +33,12 @@ DEFAULT_SUBAGENT_MAX_TURNS = 8
 
 # Recommended safe default toolsets per common worker specialization
 ROLE_DEFAULT_TOOLS: dict[str, list[str]] = {
-    "deep_research": ["web_fetch", "read_file", "write_file", "list_dir"],
-    "repo_inspection": ["list_dir", "read_file", "bash_exec"],
-    "code_review": ["list_dir", "read_file", "bash_exec"],
-    "data_analysis": ["list_dir", "read_file", "write_file", "bash_exec"],
-    "documentation": ["list_dir", "read_file", "write_file", "edit_file"],
-    "general": ["list_dir", "read_file", "web_fetch"],
+    "deep_research": ["web_fetch", "read_file", "write_file", "list_dir", "load_skill"],
+    "repo_inspection": ["list_dir", "read_file", "bash_exec", "load_skill"],
+    "code_review": ["list_dir", "read_file", "bash_exec", "load_skill"],
+    "data_analysis": ["list_dir", "read_file", "write_file", "bash_exec", "load_skill"],
+    "documentation": ["list_dir", "read_file", "write_file", "edit_file", "load_skill"],
+    "general": ["list_dir", "read_file", "web_fetch", "load_skill"],
 }
 
 
@@ -187,8 +188,16 @@ async def run_isolated_subagent(
 
     async def worker_reason(state: WorkerState) -> dict[str, Any]:
         next_turn = state["turn_count"] + 1
+        emit_progress(
+            "subagent_reason",
+            detail=f"Sub-agent '{normalized_role}' reasoning (worker turn {next_turn})",
+        )
         response = await bound_model.ainvoke(state["messages"])
         content_text = str(getattr(response, "content", "") or "")
+        emit_progress(
+            "subagent_reason_done",
+            detail=f"Sub-agent '{normalized_role}' turn {next_turn} complete",
+        )
         return {
             "messages": [response],
             "turn_count": next_turn,
@@ -221,12 +230,22 @@ async def run_isolated_subagent(
                 continue
 
             tool_obj = permitted_tools[tc_name]
+            emit_progress(
+                "subagent_tool_start",
+                tool=tc_name,
+                detail=f"Sub-agent '{normalized_role}' running tool '{tc_name}'",
+            )
             # CRITICAL: Central guardrail execution — GraphInterrupt propagates untouched!
             raw_result, _audit = await execute_tool_with_guardrails(
                 tool_obj,
                 tc_args,
                 is_mcp_tool=(tc_name in mcp_names),
                 source=f"subagent:{normalized_role}",
+            )
+            emit_progress(
+                "subagent_tool_done",
+                tool=tc_name,
+                detail=f"Sub-agent '{normalized_role}' finished tool '{tc_name}'",
             )
             compacted, _saved = compact_tool_output(
                 f"subagent_{normalized_role}_{tc_name}",
@@ -264,6 +283,8 @@ async def run_isolated_subagent(
         f"delegated task for the parent LangGraph supervisor.\n"
         f"Assigned tools: {', '.join(sorted(permitted_tools.keys())) or '(none)'}.\n"
         "You have no access to tools outside your assigned list and cannot bypass safety gates.\n"
+        "Accuracy rules: verify calculations or file facts with your assigned tools instead of "
+        "guessing, and never fabricate results.\n"
         "When finished, return a concise JSON object with keys: "
         '{"summary": "...", "key_findings": ["..."], "artifacts": ["..."]}.'
     )
@@ -308,8 +329,8 @@ async def run_isolated_subagent(
 def make_spawn_subagent_tool(
     *,
     worker_model_factory: Any,
-    available_tools: dict[str, BaseTool],
-    mcp_tool_names: set[str] | None = None,
+    available_tools: dict[str, BaseTool] | Any,
+    mcp_tool_names: set[str] | Any | None = None,
     workspace_dir: str | None = None,
 ) -> BaseTool:
     """Create the supervisor's ``spawn_subagent`` LangChain tool."""
@@ -331,13 +352,19 @@ def make_spawn_subagent_tool(
         worker_model = (
             worker_model_factory() if callable(worker_model_factory) else worker_model_factory
         )
+        resolved_tools: dict[str, BaseTool] = (
+            available_tools() if callable(available_tools) else available_tools
+        )
+        resolved_mcp_names: set[str] | None = (
+            mcp_tool_names() if callable(mcp_tool_names) else mcp_tool_names
+        )
         report = await run_isolated_subagent(
             task=task,
             role=role,
             worker_model=worker_model,
-            available_tools=available_tools,
+            available_tools=resolved_tools,
             allowed_tool_names=allowed_tools,
-            mcp_tool_names=mcp_tool_names,
+            mcp_tool_names=resolved_mcp_names,
             context=context,
             max_turns=max_turns,
             workspace_dir=workspace_dir,

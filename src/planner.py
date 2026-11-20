@@ -195,10 +195,10 @@ def build_supervisor_system_prompt(
             "Architectural boundaries:\n"
             "- Local hands: Docker/workspace sandbox tools (bash_exec, read_file, write_file, "
             "edit_file, list_dir, web_fetch) operate strictly inside /workspace.\n"
-            "- SaaS arm: n8n MCP tools handle external integrations (Gmail, Sheets, Calendar, "
-            "Slack, Webhooks, n8n workflows).\n"
-            "- Skills: Use load_skill(name) only when a task genuinely benefits from specialized "
-            "instructions.\n"
+            "- SaaS & MCP arm: Built-in n8n MCP tools and any MCP Server / AI Tool nodes plugged "
+            "into the n8n canvas handle external integrations and live queries.\n"
+            "- Skills: Call load_skill(name) FIRST whenever a task matches a skill in the catalog "
+            "(including [n8n canvas] skills) and strictly follow its instructions.\n"
             "- Sub-agents: Use spawn_subagent for large independent workstreams (deep research, "
             "repo audits, code review, data analysis, documentation).\n"
             "- Safety: Never attempt to bypass guardrails; sensitive actions pause for explicit "
@@ -214,11 +214,16 @@ def build_supervisor_system_prompt(
 
     sections.append(f"Current execution plan:\n{plan_text}")
     sections.append(
-        "Execution rules:\n"
+        "Execution & accuracy rules:\n"
         "1. Do not re-execute steps already marked COMPLETED.\n"
-        "2. Only call tools needed for the active step; avoid unnecessary subsystem calls.\n"
-        "3. If a tool fails, inspect the error, recover or re-plan within bounded retries.\n"
-        "4. When all required work is complete, provide a clear, accurate final answer directly."
+        "2. Verify non-trivial math, statistics, parsing, or code logic with bash_exec (Python) "
+        "instead of guessing mentally.\n"
+        "3. Never fabricate tool outputs, file contents, or external facts; ground every claim "
+        "in observed tool output or mark uncertainty explicitly.\n"
+        "4. Only call tools needed for the active step; if a tool fails, inspect the error and "
+        "recover within bounded retries.\n"
+        "5. When all required work is complete and verified, return a clear, exact final answer "
+        "matching any requested format."
     )
     return "\n\n".join(sections)
 

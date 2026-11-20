@@ -202,15 +202,18 @@ def classify_tool_call(
                 expected_effect=_describe_expected_effect(tool_name, args),
             )
 
-    # Default fail-safe for unknown MCP/SaaS tools: treat read-only prefixes as SAFE, others SENSITIVE
+    # Default fail-safe for unknown MCP/SaaS tools: treat read-only query tools (including
+    # node/server-prefixed n8n MCP Client Tool names like MCP_Server__n8n_Canvas_search_workflows)
+    # as SAFE after all SENSITIVE_TOOL_PATTERNS have already been ruled out; everything else SENSITIVE.
     if is_mcp_tool:
-        if normalized.startswith(
-            ("get_", "list_", "search_", "read_", "find_", "fetch_", "describe_")
+        if any(normalized.endswith(f"_{safe}") for safe in EXPLICIT_SAFE_TOOLS) or re.search(
+            r"(?:^|_)(?:get|list|search|read|find|fetch|describe|lookup|query|inspect|count|check|status|ping|echo|health|whoami|info)(?:_|$)",
+            normalized,
         ):
             return ToolClassification(
                 tool_name=tool_name,
                 safety_level="SAFE",
-                risk_reason="Read-only n8n MCP discovery/query tool.",
+                risk_reason="Read-only MCP discovery/query tool.",
                 expected_effect=_describe_expected_effect(tool_name, args),
             )
         return ToolClassification(

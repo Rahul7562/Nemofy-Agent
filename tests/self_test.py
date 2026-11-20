@@ -38,6 +38,7 @@ def main() -> int:
                 "src/subagents.py",
                 "src/sandbox.py",
                 "src/guardrails.py",
+                "src/jobs.py",
                 "src/api.py",
                 "src/tools/local.py",
                 "src/tools/mcp_n8n.py",
