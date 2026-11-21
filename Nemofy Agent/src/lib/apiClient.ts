@@ -1,14 +1,17 @@
 import type {
   AgentHealthResponse,
   AuthSession,
+  ChatAttachment,
   ChatMessage,
   ChatThread,
   LiveAgentActivity,
   MCPServerItem,
+  ModelRoleKey,
   PersistedLLMConfig,
   ProfileVaultSummary,
   ProviderAvailability,
   ProviderModelsResponse,
+  RoleLLMConfig,
   SkillDocument,
   WorkspaceNode,
 } from '../types/agent.ts';
@@ -17,7 +20,13 @@ import {
   DEFAULT_STANDALONE_CREDENTIAL_DIGEST,
   hashStandaloneCredential,
 } from './authValidation.ts';
-import { LLM_PROVIDER_PRESETS, getProviderPreset } from './llmPresets.ts';
+import {
+  LLM_PROVIDER_PRESETS,
+  classifyFileModality,
+  getDefaultAccessoriesConfig,
+  getProviderPreset,
+  normalizeAccessoriesConfig,
+} from './llmPresets.ts';
 
 const SESSION_TOKEN_KEY = 'nemofy_session_token';
 const STANDALONE_DIGEST_KEY = 'nemofy_standalone_digest';
@@ -114,7 +123,7 @@ function getDefaultLLMConfig(): PersistedLLMConfig {
   return {
     primary: {
       provider: 'river_ai',
-      model: 'deepseek-ai/DeepSeek-V4.1-Flash',
+      model: '',
       base_url: 'https://api.river.ai/v1',
       temperature: 0.2,
       max_tokens: 16384,
@@ -128,6 +137,7 @@ function getDefaultLLMConfig(): PersistedLLMConfig {
       max_tokens: 8192,
       reasoning_effort: 'off',
     },
+    accessories: getDefaultAccessoriesConfig(),
     max_turns: 30,
   };
 }
@@ -312,10 +322,63 @@ export async function deleteThread(threadId: string): Promise<void> {
   await apiFetch(`/api/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
 }
 
+export async function uploadChatMedia(
+  file: File,
+  threadId?: string,
+): Promise<ChatAttachment> {
+  if (detectedStandaloneMode) {
+    const kind = classifyFileModality(file.type, file.name);
+    if (!kind) {
+      throw new Error('Unsupported file type. Upload an image, audio, or video file.');
+    }
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('Failed to read media file.'));
+      reader.readAsDataURL(file);
+    });
+    return {
+      id: `att-${Math.random().toString(16).slice(2, 12)}`,
+      name: file.name,
+      kind,
+      mimeType: file.type || `${kind}/octet-stream`,
+      size: file.size,
+      url: dataUrl,
+    };
+  }
+
+  const headers = new Headers();
+  headers.set('Content-Type', file.type || 'application/octet-stream');
+  headers.set('X-File-Name', encodeURIComponent(file.name));
+  if (file.type) headers.set('X-File-Type', file.type);
+  if (threadId) headers.set('X-Thread-Id', threadId);
+  headers.set('X-Requested-With', 'NemofyAgent');
+  const token = getSessionToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const resp = await fetch(buildUrl('/api/media/upload'), {
+    method: 'POST',
+    headers,
+    body: file,
+    credentials: 'include',
+  });
+  const payload = (await resp.json().catch(() => ({}))) as {
+    attachment?: ChatAttachment;
+    error?: string;
+  };
+  if (!resp.ok || !payload.attachment) {
+    throw new Error(payload.error || 'Failed to upload media attachment.');
+  }
+  return payload.attachment;
+}
+
 export async function sendChatMessage(
   threadId: string,
   message: string,
   reasoningEffort?: string,
+  attachments?: ChatAttachment[],
 ): Promise<{ thread: ChatThread; message: ChatMessage; error?: string }> {
   if (detectedStandaloneMode) {
     const now = new Date().toISOString();
@@ -324,7 +387,7 @@ export async function sendChatMessage(
     if (!thread) {
       thread = {
         id: threadId,
-        title: message.slice(0, 56),
+        title: (message || attachments?.[0]?.name || 'Media Session').slice(0, 56),
         createdAt: now,
         updatedAt: now,
         messages: [],
@@ -336,6 +399,7 @@ export async function sendChatMessage(
       role: 'user',
       content: message,
       timestamp: now,
+      attachments: attachments && attachments.length > 0 ? attachments : undefined,
     });
     const reply: ChatMessage = {
       id: `msg-${Date.now()}-a`,
@@ -355,7 +419,12 @@ export async function sendChatMessage(
     '/api/chat/send',
     {
       method: 'POST',
-      body: JSON.stringify({ threadId, message, reasoningEffort }),
+      body: JSON.stringify({
+        threadId,
+        message,
+        reasoningEffort,
+        attachments: attachments && attachments.length > 0 ? attachments : undefined,
+      }),
     },
   );
   if (!res.ok) {
@@ -369,6 +438,7 @@ export async function startChatJob(
   message: string,
   reasoningEffort?: string,
   signal?: AbortSignal,
+  attachments?: ChatAttachment[],
 ): Promise<{
   jobId: string | null;
   thread: ChatThread;
@@ -377,7 +447,7 @@ export async function startChatJob(
   error?: string;
 }> {
   if (detectedStandaloneMode) {
-    const fallback = await sendChatMessage(threadId, message, reasoningEffort);
+    const fallback = await sendChatMessage(threadId, message, reasoningEffort, attachments);
     return {
       jobId: null,
       thread: fallback.thread,
@@ -394,7 +464,12 @@ export async function startChatJob(
     error?: string;
   }>('/api/chat/jobs/start', {
     method: 'POST',
-    body: JSON.stringify({ threadId, message, reasoningEffort }),
+    body: JSON.stringify({
+      threadId,
+      message,
+      reasoningEffort,
+      attachments: attachments && attachments.length > 0 ? attachments : undefined,
+    }),
     signal,
   });
 
@@ -476,7 +551,13 @@ export async function resumeApproval(
 // ---------------------------------------------------------------------------
 // Workspace Filesystem API
 // ---------------------------------------------------------------------------
-export async function fetchWorkspaceTree(): Promise<{ root: string; entries: WorkspaceNode[] }> {
+export async function fetchWorkspaceTree(dir?: string): Promise<{
+  root: string;
+  dir?: string;
+  entries: WorkspaceNode[];
+  totalCount?: number;
+  truncated?: boolean;
+}> {
   if (detectedStandaloneMode) {
     const files = readLocalJson<Record<string, string>>(STANDALONE_FILES_KEY, {
       'README.md': '# Nemofy Agent Workspace\n\nConnect a hosted Agent-Core server in Settings to sync with the live Python sandbox `/workspace` directory.\n',
@@ -490,10 +571,19 @@ export async function fetchWorkspaceTree(): Promise<{ root: string; entries: Wor
         size: files[p].length,
         modifiedAt: new Date().toISOString(),
       }));
-    return { root: '/workspace', entries };
+    return { root: '/workspace', entries, totalCount: entries.length, truncated: false };
   }
-  const res = await apiFetch<{ root: string; entries: WorkspaceNode[] }>('/api/filesystem/tree');
-  if (!res.ok) throw new Error('Unable to read workspace tree.');
+  const cleanDir = (dir || '').trim();
+  const query = cleanDir ? `?dir=${encodeURIComponent(cleanDir)}` : '';
+  const res = await apiFetch<{
+    root: string;
+    dir?: string;
+    entries: WorkspaceNode[];
+    totalCount?: number;
+    truncated?: boolean;
+    error?: string;
+  }>(`/api/filesystem/tree${query}`);
+  if (!res.ok) throw new Error(res.data?.error || 'Unable to read workspace tree.');
   return res.data;
 }
 
@@ -574,8 +664,12 @@ export async function fetchLLMSettings(): Promise<{
         requires_api_key: p.requiresApiKey,
       };
     }
+    const rawConfig = readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig());
     return {
-      config: readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig()),
+      config: {
+        ...rawConfig,
+        accessories: normalizeAccessoriesConfig(rawConfig.accessories),
+      },
       providers,
       vault: {
         username: DEFAULT_ADMIN_USERNAME,
@@ -591,12 +685,18 @@ export async function fetchLLMSettings(): Promise<{
     vault?: ProfileVaultSummary;
   }>('/api/settings/llm');
   if (!res.ok) throw new Error('Unable to load LLM settings.');
-  return res.data;
+  return {
+    ...res.data,
+    config: {
+      ...res.data.config,
+      accessories: normalizeAccessoriesConfig(res.data.config?.accessories),
+    },
+  };
 }
 
 export async function saveLLMSettings(
   config: PersistedLLMConfig,
-  apiKeys?: { primary?: string; worker?: string },
+  apiKeys?: Partial<Record<ModelRoleKey, string>>,
 ): Promise<{
   config: PersistedLLMConfig;
   providers: Record<string, ProviderAvailability>;
@@ -623,7 +723,13 @@ export async function saveLLMSettings(
     }),
   });
   if (!res.ok) throw new Error(res.data.error || 'Unable to save LLM settings.');
-  return res.data;
+  return {
+    ...res.data,
+    config: {
+      ...res.data.config,
+      accessories: normalizeAccessoriesConfig(res.data.config?.accessories),
+    },
+  };
 }
 
 export async function saveProfileVaultKey(params: {
@@ -679,7 +785,7 @@ export async function fetchProviderModels(params: {
   provider: string;
   base_url?: string;
   api_key?: string;
-  role?: 'primary' | 'worker';
+  role?: ModelRoleKey;
 }): Promise<ProviderModelsResponse> {
   if (detectedStandaloneMode) {
     const preset = getProviderPreset(params.provider);
@@ -727,8 +833,8 @@ export async function fetchProviderModels(params: {
 }
 
 export async function probeLLMModel(
-  role: 'primary' | 'worker',
-  override: PersistedLLMConfig['primary'],
+  role: ModelRoleKey,
+  override: RoleLLMConfig,
   apiKey?: string,
 ): Promise<Record<string, unknown>> {
   if (detectedStandaloneMode) {

@@ -168,6 +168,10 @@ export function App() {
               setSettingsTab('llm');
               setActiveSection('settings');
             }}
+            onOpenAccessoriesSettings={() => {
+              setSettingsTab('accessories');
+              setActiveSection('settings');
+            }}
           />
         )}
         {activeSection === 'filesystem' && <FilesystemView />}

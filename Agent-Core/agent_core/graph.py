@@ -23,6 +23,7 @@ from langchain_core.messages import (
     AIMessageChunk,
     BaseMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -33,6 +34,15 @@ from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from agent_core.context_manager import (
+    AUTO_COMPACT_THRESHOLD_PERCENT,
+    build_compacted_memory_block,
+    compact_conversation_history,
+    compute_context_usage,
+    extract_provider_input_tokens,
+    should_auto_compact,
+    utc_now_iso,
+)
 from agent_core.guardrails import execute_tool_with_guardrails, normalize_tool_arguments
 from agent_core.jobs import ProgressCallback, current_progress_callback, emit_progress
 from agent_core.models import (
@@ -43,7 +53,18 @@ from agent_core.models import (
     get_primary_model,
     get_worker_model,
     load_model_spec,
+    resolve_accessory_model_spec,
     resolve_model_spec_with_override,
+)
+from agent_core.multimodal import (
+    MediaAttachment,
+    MediaModality,
+    build_multimodal_content_blocks,
+    detect_model_input_modalities,
+    format_accessory_reports_for_primary,
+    is_unsupported_modality_error,
+    partition_attachments_by_capability,
+    run_accessory_media_subagent,
 )
 from agent_core.planner import (
     build_supervisor_system_prompt,
@@ -91,8 +112,28 @@ current_extra_mcp_names: ContextVar[set[str] | None] = ContextVar(
 current_run_activity: ContextVar[dict[str, Any] | None] = ContextVar(
     "current_run_activity", default=None
 )
+current_native_media_attachments: ContextVar[list[MediaAttachment] | None] = ContextVar(
+    "current_native_media_attachments", default=None
+)
+current_accessory_fallback_fn: ContextVar[Callable[..., Any] | None] = ContextVar(
+    "current_accessory_fallback_fn", default=None
+)
+current_uploads_dir: ContextVar[Path | None] = ContextVar(
+    "current_uploads_dir", default=None
+)
+current_primary_meta: ContextVar[dict[str, Any] | None] = ContextVar(
+    "current_primary_meta", default=None
+)
 
-_IGNORED_WORKSPACE_DIRS = {".git", "__pycache__", ".agent_logs", "node_modules"}
+_IGNORED_WORKSPACE_DIRS = {
+    ".git",
+    "__pycache__",
+    ".agent_logs",
+    ".cache",
+    ".venv",
+    "venv",
+    "node_modules",
+}
 
 
 def _new_run_activity() -> dict[str, Any]:
@@ -100,6 +141,7 @@ def _new_run_activity() -> dict[str, Any]:
         "thinking_segments": [],
         "tool_events": [],
         "file_changes": [],
+        "accessory_reports": [],
     }
 
 
@@ -256,6 +298,8 @@ def _describe_model_instance(
             "temperature": spec.temperature,
             "max_tokens": spec.max_tokens,
             "reasoning_effort": spec.reasoning_effort,
+            "context_window": spec.context_window,
+            "max_output_tokens": spec.max_output_tokens,
         }
     if model_obj is None:
         return {"provider": "unknown", "model": "unknown", "base_url": ""}
@@ -265,10 +309,16 @@ def _describe_model_instance(
         or type(model_obj).__name__
     )
     base_url = getattr(model_obj, "openai_api_base", None) or getattr(model_obj, "base_url", None)
+    explicit_ctx = getattr(model_obj, "context_window", None)
+    explicit_out = getattr(model_obj, "max_output_tokens", None)
+    cfg_max_tok = getattr(model_obj, "max_tokens", None)
     return {
         "provider": "custom",
         "model": str(model_name),
         "base_url": str(base_url or ""),
+        **({"context_window": int(explicit_ctx)} if isinstance(explicit_ctx, int) and explicit_ctx >= 512 else {}),
+        **({"max_output_tokens": int(explicit_out)} if isinstance(explicit_out, int) and explicit_out >= 256 else {}),
+        **({"max_tokens": int(cfg_max_tok)} if isinstance(cfg_max_tok, int) and cfg_max_tok >= 64 else {}),
     }
 
 
@@ -335,8 +385,26 @@ class AgentRuntime:
         extra_mcp_tool_names: set[str] | None = None,
         dynamic_skills: dict[str, DynamicSkill] | list[dict[str, Any]] | None = None,
         progress_callback: ProgressCallback | None = None,
+        attachments: list[MediaAttachment | dict[str, Any]] | None = None,
+        accessory_models: dict[
+            str, BaseChatModel | ModelSpec | ModelOverride | dict[str, Any]
+        ]
+        | None = None,
+        primary_input_modalities: list[str] | set[str] | None = None,
+        allowed_uploads_dir: Path | None = None,
     ) -> dict[str, Any]:
-        if not task or not task.strip():
+        parsed_attachments: list[MediaAttachment] = []
+        for raw_att in attachments or []:
+            if isinstance(raw_att, MediaAttachment):
+                parsed_attachments.append(raw_att)
+            elif isinstance(raw_att, dict):
+                parsed_attachments.append(MediaAttachment.model_validate(raw_att))
+
+        clean_task = (task or "").strip()
+        if not clean_task and parsed_attachments:
+            kinds = sorted({a.kind for a in parsed_attachments})
+            clean_task = f"Analyze the attached {', '.join(kinds)} file(s)."
+        if not clean_task:
             raise ValueError("Task must be a non-empty string.")
 
         prim_model, prim_spec = _resolve_override_model(
@@ -381,14 +449,184 @@ class AgentRuntime:
         skills_tok = current_dynamic_skills.set(parsed_skills or None)
         prog_tok = current_progress_callback.set(progress_callback)
         act_tok = current_run_activity.set(run_activity)
+        uploads_tok = current_uploads_dir.set(allowed_uploads_dir)
+        native_media_tok = current_native_media_attachments.set(None)
+        fallback_fn_tok = current_accessory_fallback_fn.set(None)
+        prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
+
+        async def _run_accessory_for_modality(
+            modality: MediaModality,
+            mod_atts: list[MediaAttachment],
+            user_prompt: str,
+        ) -> dict[str, Any]:
+            raw_acc = (accessory_models or {}).get(modality)
+            acc_model_obj: BaseChatModel | None = None
+            acc_provider = "openrouter"
+            acc_model_name = "accessory"
+            acc_enabled = True
+            resolve_err: str | None = None
+
+            if isinstance(raw_acc, BaseChatModel):
+                acc_model_obj = raw_acc
+                desc = _describe_model_instance(raw_acc)
+                acc_provider = str(desc.get("provider") or "accessory")
+                acc_model_name = str(desc.get("model") or "accessory")
+            elif isinstance(raw_acc, ModelSpec):
+                acc_provider = raw_acc.provider
+                acc_model_name = raw_acc.model
+                try:
+                    acc_model_obj = (
+                        self.model_override_resolver("worker", raw_acc)
+                        if self.model_override_resolver
+                        else build_chat_model("worker", spec=raw_acc, require_api_key=True)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    resolve_err = str(exc)
+            else:
+                try:
+                    acc_spec, acc_enabled = resolve_accessory_model_spec(
+                        modality,
+                        override=raw_acc if isinstance(raw_acc, (dict, ModelOverride)) else None,
+                    )
+                    acc_provider = acc_spec.provider
+                    acc_model_name = acc_spec.model
+                    if acc_enabled:
+                        acc_model_obj = (
+                            self.model_override_resolver("worker", acc_spec)
+                            if self.model_override_resolver
+                            else build_chat_model("worker", spec=acc_spec, require_api_key=True)
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    resolve_err = str(exc)
+
+            ev_id = f"acc-{modality}-{len(run_activity['tool_events']) + 1}"
+            file_list = ", ".join(a.name for a in mod_atts)
+            tool_label = f"accessory_{modality}_subagent"
+            start_event = {
+                "id": ev_id,
+                "tool": tool_label,
+                "args_summary": f"{acc_provider}:{acc_model_name} · {file_list}"[:160],
+                "status": "running",
+                "started_at": datetime.now(UTC).isoformat(),
+            }
+            _record_run_tool_event(start_event)
+            emit_progress(
+                "act_tool_start",
+                tool=tool_label,
+                tool_event=start_event,
+                detail=(
+                    f"Spawning {modality} Accessory sub-agent ({acc_model_name}) "
+                    f"for {len(mod_atts)} file(s)..."
+                ),
+            )
+
+            if not acc_enabled:
+                report = {
+                    "subagent_id": ev_id,
+                    "role": tool_label,
+                    "modality": modality,
+                    "provider": acc_provider,
+                    "model": acc_model_name,
+                    "attachments": [a.name for a in mod_atts],
+                    "status": "error",
+                    "summary": f"{modality.title()} Accessory sub-agent is disabled in Settings > Accessories.",
+                    "findings": (
+                        f"The primary model does not natively accept {modality} inputs, and the "
+                        f"{modality} Accessory model is currently disabled in Settings > Accessories."
+                    ),
+                    "error": "Accessory disabled",
+                }
+            elif acc_model_obj is None:
+                report = {
+                    "subagent_id": ev_id,
+                    "role": tool_label,
+                    "modality": modality,
+                    "provider": acc_provider,
+                    "model": acc_model_name,
+                    "attachments": [a.name for a in mod_atts],
+                    "status": "error",
+                    "summary": f"Could not initialize {modality} Accessory model ({acc_provider}: {acc_model_name}).",
+                    "findings": (
+                        f"The primary model does not natively accept {modality} inputs, and the "
+                        f"configured {modality} Accessory model ({acc_provider}: {acc_model_name}) "
+                        f"could not be initialized: {resolve_err or 'missing API key'}. "
+                        "Configure its API key or model under Settings > Accessories."
+                    ),
+                    "error": resolve_err or "Accessory unavailable",
+                }
+            else:
+                report = await run_accessory_media_subagent(
+                    modality=modality,
+                    attachments=mod_atts,
+                    user_task=user_prompt,
+                    model=acc_model_obj,
+                    provider_label=acc_provider,
+                    model_label=acc_model_name,
+                    allowed_uploads_dir=allowed_uploads_dir,
+                )
+
+            done_event = {
+                "id": ev_id,
+                "tool": tool_label,
+                "args_summary": start_event["args_summary"],
+                "status": "ok" if report.get("status") == "completed" else "error",
+                "output_summary": str(report.get("summary") or "")[:180],
+                "finished_at": datetime.now(UTC).isoformat(),
+            }
+            _record_run_tool_event(done_event)
+            emit_progress(
+                "act_tool_done",
+                tool=tool_label,
+                tool_event=done_event,
+                detail=(
+                    f"{modality.title()} Accessory sub-agent finished ({acc_model_name})"
+                    if report.get("status") == "completed"
+                    else f"{modality.title()} Accessory sub-agent reported an issue"
+                ),
+            )
+            run_activity["accessory_reports"].append(report)
+            return report
+
         try:
+            primary_meta = active_models["primary"]
+            primary_modalities = detect_model_input_modalities(
+                primary_meta.get("provider"),
+                primary_meta.get("model"),
+                explicit_modalities=primary_input_modalities,
+            )
+            native_atts, delegated_by_modality = partition_attachments_by_capability(
+                parsed_attachments, primary_modalities
+            )
+
+            accessory_reports: list[dict[str, Any]] = []
+            if delegated_by_modality:
+                accessory_reports = list(
+                    await asyncio.gather(
+                        *(
+                            _run_accessory_for_modality(mod, mod_atts, clean_task)
+                            for mod, mod_atts in delegated_by_modality.items()
+                        )
+                    )
+                )
+
+            message_parts: list[str] = [clean_task]
+            if native_atts:
+                native_desc = ", ".join(f"{a.name} ({a.kind})" for a in native_atts)
+                message_parts.append(f"\n[Natively attached media: {native_desc}]")
+            if accessory_reports:
+                message_parts.append("\n" + format_accessory_reports_for_primary(accessory_reports))
+
+            human_text = "\n".join(message_parts).strip()
+            current_native_media_attachments.set(native_atts or None)
+            current_accessory_fallback_fn.set(_run_accessory_for_modality)
+
             config = self.make_config(thread_id)
             existing = await self.graph.aget_state(config)
             has_history = bool(existing and existing.values and existing.values.get("messages"))
 
             if has_history:
                 input_payload: dict[str, Any] = {
-                    "messages": [HumanMessage(content=task.strip())],
+                    "messages": [HumanMessage(content=human_text)],
                     "turn_count": 0,
                     "max_turns": max_turns if max_turns is not None else self.max_turns,
                     "next_action": "continue",
@@ -399,7 +637,7 @@ class AgentRuntime:
             else:
                 input_payload = dict(
                     make_initial_state(
-                        [HumanMessage(content=task.strip())],
+                        [HumanMessage(content=human_text)],
                         thread_id=thread_id,
                         max_turns=max_turns if max_turns is not None else self.max_turns,
                     )
@@ -412,8 +650,15 @@ class AgentRuntime:
                 result["thinking"] = "\n\n".join(run_activity["thinking_segments"]).strip()
             result["tool_events"] = list(run_activity["tool_events"])
             result["file_changes"] = list(run_activity["file_changes"])
+            if run_activity["accessory_reports"]:
+                existing_reports = list(result.get("subagent_reports") or [])
+                result["subagent_reports"] = [*run_activity["accessory_reports"], *existing_reports]
             return result
         finally:
+            current_primary_meta.reset(prim_meta_tok)
+            current_accessory_fallback_fn.reset(fallback_fn_tok)
+            current_native_media_attachments.reset(native_media_tok)
+            current_uploads_dir.reset(uploads_tok)
             current_run_activity.reset(act_tok)
             current_progress_callback.reset(prog_tok)
             current_dynamic_skills.reset(skills_tok)
@@ -485,6 +730,7 @@ class AgentRuntime:
         skills_tok = current_dynamic_skills.set(parsed_skills or None)
         prog_tok = current_progress_callback.set(progress_callback)
         act_tok = current_run_activity.set(run_activity)
+        prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
         try:
             config = self.make_config(thread_id)
             await self.graph.ainvoke(Command(resume=decision), config=config)
@@ -496,6 +742,7 @@ class AgentRuntime:
             result["file_changes"] = list(run_activity["file_changes"])
             return result
         finally:
+            current_primary_meta.reset(prim_meta_tok)
             current_run_activity.reset(act_tok)
             current_progress_callback.reset(prog_tok)
             current_dynamic_skills.reset(skills_tok)
@@ -540,6 +787,7 @@ class AgentRuntime:
             "pending_approval": interrupts[0] if interrupts else None,
             "interrupts": interrupts,
             "subagent_reports": values.get("subagent_reports", []),
+            "context_usage": values.get("context_usage") or None,
             "error": values.get("error"),
         }
 
@@ -1297,14 +1545,23 @@ def build_supervisor_graph(
         active_tool_list = list(active_tools.values())
         dynamic_skill_catalog = resolved_skills.format_catalog_for_prompt()
         loaded_skills_text = build_loaded_skills_context(active_skills, resolved_skills)
-        sys_prompt = build_supervisor_system_prompt(
-            skill_catalog_text=dynamic_skill_catalog,
-            loaded_skills_text=loaded_skills_text,
-            available_tool_names=list(active_tools.keys()),
-            plan=updated_plan,
-            turn_count=turn_count,
-            max_turns=effective_max,
-        )
+        compacted_summary = str(state.get("compacted_summary") or "")
+        compaction_count = int(state.get("compaction_count") or 0)
+        last_compacted_at: str | None = state.get("last_compacted_at")
+        last_compaction_saved_tokens = int(state.get("last_compaction_saved_tokens") or 0)
+
+        def _build_full_system_prompt(summary_text: str) -> str:
+            base_sys = build_supervisor_system_prompt(
+                skill_catalog_text=dynamic_skill_catalog,
+                loaded_skills_text=loaded_skills_text,
+                available_tool_names=list(active_tools.keys()),
+                plan=updated_plan,
+                turn_count=turn_count,
+                max_turns=effective_max,
+            )
+            return base_sys + build_compacted_memory_block(summary_text)
+
+        sys_prompt = _build_full_system_prompt(compacted_summary)
 
         override_primary = current_primary_model.get()
         has_dynamic_tools = bool(current_extra_tools.get())
@@ -1318,9 +1575,155 @@ def build_supervisor_graph(
             active_bound_model = primary_model.bind_tools(active_tool_list)
         else:
             active_bound_model = default_bound_model
-        sanitized_history = _sanitize_messages_for_llm(messages)
-        llm_input_messages: list[BaseMessage] = [SystemMessage(content=sys_prompt), *sanitized_history]
         base_candidate = override_primary if override_primary is not None else primary_model
+
+        active_primary_meta = current_primary_meta.get() or _describe_model_instance(base_candidate)
+        active_provider_name = str(active_primary_meta.get("provider") or "")
+        active_model_name = str(active_primary_meta.get("model") or "")
+        explicit_ctx_window = active_primary_meta.get("context_window")
+        if not isinstance(explicit_ctx_window, int) or explicit_ctx_window < 512:
+            model_attr_ctx = getattr(base_candidate, "context_window", None)
+            explicit_ctx_window = (
+                int(model_attr_ctx)
+                if isinstance(model_attr_ctx, int) and model_attr_ctx >= 512
+                else None
+            )
+        explicit_max_out = active_primary_meta.get("max_output_tokens")
+        if not isinstance(explicit_max_out, int) or explicit_max_out < 256:
+            model_attr_out = getattr(base_candidate, "max_output_tokens", None)
+            explicit_max_out = (
+                int(model_attr_out)
+                if isinstance(model_attr_out, int) and model_attr_out >= 256
+                else None
+            )
+        configured_max_toks = active_primary_meta.get("max_tokens")
+        if not isinstance(configured_max_toks, int) or configured_max_toks < 64:
+            configured_max_toks = None
+
+        pre_context_usage = compute_context_usage(
+            provider=active_provider_name,
+            model=active_model_name,
+            explicit_context_window=explicit_ctx_window,
+            explicit_max_output_tokens=explicit_max_out,
+            configured_max_tokens=configured_max_toks,
+            system_prompt_text=sys_prompt,
+            skill_catalog_text=dynamic_skill_catalog,
+            loaded_skills_text=loaded_skills_text,
+            tools=active_tool_list,
+            messages=messages,
+            compacted_summary=compacted_summary,
+            compaction_count=compaction_count,
+            last_compacted_at=last_compacted_at,
+            tokens_saved_last_compaction=last_compaction_saved_tokens,
+        )
+
+        # Auto-compact conversation strictly at >= 80% of this model's context window ONLY
+        removal_messages: list[RemoveMessage] = []
+        usage_ratio = pre_context_usage["used_tokens"] / max(1, pre_context_usage["context_window"])
+        if should_auto_compact(usage_ratio, len(messages)):
+            compact_ev_id = f"compact-{compaction_count + 1}-{turn_count}"
+            compact_start_ev = {
+                "id": compact_ev_id,
+                "tool": "auto_compact_context",
+                "args_summary": (
+                    f"{pre_context_usage['usage_percent']}% of "
+                    f"{pre_context_usage['context_window']:,} tokens ({active_model_name or 'primary'})"
+                )[:160],
+                "status": "running",
+                "started_at": utc_now_iso(),
+            }
+            _record_run_tool_event(compact_start_ev)
+            emit_progress(
+                "compacting_context",
+                turn_count=turn_count,
+                tool="auto_compact_context",
+                tool_event=compact_start_ev,
+                context_usage=pre_context_usage,
+                detail=(
+                    f"Context reached {pre_context_usage['usage_percent']}% "
+                    f"(>= {AUTO_COMPACT_THRESHOLD_PERCENT}% threshold) — auto-compacting earlier turns..."
+                ),
+            )
+            removals, remaining_msgs, new_summary, saved_tokens = await compact_conversation_history(
+                messages,
+                summarizer_model=base_candidate,
+                existing_summary=compacted_summary,
+                keep_recent_turns=2,
+            )
+            if removals or (new_summary and new_summary != compacted_summary):
+                removal_messages = removals
+                messages = remaining_msgs
+                compacted_summary = new_summary
+                compaction_count += 1
+                last_compacted_at = utc_now_iso()
+                last_compaction_saved_tokens = saved_tokens
+                sys_prompt = _build_full_system_prompt(compacted_summary)
+                pre_context_usage = compute_context_usage(
+                    provider=active_provider_name,
+                    model=active_model_name,
+                    explicit_context_window=explicit_ctx_window,
+                    explicit_max_output_tokens=explicit_max_out,
+                    configured_max_tokens=configured_max_toks,
+                    system_prompt_text=sys_prompt,
+                    skill_catalog_text=dynamic_skill_catalog,
+                    loaded_skills_text=loaded_skills_text,
+                    tools=active_tool_list,
+                    messages=messages,
+                    compacted_summary=compacted_summary,
+                    compaction_count=compaction_count,
+                    last_compacted_at=last_compacted_at,
+                    tokens_saved_last_compaction=last_compaction_saved_tokens,
+                )
+            compact_done_ev = {
+                "id": compact_ev_id,
+                "tool": "auto_compact_context",
+                "args_summary": compact_start_ev["args_summary"],
+                "status": "ok",
+                "output_summary": (
+                    f"Saved ~{saved_tokens:,} tokens; now at {pre_context_usage['usage_percent']}% "
+                    f"({pre_context_usage['used_tokens']:,} / {pre_context_usage['context_window']:,})"
+                )[:180],
+                "finished_at": utc_now_iso(),
+            }
+            _record_run_tool_event(compact_done_ev)
+            emit_progress(
+                "act_tool_done",
+                turn_count=turn_count,
+                tool="auto_compact_context",
+                tool_event=compact_done_ev,
+                context_usage=pre_context_usage,
+                detail=(
+                    f"Auto-compacted conversation at 80% threshold "
+                    f"(now {pre_context_usage['usage_percent']}%)"
+                ),
+            )
+
+        sanitized_history = _sanitize_messages_for_llm(messages)
+        native_media_atts = current_native_media_attachments.get()
+        if native_media_atts:
+            for rev_idx in range(len(sanitized_history) - 1, -1, -1):
+                if isinstance(sanitized_history[rev_idx], HumanMessage):
+                    orig_hm = sanitized_history[rev_idx]
+                    orig_text = (
+                        orig_hm.content
+                        if isinstance(orig_hm.content, str)
+                        else str(orig_hm.content or "")
+                    )
+                    try:
+                        mm_blocks = build_multimodal_content_blocks(
+                            orig_text,
+                            native_media_atts,
+                            allowed_uploads_dir=current_uploads_dir.get(),
+                        )
+                        sanitized_history[rev_idx] = HumanMessage(
+                            content=mm_blocks,
+                            additional_kwargs=dict(getattr(orig_hm, "additional_kwargs", None) or {}),
+                        )
+                    except Exception as mm_exc:  # noqa: BLE001
+                        logger.warning("Failed to encode native media attachment: %s", mm_exc)
+                    break
+
+        llm_input_messages: list[BaseMessage] = [SystemMessage(content=sys_prompt), *sanitized_history]
 
         async def _call_model_resilient(
             bound_candidate: Any,
@@ -1372,6 +1775,7 @@ def build_supervisor_graph(
         emit_progress(
             "thinking",
             turn_count=turn_count,
+            context_usage=pre_context_usage,
             detail=(
                 "Analyzing your request..."
                 if turn_count == 1
@@ -1387,18 +1791,75 @@ def build_supervisor_graph(
         except GraphInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
-            err_msg = f"Primary model error during planning: {exc}"
-            logger.error(err_msg)
-            return {
-                "turn_count": turn_count,
-                "plan": update_plan_step(
-                    updated_plan, current_step_id, status="failed", result=err_msg
-                ),
-                "current_step_id": current_step_id,
-                "next_action": "complete",
-                "error": err_msg,
-                "final_response": f"Agent stopped due to model error: {err_msg}",
-            }
+            # Runtime safety net: if the primary model unexpectedly rejects native multimodal blocks,
+            # automatically delegate those attachments to the configured Accessory sub-agent(s) and retry!
+            fallback_fn = current_accessory_fallback_fn.get()
+            if native_media_atts and fallback_fn is not None and is_unsupported_modality_error(exc):
+                logger.warning(
+                    "Primary model rejected native media (%s); automatically delegating to Accessory sub-agent(s).",
+                    exc,
+                )
+                grouped: dict[MediaModality, list[MediaAttachment]] = {}
+                for att in native_media_atts:
+                    grouped.setdefault(att.kind, []).append(att)
+                fallback_reports = list(
+                    await asyncio.gather(
+                        *(
+                            fallback_fn(mod, mod_atts, user_goal)
+                            for mod, mod_atts in grouped.items()
+                        )
+                    )
+                )
+                current_native_media_attachments.set(None)
+                report_block = format_accessory_reports_for_primary(fallback_reports)
+                text_only_history = _sanitize_messages_for_llm(messages)
+                for rev_idx in range(len(text_only_history) - 1, -1, -1):
+                    if isinstance(text_only_history[rev_idx], HumanMessage):
+                        orig_hm = text_only_history[rev_idx]
+                        orig_text = (
+                            orig_hm.content
+                            if isinstance(orig_hm.content, str)
+                            else str(orig_hm.content or "")
+                        )
+                        text_only_history[rev_idx] = HumanMessage(
+                            content=f"{orig_text}\n\n{report_block}".strip()
+                        )
+                        break
+                llm_input_messages = [SystemMessage(content=sys_prompt), *text_only_history]
+                try:
+                    ai_reply = await _call_model_resilient(
+                        active_bound_model,
+                        base_candidate,
+                        llm_input_messages,
+                    )
+                except GraphInterrupt:
+                    raise
+                except Exception as retry_exc:  # noqa: BLE001
+                    err_msg = f"Primary model error after Accessory fallback: {retry_exc}"
+                    logger.error(err_msg)
+                    return {
+                        "turn_count": turn_count,
+                        "plan": update_plan_step(
+                            updated_plan, current_step_id, status="failed", result=err_msg
+                        ),
+                        "current_step_id": current_step_id,
+                        "next_action": "complete",
+                        "error": err_msg,
+                        "final_response": f"Agent stopped due to model error: {err_msg}",
+                    }
+            else:
+                err_msg = f"Primary model error during planning: {exc}"
+                logger.error(err_msg)
+                return {
+                    "turn_count": turn_count,
+                    "plan": update_plan_step(
+                        updated_plan, current_step_id, status="failed", result=err_msg
+                    ),
+                    "current_step_id": current_step_id,
+                    "next_action": "complete",
+                    "error": err_msg,
+                    "final_response": f"Agent stopped due to model error: {err_msg}",
+                }
 
         clean_preamble, turn_thinking = _extract_text_and_thinking(ai_reply)
         _record_run_thinking(turn_thinking)
@@ -1567,11 +2028,31 @@ def build_supervisor_graph(
             if tool_calls and clean_preamble and not clean_preamble.lstrip().startswith("{")
             else None
         )
+        provider_input_toks = extract_provider_input_tokens(ai_reply)
+        post_context_usage = compute_context_usage(
+            provider=active_provider_name,
+            model=active_model_name,
+            explicit_context_window=explicit_ctx_window,
+            explicit_max_output_tokens=explicit_max_out,
+            configured_max_tokens=configured_max_toks,
+            system_prompt_text=sys_prompt,
+            skill_catalog_text=dynamic_skill_catalog,
+            loaded_skills_text=loaded_skills_text,
+            tools=active_tool_list,
+            messages=[*messages, ai_reply],
+            compacted_summary=compacted_summary,
+            provider_input_tokens=provider_input_toks,
+            compaction_count=compaction_count,
+            last_compacted_at=last_compacted_at,
+            tokens_saved_last_compaction=last_compaction_saved_tokens,
+        )
+
         emit_progress(
             "plan_llm_done",
             turn_count=turn_count,
             thinking=turn_thinking,
             activity_note=preamble_note,
+            context_usage=post_context_usage,
             detail=(
                 f"Calling {tool_list_label}"
                 if tool_calls
@@ -1613,11 +2094,16 @@ def build_supervisor_graph(
             ]
 
         return {
-            "messages": [ai_reply],
+            "messages": [*removal_messages, ai_reply],
             "plan": updated_plan,
             "current_step_id": current_step_id,
             "turn_count": turn_count,
             "pending_approval": None,
+            "compacted_summary": compacted_summary,
+            "compaction_count": compaction_count,
+            "last_compacted_at": last_compacted_at,
+            "last_compaction_saved_tokens": last_compaction_saved_tokens,
+            "context_usage": post_context_usage,
             "error": None,
         }
 

@@ -63,6 +63,11 @@ class AgentState(TypedDict, total=False):
     tool_retry_counts: dict[str, int]
     last_observations: list[dict[str, Any]]
     subagent_reports: list[dict[str, Any]]
+    compacted_summary: str
+    compaction_count: int
+    last_compacted_at: str | None
+    last_compaction_saved_tokens: int
+    context_usage: dict[str, Any]
     error: str | None
 
 
@@ -155,5 +160,10 @@ def make_initial_state(
         tool_retry_counts={},
         last_observations=[],
         subagent_reports=[],
+        compacted_summary="",
+        compaction_count=0,
+        last_compacted_at=None,
+        last_compaction_saved_tokens=0,
+        context_usage={},
         error=None,
     )

@@ -6,6 +6,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Loader2,
   RefreshCw,
   Save,
   Search,
@@ -29,9 +30,36 @@ import {
 } from '../lib/filesystemUtils.ts';
 import type { WorkspaceNode } from '../types/agent.ts';
 
+function mergeFolderChildren(
+  nodes: WorkspaceNode[],
+  folderPath: string,
+  children: WorkspaceNode[],
+  truncated = false,
+): WorkspaceNode[] {
+  return nodes.map((node) => {
+    if (node.type === 'folder' && node.path === folderPath) {
+      return {
+        ...node,
+        children,
+        hasChildren: children.length > 0,
+        childCount: children.length,
+        truncated,
+      };
+    }
+    if (node.type === 'folder' && node.children && node.children.length > 0) {
+      return {
+        ...node,
+        children: mergeFolderChildren(node.children, folderPath, children, truncated),
+      };
+    }
+    return node;
+  });
+}
+
 export function FilesystemView() {
   const [tree, setTree] = useState<WorkspaceNode[]>([]);
   const [loadingTree, setLoadingTree] = useState(true);
+  const [loadingFolders, setLoadingFolders] = useState<Record<string, boolean>>({});
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({});
 
@@ -75,10 +103,10 @@ export function FilesystemView() {
 
   async function handleSelectFile(filePath: string) {
     setFeedback(null);
-    setSelectedPath(filePath);
     setLoadingFile(true);
     try {
       const data = await readWorkspaceFile(filePath);
+      setSelectedPath(filePath);
       setFileContent(data.content);
       setSavedContent(data.content);
       setFileMeta({ size: data.size, modifiedAt: data.modifiedAt });
@@ -167,14 +195,42 @@ export function FilesystemView() {
     }
   }
 
-  function toggleFolder(folderPath: string) {
-    setExpandedFolders((prev) => ({ ...prev, [folderPath]: !(prev[folderPath] ?? true) }));
+  async function toggleFolder(node: WorkspaceNode) {
+    const folderPath = node.path;
+    const currentlyOpen = expandedFolders[folderPath] ?? false;
+    const nextOpen = !currentlyOpen;
+    setExpandedFolders((prev) => ({ ...prev, [folderPath]: nextOpen }));
+
+    if (nextOpen && (node.children === undefined || node.truncated)) {
+      setLoadingFolders((prev) => ({ ...prev, [folderPath]: true }));
+      try {
+        const res = await fetchWorkspaceTree(folderPath);
+        setTree((prev) =>
+          mergeFolderChildren(prev, folderPath, res.entries || [], Boolean(res.truncated)),
+        );
+      } catch (err) {
+        setFeedback({
+          type: 'error',
+          text: err instanceof Error ? err.message : `Unable to list /workspace/${folderPath}.`,
+        });
+      } finally {
+        setLoadingFolders((prev) => ({ ...prev, [folderPath]: false }));
+      }
+    }
   }
 
   function renderTreeNodes(nodes: WorkspaceNode[], depth = 0) {
+    const isSearching = searchQuery.trim().length > 0;
     return nodes.map((node) => {
       if (node.type === 'folder') {
-        const isOpen = expandedFolders[node.path] ?? true;
+        const isOpen = isSearching ? true : (expandedFolders[node.path] ?? false);
+        const isLoading = Boolean(loadingFolders[node.path]);
+        const itemCount =
+          typeof node.childCount === 'number'
+            ? node.childCount
+            : Array.isArray(node.children)
+              ? node.children.length
+              : null;
         return (
           <div key={node.path}>
             <div
@@ -183,10 +239,13 @@ export function FilesystemView() {
             >
               <button
                 type="button"
-                onClick={() => toggleFolder(node.path)}
+                onClick={() => void toggleFolder(node)}
+                aria-expanded={isOpen}
                 className="flex items-center gap-1.5 min-w-0 flex-1 text-left cursor-pointer"
               >
-                {isOpen ? (
+                {isLoading ? (
+                  <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-[var(--signal)]" />
+                ) : isOpen ? (
                   <ChevronDown className="w-3.5 h-3.5 shrink-0" />
                 ) : (
                   <ChevronRight className="w-3.5 h-3.5 shrink-0" />
@@ -198,17 +257,30 @@ export function FilesystemView() {
                 )}
                 <span className="truncate font-medium">{node.name}</span>
               </button>
+              {itemCount !== null && (
+                <span className="text-[10px] font-mono tabular-nums text-[var(--ink-faint)] shrink-0 group-hover:hidden">
+                  {itemCount}
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => void handleDelete(node.path)}
                 aria-label={`Delete folder ${node.name}`}
-                className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1 rounded hover:text-[var(--flare)] cursor-pointer"
+                className="hidden group-hover:inline-flex focus:inline-flex p-1 rounded hover:text-[var(--flare)] cursor-pointer"
               >
                 <Trash2 className="w-3 h-3" />
               </button>
             </div>
             {isOpen && node.children && node.children.length > 0 && (
               <div>{renderTreeNodes(node.children, depth + 1)}</div>
+            )}
+            {isOpen && !isLoading && Array.isArray(node.children) && node.children.length === 0 && (
+              <div
+                className="py-1 text-[11px] text-[var(--ink-faint)] italic"
+                style={{ paddingLeft: `${26 + depth * 14}px` }}
+              >
+                Empty folder
+              </div>
             )}
           </div>
         );
@@ -348,7 +420,7 @@ export function FilesystemView() {
           )}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+        <div className="flex-1 overflow-y-auto scrollbar-none p-2 space-y-0.5">
           {loadingTree ? (
             <div className="p-3 text-xs text-[var(--ink-faint)]">Scanning /workspace...</div>
           ) : filteredTree.length === 0 ? (

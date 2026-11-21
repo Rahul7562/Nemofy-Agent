@@ -1,11 +1,13 @@
-"""Local Sandbox Tools (Local Hands): bash_exec, read/write/edit_file, list_dir, web_fetch."""
+"""Local Sandbox Tools (Local Hands): bash_exec, read/write/edit_file, list_dir, web_search, web_fetch."""
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 from contextvars import ContextVar
-from urllib.parse import urlparse
+from html import unescape
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -118,12 +120,256 @@ async def fetch_webpage_markdown(
     return extracted
 
 
+_DEFAULT_SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _unwrap_search_url(raw_href: str) -> str:
+    """Extract clean target http(s) URL from DuckDuckGo redirect links or raw hrefs."""
+    href = unescape((raw_href or "").strip())
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = f"https:{href}"
+    parsed = urlparse(href)
+    if "duckduckgo.com" in (parsed.hostname or "").lower() and parsed.path.startswith("/l/"):
+        qs = parse_qs(parsed.query)
+        uddg = qs.get("uddg")
+        if uddg and uddg[0]:
+            href = unquote(uddg[0])
+            parsed = urlparse(href)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    return href
+
+
+def _parse_ddg_html_results(html_text: str, max_results: int) -> list[dict[str, str]]:
+    """Parse search results from DuckDuckGo's HTML endpoint."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for block in soup.select(".result, .web-result"):
+        link = block.select_one("a.result__a") or block.select_one("h2 a")
+        if not link:
+            continue
+        url = _unwrap_search_url(str(link.get("href") or ""))
+        if not url or url in seen_urls:
+            continue
+        title = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip() or url
+        snippet_el = block.select_one(".result__snippet") or block.select_one("a.result__snippet")
+        snippet = (
+            re.sub(r"\s+", " ", snippet_el.get_text(" ", strip=True)).strip()
+            if snippet_el
+            else ""
+        )
+        seen_urls.add(url)
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _parse_ddg_lite_results(html_text: str, max_results: int) -> list[dict[str, str]]:
+    """Parse search results from DuckDuckGo's Lite endpoint as a resilient fallback."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    links = soup.select("a.result-link")
+    snippets = soup.select("td.result-snippet")
+    for idx, link in enumerate(links):
+        url = _unwrap_search_url(str(link.get("href") or ""))
+        if not url or url in seen_urls:
+            continue
+        title = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip() or url
+        snippet = ""
+        if idx < len(snippets):
+            snippet = re.sub(r"\s+", " ", snippets[idx].get_text(" ", strip=True)).strip()
+        seen_urls.add(url)
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+async def search_web_results(
+    query: str,
+    *,
+    max_results: int = 5,
+    timeout_seconds: float = 15.0,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[list[dict[str, str]], str]:
+    """Run a live web search and return (results, provider_name).
+
+    Uses TAVILY_API_KEY or BRAVE_SEARCH_API_KEY when configured in environment;
+    otherwise uses zero-key DuckDuckGo HTML/Lite search with a Wikipedia OpenSearch fallback.
+    """
+    clean_query = query.strip()
+    if not clean_query:
+        raise ValueError("Search query must not be empty.")
+    clamped = max(1, min(int(max_results), 10))
+    headers = {
+        "User-Agent": _DEFAULT_SEARCH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+        follow_redirects=True,
+        max_redirects=5,
+        headers=headers,
+        transport=transport,
+    ) as client:
+        tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
+        if tavily_key:
+            try:
+                resp = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": tavily_key,
+                        "query": clean_query,
+                        "max_results": clamped,
+                        "search_depth": "basic",
+                    },
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    items = [
+                        {
+                            "title": str(it.get("title") or it.get("url") or "").strip(),
+                            "url": str(it.get("url") or "").strip(),
+                            "snippet": str(it.get("content") or "").strip(),
+                        }
+                        for it in (payload.get("results") or [])
+                        if isinstance(it, dict)
+                        and str(it.get("url") or "").startswith(("http://", "https://"))
+                    ][:clamped]
+                    if items:
+                        return items, "tavily"
+            except Exception:
+                pass
+
+        brave_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+        if brave_key:
+            try:
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": clean_query, "count": clamped},
+                    headers={"X-Subscription-Token": brave_key, "Accept": "application/json"},
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    web_items = (payload.get("web") or {}).get("results") or []
+                    items = [
+                        {
+                            "title": str(it.get("title") or it.get("url") or "").strip(),
+                            "url": str(it.get("url") or "").strip(),
+                            "snippet": str(it.get("description") or "").strip(),
+                        }
+                        for it in web_items
+                        if isinstance(it, dict)
+                        and str(it.get("url") or "").startswith(("http://", "https://"))
+                    ][:clamped]
+                    if items:
+                        return items, "brave"
+            except Exception:
+                pass
+
+        try:
+            resp = await client.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": clean_query, "kl": "us-en"},
+                headers={**headers, "Referer": "https://html.duckduckgo.com/"},
+            )
+            if resp.status_code == 200 and resp.text:
+                parsed = _parse_ddg_html_results(resp.text, clamped)
+                if parsed:
+                    return parsed, "duckduckgo"
+        except Exception:
+            pass
+
+        try:
+            resp = await client.post(
+                "https://lite.duckduckgo.com/lite/",
+                data={"q": clean_query},
+                headers={**headers, "Referer": "https://lite.duckduckgo.com/"},
+            )
+            if resp.status_code == 200 and resp.text:
+                parsed = _parse_ddg_lite_results(resp.text, clamped)
+                if parsed:
+                    return parsed, "duckduckgo_lite"
+        except Exception:
+            pass
+
+        try:
+            resp = await client.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "opensearch",
+                    "search": clean_query,
+                    "limit": clamped,
+                    "namespace": 0,
+                    "format": "json",
+                },
+                headers={"User-Agent": "NemofyAgentCore/2.0", "Accept": "application/json"},
+            )
+            if resp.status_code == 200:
+                arr = resp.json()
+                if isinstance(arr, list) and len(arr) >= 4:
+                    titles, descs, urls = arr[1], arr[2], arr[3]
+                    items = [
+                        {
+                            "title": str(t or u).strip(),
+                            "url": str(u).strip(),
+                            "snippet": str(d or "").strip(),
+                        }
+                        for t, d, u in zip(titles, descs, urls)
+                        if isinstance(u, str) and u.startswith(("http://", "https://"))
+                    ][:clamped]
+                    if items:
+                        return items, "wikipedia"
+        except Exception:
+            pass
+
+    return [], "duckduckgo"
+
+
+def format_search_results_markdown(
+    query: str,
+    results: list[dict[str, str]],
+    provider: str,
+) -> str:
+    """Format web search results into compact Markdown for the LLM."""
+    if not results:
+        return (
+            f"Web search for `{query}` returned no results (source={provider}). "
+            "Try rephrasing the query or fetch a known URL directly with `web_fetch`."
+        )
+    lines: list[str] = [f"Web search results for: **{query}** (source: {provider})\n"]
+    for idx, item in enumerate(results, start=1):
+        title = item.get("title") or item.get("url") or f"Result {idx}"
+        url = item.get("url") or ""
+        snippet = item.get("snippet") or ""
+        lines.append(f"{idx}. **{title}**")
+        lines.append(f"   URL: {url}")
+        if snippet:
+            lines.append(f"   {snippet}")
+    lines.append(
+        "\nTip: Call `web_fetch(url=...)` on any relevant URL above to read the full page content."
+    )
+    return "\n".join(lines)
+
+
 def build_local_tools(
     sandbox: SandboxManager,
     *,
     allow_private_web_fetch: bool = False,
 ) -> list[BaseTool]:
-    """Create the 6 LangChain local execution tools bound to ``sandbox``."""
+    """Create the 7 LangChain local execution tools bound to ``sandbox``."""
 
     @tool("bash_exec")
     async def bash_exec(command: str, timeout: int | None = None) -> str:
@@ -219,6 +465,24 @@ def build_local_tools(
         except (SandboxSecurityError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
             return f"ERROR: {exc}"
 
+    @tool("web_search")
+    async def web_search(query: str, max_results: int = 5) -> str:
+        """Search the live web for up-to-date information, documentation, news, and URLs.
+
+        Args:
+            query: Search query string (keywords or natural-language question).
+            max_results: Maximum number of results to return (1-10, defaults to 5).
+        """
+        try:
+            results, provider = await search_web_results(query, max_results=max_results)
+            return format_search_results_markdown(query, results, provider)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        except httpx.TimeoutException:
+            return f"ERROR: web_search timed out for query {query!r}"
+        except httpx.HTTPError as exc:
+            return f"ERROR: Network error searching for {query!r}: {type(exc).__name__}"
+
     @tool("web_fetch")
     async def web_fetch(url: str) -> str:
         """Fetch a webpage and extract clean Markdown text.
@@ -240,4 +504,4 @@ def build_local_tools(
         except httpx.HTTPError as exc:
             return f"ERROR: Network error fetching {url}: {type(exc).__name__}"
 
-    return [bash_exec, read_file, write_file, edit_file, list_dir, web_fetch]
+    return [bash_exec, read_file, write_file, edit_file, list_dir, web_search, web_fetch]

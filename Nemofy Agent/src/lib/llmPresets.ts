@@ -1,4 +1,11 @@
-import type { PersistedLLMConfig, ProviderModelOption, RoleLLMConfig } from '../types/agent.ts';
+import type {
+  AccessoriesConfig,
+  AccessoryLLMConfig,
+  MediaModality,
+  PersistedLLMConfig,
+  ProviderModelOption,
+  RoleLLMConfig,
+} from '../types/agent.ts';
 import { getThinkingProfile, normalizeThinkingLevel } from './thinkingModes.ts';
 
 export interface ProviderPreset {
@@ -67,6 +74,7 @@ export const LLM_PROVIDER_PRESETS: ProviderPreset[] = [
     label: 'OpenRouter',
     baseUrl: 'https://openrouter.ai/api/v1',
     defaultModels: [
+      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
       'anthropic/claude-opus-4.6',
       'openai/gpt-5.2',
       'deepseek/deepseek-r1',
@@ -154,11 +162,15 @@ export function getProviderPreset(providerId: string): ProviderPreset | undefine
   return LLM_PROVIDER_PRESETS.find((p) => p.id === canonical);
 }
 
-export function applyProviderPreset(current: RoleLLMConfig, nextProviderId: string): RoleLLMConfig {
+export function applyProviderPreset(
+  current: RoleLLMConfig,
+  nextProviderId: string,
+  options?: { clearModelOnProviderSwitch?: boolean },
+): RoleLLMConfig {
   const canonicalNext = canonicalizeProviderId(nextProviderId);
   const preset = getProviderPreset(canonicalNext);
   if (!preset) {
-    return { ...current, provider: canonicalNext };
+    return { ...current, provider: canonicalNext, context_window: undefined, max_output_tokens: undefined };
   }
 
   const isSameProvider = canonicalizeProviderId(current.provider) === preset.id;
@@ -171,8 +183,10 @@ export function applyProviderPreset(current: RoleLLMConfig, nextProviderId: stri
       : preset.baseUrl;
 
   const nextModel = isSameProvider
-    ? current.model || preset.defaultModels[0] || ''
-    : preset.defaultModels[0] || '';
+    ? current.model || (options?.clearModelOnProviderSwitch ? '' : preset.defaultModels[0] || '')
+    : options?.clearModelOnProviderSwitch
+      ? ''
+      : preset.defaultModels[0] || '';
 
   const profile = getThinkingProfile(preset.id, nextModel);
   return {
@@ -180,6 +194,8 @@ export function applyProviderPreset(current: RoleLLMConfig, nextProviderId: stri
     provider: preset.id,
     base_url: nextBaseUrl,
     model: nextModel,
+    context_window: isSameProvider ? current.context_window : undefined,
+    max_output_tokens: isSameProvider ? current.max_output_tokens : undefined,
     reasoning_effort: normalizeThinkingLevel(profile, current.reasoning_effort),
   };
 }
@@ -250,11 +266,268 @@ export function formatContextLength(tokens?: number | null): string | null {
   return `${tokens} ctx`;
 }
 
-export function validateLLMConfig(config: PersistedLLMConfig): { valid: boolean; error?: string } {
-  const roles: Array<{ label: string; cfg: RoleLLMConfig }> = [
-    { label: 'Main Agent', cfg: config.primary },
-    { label: 'Sub-Agent', cfg: config.worker },
-  ];
+export function formatOutputLength(tokens?: number | null): string | null {
+  if (!tokens || !Number.isFinite(tokens) || tokens <= 0) return null;
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M out`;
+  }
+  if (tokens >= 1000) {
+    return `${Math.round(tokens / 1000)}k out`;
+  }
+  return `${tokens} out`;
+}
+
+export const DEFAULT_ACCESSORY_PROVIDER = 'openrouter';
+export const DEFAULT_ACCESSORY_MODEL = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free';
+export const DEFAULT_ACCESSORY_BASE_URL = 'https://openrouter.ai/api/v1';
+
+export function getDefaultAccessoryEntry(): AccessoryLLMConfig {
+  return {
+    enabled: true,
+    provider: DEFAULT_ACCESSORY_PROVIDER,
+    model: DEFAULT_ACCESSORY_MODEL,
+    base_url: DEFAULT_ACCESSORY_BASE_URL,
+    temperature: 0.2,
+    max_tokens: 4096,
+    reasoning_effort: 'low',
+  };
+}
+
+export function getDefaultAccessoriesConfig(): AccessoriesConfig {
+  return {
+    image: getDefaultAccessoryEntry(),
+    video: getDefaultAccessoryEntry(),
+    audio: getDefaultAccessoryEntry(),
+  };
+}
+
+export function normalizeAccessoriesConfig(
+  raw?: Partial<Record<MediaModality, Partial<AccessoryLLMConfig>>> | null,
+): AccessoriesConfig {
+  const defaults = getDefaultAccessoriesConfig();
+  const out: AccessoriesConfig = { ...defaults };
+  for (const mod of ['image', 'video', 'audio'] as const) {
+    const incoming = raw?.[mod];
+    if (incoming && typeof incoming === 'object') {
+      out[mod] = {
+        ...defaults[mod],
+        ...incoming,
+        enabled: typeof incoming.enabled === 'boolean' ? incoming.enabled : defaults[mod].enabled,
+        provider: (incoming.provider || defaults[mod].provider).trim(),
+        model: (incoming.model || defaults[mod].model).trim(),
+        base_url: (incoming.base_url || defaults[mod].base_url).trim(),
+        temperature:
+          typeof incoming.temperature === 'number' && Number.isFinite(incoming.temperature)
+            ? incoming.temperature
+            : defaults[mod].temperature,
+        max_tokens:
+          typeof incoming.max_tokens === 'number' && Number.isFinite(incoming.max_tokens)
+            ? Math.round(incoming.max_tokens)
+            : defaults[mod].max_tokens,
+        reasoning_effort: (incoming.reasoning_effort || defaults[mod].reasoning_effort).trim(),
+      };
+    }
+  }
+  return out;
+}
+
+const OMNI_ALL_PATTERNS = [
+  'omni',
+  'gemini-1.5',
+  'gemini-2',
+  'gemini-2.5',
+  'gemini-3',
+  'gemini-4',
+  'gemini-flash',
+  'gemini-pro',
+  'qwen2.5-omni',
+  'qwen3-omni',
+  'minicpm-o',
+];
+
+const TEXT_ONLY_OVERRIDES = [
+  'deepseek-r1',
+  'deepseek-v3',
+  'deepseek-chat',
+  'deepseek-reasoner',
+  'deepseek-coder',
+  'qwen2.5-coder',
+  'qwen3-coder',
+  'o1-mini',
+  'o3-mini',
+  'llama-3.1',
+  'llama-3.3',
+  'gpt-3.5',
+  'text-embedding',
+  'embed',
+  'rerank',
+];
+
+const VISION_PATTERNS = [
+  'deepseek-v4',
+  'gpt-4o',
+  'gpt-4.1',
+  'gpt-4-vision',
+  'gpt-4-turbo',
+  'gpt-5',
+  'claude-3',
+  'claude-4',
+  'claude-sonnet',
+  'claude-opus',
+  'claude-haiku',
+  'gemma-3',
+  'gemma-4',
+  'llama-4',
+  'llama-3.2-11b-vision',
+  'llama-3.2-90b-vision',
+  'pixtral',
+  'mistral-small-3',
+  'mistral-large-2',
+  'grok-2-vision',
+  'grok-3',
+  'grok-4',
+  'kimi-k2.5',
+  'kimi-k3',
+  'glm-4v',
+  'glm-4.5v',
+  'glm-5',
+  'qwen2-vl',
+  'qwen2.5-vl',
+  'qwen3-vl',
+  '-vl',
+  '_vl',
+  'vision',
+  'multimodal',
+  'internvl',
+  'llava',
+  'minicpm-v',
+  'molmo',
+  'cogvlm',
+  'phi-3.5-vision',
+  'phi-4-multimodal',
+];
+
+const AUDIO_PATTERNS = [
+  'gpt-4o-audio',
+  'gpt-audio',
+  'voxtral',
+  'phi-4-multimodal',
+  'ultravox',
+  'whisper',
+];
+
+/**
+ * Mirrors Agent-Core's detect_model_input_modalities so the UI accurately displays
+ * which modalities are handled natively by the Primary LLM vs delegated to Accessory sub-agents.
+ */
+export function detectModelInputModalities(
+  _provider?: string | null,
+  model?: string | null,
+  explicitModalities?: string[] | null,
+): Set<'text' | MediaModality> {
+  if (Array.isArray(explicitModalities) && explicitModalities.length > 0) {
+    const out = new Set<'text' | MediaModality>(['text']);
+    for (const item of explicitModalities) {
+      const clean = String(item || '').trim().toLowerCase();
+      if (clean === 'image' || clean === 'video' || clean === 'audio') {
+        out.add(clean);
+      }
+    }
+    return out;
+  }
+
+  const modalities = new Set<'text' | MediaModality>(['text']);
+  const m = (model || '').trim().toLowerCase();
+  if (!m) return modalities;
+
+  if (OMNI_ALL_PATTERNS.some((pat) => m.includes(pat))) {
+    if (!m.includes('embedding') && !m.includes('imagen') && !m.includes('tts')) {
+      modalities.add('image');
+      modalities.add('audio');
+      modalities.add('video');
+      return modalities;
+    }
+  }
+
+  if (
+    TEXT_ONLY_OVERRIDES.some((pat) => m.includes(pat)) &&
+    !['vl', 'vision', 'omni', 'audio', 'multimodal'].some((tag) => m.includes(tag))
+  ) {
+    return modalities;
+  }
+
+  if (/(?:^|\/)(?:o1|o3|o4)(?:$|[-_:]|\b)/.test(m) && !m.includes('mini')) {
+    modalities.add('image');
+  }
+
+  if (VISION_PATTERNS.some((pat) => m.includes(pat))) {
+    modalities.add('image');
+  }
+
+  if (AUDIO_PATTERNS.some((pat) => m.includes(pat))) {
+    modalities.add('audio');
+  }
+
+  if (m.includes('video') && !m.includes('embed')) {
+    modalities.add('video');
+  }
+
+  return modalities;
+}
+
+export function classifyFileModality(mimeType: string, filename: string): MediaModality | null {
+  const mime = (mimeType || '').toLowerCase().split(';')[0].trim();
+  const ext = (filename || '').toLowerCase().split('.').pop() || '';
+  if (mime === 'image/svg+xml' || ext === 'svg') return null;
+  if (mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) {
+    return 'image';
+  }
+  if (
+    mime.startsWith('audio/') ||
+    ['wav', 'mp3', 'ogg', 'opus', 'flac', 'm4a', 'aac'].includes(ext)
+  ) {
+    return 'audio';
+  }
+  if (mime.startsWith('video/') || ['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v'].includes(ext)) {
+    return 'video';
+  }
+  return null;
+}
+
+export function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function validateLLMConfig(
+  config: PersistedLLMConfig,
+  scope: 'all' | 'llm' | 'accessories' = 'all',
+): { valid: boolean; error?: string } {
+  const roles: Array<{ label: string; cfg: RoleLLMConfig }> = [];
+
+  if (scope === 'all' || scope === 'llm') {
+    roles.push(
+      { label: 'Main Agent', cfg: config.primary },
+      { label: 'Sub-Agent', cfg: config.worker },
+    );
+  }
+
+  if ((scope === 'all' || scope === 'accessories') && config.accessories) {
+    const modLabels: Array<{ key: MediaModality; label: string }> = [
+      { key: 'image', label: 'Image Accessory' },
+      { key: 'video', label: 'Video Accessory' },
+      { key: 'audio', label: 'Audio Accessory' },
+    ];
+    for (const { key, label } of modLabels) {
+      const entry = config.accessories[key];
+      if (entry && entry.enabled) {
+        roles.push({ label, cfg: entry });
+      }
+    }
+  }
 
   for (const { label, cfg } of roles) {
     if (!cfg.provider.trim()) {
@@ -269,12 +542,15 @@ export function validateLLMConfig(config: PersistedLLMConfig): { valid: boolean;
     if (Number.isNaN(cfg.temperature) || cfg.temperature < 0 || cfg.temperature > 2) {
       return { valid: false, error: `${label}: temperature must be between 0 and 2.` };
     }
-    if (Number.isNaN(cfg.max_tokens) || cfg.max_tokens < 128 || cfg.max_tokens > 128000) {
-      return { valid: false, error: `${label}: max tokens must be between 128 and 128,000.` };
+    if (Number.isNaN(cfg.max_tokens) || cfg.max_tokens < 128 || cfg.max_tokens > 20_000_000) {
+      return { valid: false, error: `${label}: max output tokens must be between 128 and 20,000,000.` };
     }
   }
 
-  if (Number.isNaN(config.max_turns) || config.max_turns < 1 || config.max_turns > 100) {
+  if (
+    (scope === 'all' || scope === 'llm') &&
+    (Number.isNaN(config.max_turns) || config.max_turns < 1 || config.max_turns > 100)
+  ) {
     return { valid: false, error: 'Max execution turns must be between 1 and 100.' };
   }
 

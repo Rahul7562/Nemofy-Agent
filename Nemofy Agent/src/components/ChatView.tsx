@@ -1,20 +1,27 @@
 import {
+  AudioLines,
+  Brain,
   Check,
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  Image as ImageIcon,
   Layers,
+  Loader2,
   MessageSquarePlus,
+  Paperclip,
   Send,
   ShieldAlert,
   SlidersHorizontal,
   Sparkles,
   Square,
   Trash2,
+  Video as VideoIcon,
   X,
-  Brain,
 } from 'lucide-react';
 import {
+  type ClipboardEvent,
+  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   useEffect,
@@ -36,7 +43,15 @@ import {
   pollChatJob,
   resumeApproval,
   startChatJob,
+  uploadChatMedia,
 } from '../lib/apiClient.ts';
+import {
+  classifyFileModality,
+  detectModelInputModalities,
+  formatFileSize,
+  normalizeAccessoriesConfig,
+} from '../lib/llmPresets.ts';
+import { computeModelContextUsage } from '../lib/contextUtils.ts';
 import { computeAutoGrowHeight, resolveScrollPinState } from '../lib/scrollUtils.ts';
 import {
   type ThinkingLevel,
@@ -45,18 +60,24 @@ import {
   normalizeThinkingLevel,
 } from '../lib/thinkingModes.ts';
 import type {
+  ChatAttachment,
   ChatMessage,
   ChatThread,
   LiveAgentActivity,
   PersistedLLMConfig,
 } from '../types/agent.ts';
 import { AgentActivityPanel } from './AgentActivityPanel.tsx';
+import { ContextUsageRing } from './ContextUsageRing.tsx';
 import { MarkdownMessage } from './MarkdownMessage.tsx';
+
+const MEDIA_ACCEPT_ATTR =
+  'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-matroska,audio/mpeg,audio/wav,audio/ogg,audio/flac,audio/mp4,audio/aac,audio/webm';
 
 interface ChatViewProps {
   llmConfig: PersistedLLMConfig | null;
   onPrimaryThinkingChange?: (level: ThinkingLevel) => void;
   onOpenLLMSettings: () => void;
+  onOpenAccessoriesSettings?: () => void;
 }
 
 function cleanThreadTitle(raw: string): string {
@@ -142,16 +163,136 @@ function MessageMetadata({ msg }: { msg: ChatMessage }) {
 
       {reportsOpen && hasReports && (
         <div className="space-y-2">
-          {msg.subagentReports!.map((rep, idx) => (
-            <pre
-              key={idx}
-              className="p-2.5 rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] font-mono text-[11px] text-[var(--ink-soft)] overflow-x-auto"
-            >
-              {JSON.stringify(rep, null, 2)}
-            </pre>
-          ))}
+          {msg.subagentReports!.map((rep, idx) => {
+            const findings = typeof rep.findings === 'string' ? rep.findings : null;
+            const modality = typeof rep.modality === 'string' ? rep.modality : null;
+            const modelName = typeof rep.model === 'string' ? rep.model : null;
+            const providerName = typeof rep.provider === 'string' ? rep.provider : null;
+            if (findings && modality) {
+              return (
+                <div
+                  key={idx}
+                  className="p-3 rounded-lg bg-[var(--paper-sunk)] border border-[var(--rule)] space-y-1.5"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                    <span className="font-semibold uppercase tracking-wide text-[var(--signal)]">
+                      {modality} Accessory Sub-Agent
+                    </span>
+                    {modelName && (
+                      <span className="font-mono text-[10px] text-[var(--ink-faint)]">
+                        {providerName ? `${providerName}: ` : ''}
+                        {modelName}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-[var(--ink-soft)] whitespace-pre-wrap leading-relaxed">
+                    {findings}
+                  </p>
+                </div>
+              );
+            }
+            return (
+              <pre
+                key={idx}
+                className="p-2.5 rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] font-mono text-[11px] text-[var(--ink-soft)] overflow-x-auto"
+              >
+                {JSON.stringify(rep, null, 2)}
+              </pre>
+            );
+          })}
         </div>
       )}
+    </div>
+  );
+}
+
+function MessageAttachments({
+  attachments,
+  isUser,
+  onPreviewImage,
+}: {
+  attachments: ChatAttachment[];
+  isUser: boolean;
+  onPreviewImage: (att: ChatAttachment) => void;
+}) {
+  if (!attachments || attachments.length === 0) return null;
+  return (
+    <div className="mb-2.5 flex flex-wrap gap-2">
+      {attachments.map((att) => {
+        if (att.kind === 'image') {
+          return (
+            <button
+              key={att.id}
+              type="button"
+              onClick={() => onPreviewImage(att)}
+              title={`Preview ${att.name}`}
+              className={`group relative overflow-hidden rounded-lg border cursor-pointer text-left ${
+                isUser
+                  ? 'border-white/25 bg-black/15'
+                  : 'border-[var(--rule)] bg-[var(--paper-sunk)]'
+              }`}
+            >
+              <img
+                src={att.url}
+                alt={att.name}
+                className="max-h-52 max-w-[260px] object-cover block"
+              />
+              <div className="px-2 py-1 text-[10px] font-mono truncate max-w-[260px] bg-black/45 text-white">
+                {att.name}
+              </div>
+            </button>
+          );
+        }
+        if (att.kind === 'video') {
+          return (
+            <div
+              key={att.id}
+              className={`w-full max-w-sm rounded-lg overflow-hidden border ${
+                isUser
+                  ? 'border-white/25 bg-black/25'
+                  : 'border-[var(--rule)] bg-[var(--paper-sunk)]'
+              }`}
+            >
+              <video
+                src={att.url}
+                controls
+                preload="metadata"
+                className="w-full max-h-56 bg-black block"
+              />
+              <div
+                className={`px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] ${
+                  isUser ? 'text-white/90' : 'text-[var(--ink-soft)]'
+                }`}
+              >
+                <span className="inline-flex items-center gap-1.5 truncate font-mono">
+                  <VideoIcon className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">{att.name}</span>
+                </span>
+                <span className="text-[10px] opacity-75 shrink-0">{formatFileSize(att.size)}</span>
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div
+            key={att.id}
+            className={`w-full max-w-sm rounded-lg p-2.5 border space-y-1.5 ${
+              isUser
+                ? 'border-white/25 bg-white/10 text-white'
+                : 'border-[var(--rule)] bg-[var(--paper-sunk)] text-[var(--ink)]'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2 text-[11px]">
+              <span className="inline-flex items-center gap-1.5 truncate font-mono">
+                <AudioLines className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">{att.name}</span>
+              </span>
+              <span className="text-[10px] opacity-75 shrink-0">{formatFileSize(att.size)}</span>
+            </div>
+            <audio src={att.url} controls preload="metadata" className="w-full h-8" />
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -160,25 +301,40 @@ export function ChatView({
   llmConfig,
   onPrimaryThinkingChange,
   onOpenLLMSettings,
+  onOpenAccessoriesSettings,
 }: ChatViewProps) {
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [prompt, setPrompt] = useState('');
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
+  const [uploadingFiles, setUploadingFiles] = useState<string[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const [lightboxImage, setLightboxImage] = useState<ChatAttachment | null>(null);
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [liveActivity, setLiveActivity] = useState<LiveAgentActivity | null>(null);
   const [activityPrefs, setActivityPrefs] = useState<ActivityUserPrefs>(() => readActivityPrefs());
   const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const pollCancelledRef = useRef(false);
   const stopRequestedRef = useRef(false);
   const activeJobIdRef = useRef<string | null>(null);
   const activeAbortRef = useRef<AbortController | null>(null);
 
-  // Adaptive Thinking Mode state (auto-adapts to active primary model capabilities)
+  // Adaptive Thinking Mode & Multimodal Capability Detection
   const primaryProvider = llmConfig?.primary.provider || 'river_ai';
-  const primaryModel = llmConfig?.primary.model || 'deepseek-ai/DeepSeek-V4.1-Flash';
+  const primaryModel = (llmConfig?.primary.model || '').trim();
+  const hasPrimaryModel = primaryModel.length > 0;
+  const primaryModalities = useMemo(
+    () => detectModelInputModalities(primaryProvider, primaryModel),
+    [primaryProvider, primaryModel],
+  );
+  const normalizedAccessories = useMemo(
+    () => normalizeAccessoriesConfig(llmConfig?.accessories),
+    [llmConfig?.accessories],
+  );
   const thinkingProfile = useMemo(
     () => getThinkingProfile(primaryProvider, primaryModel),
     [primaryProvider, primaryModel],
@@ -200,6 +356,11 @@ export function ChatView({
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const activeThread = threads.find((t) => t.id === activeThreadId) || null;
+
+  const contextUsage = useMemo(
+    () => computeModelContextUsage({ thread: activeThread, liveActivity, llmConfig }),
+    [activeThread, liveActivity, llmConfig],
+  );
 
   function handleUpdateActivityPrefs(patch: Partial<ActivityUserPrefs>) {
     setActivityPrefs((prev) => {
@@ -260,6 +421,16 @@ export function ChatView({
       document.removeEventListener('keydown', handleEscape);
     };
   }, [thinkingMenuOpen]);
+
+  // Close image lightbox on Escape
+  useEffect(() => {
+    if (!lightboxImage) return;
+    function handleKey(e: globalThis.KeyboardEvent) {
+      if (e.key === 'Escape') setLightboxImage(null);
+    }
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [lightboxImage]);
 
   function handleSelectThinking(level: ThinkingLevel) {
     setSelectedThinking(level);
@@ -391,14 +562,120 @@ export function ChatView({
     }
   }
 
-  async function submitPrompt(textToSend: string) {
+  async function handleAttachFiles(fileList: FileList | File[]) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0 || sending) return;
+    setError(null);
+
+    const remainingSlots = Math.max(0, 6 - pendingAttachments.length);
+    if (remainingSlots === 0) {
+      setError('You can attach up to 6 media files per message.');
+      return;
+    }
+
+    const toProcess = files.slice(0, remainingSlots);
+    const validFiles: File[] = [];
+    for (const file of toProcess) {
+      const modality = classifyFileModality(file.type, file.name);
+      if (!modality) {
+        setError(
+          `Unsupported file "${file.name}". Attach PNG, JPG, WebP, GIF, MP4, WebM, MOV, MP3, WAV, OGG, FLAC, M4A, or AAC.`,
+        );
+        continue;
+      }
+      validFiles.push(file);
+    }
+    if (validFiles.length === 0) return;
+
+    const names = validFiles.map((f) => f.name);
+    setUploadingFiles((prev) => [...prev, ...names]);
+
+    try {
+      const uploaded: ChatAttachment[] = [];
+      for (const file of validFiles) {
+        try {
+          const att = await uploadChatMedia(file, activeThreadId || undefined);
+          uploaded.push(att);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : `Failed to upload ${file.name}.`);
+        }
+      }
+      if (uploaded.length > 0) {
+        setPendingAttachments((prev) => [...prev, ...uploaded].slice(0, 6));
+      }
+    } finally {
+      setUploadingFiles((prev) => prev.filter((n) => !names.includes(n)));
+    }
+  }
+
+  function handleRemoveAttachment(id: string) {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
+  }
+
+  function handleComposerPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const mediaFiles: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file && classifyFileModality(file.type, file.name)) {
+          mediaFiles.push(file);
+        }
+      }
+    }
+    if (mediaFiles.length > 0) {
+      e.preventDefault();
+      void handleAttachFiles(mediaFiles);
+    }
+  }
+
+  function handleDragOver(e: DragEvent<HTMLDivElement>) {
+    if (e.dataTransfer?.types?.includes('Files')) {
+      e.preventDefault();
+      if (!dragActive) setDragActive(true);
+    }
+  }
+
+  function handleDragLeave(e: DragEvent<HTMLDivElement>) {
+    if (e.currentTarget === e.target) {
+      setDragActive(false);
+    }
+  }
+
+  function handleDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDragActive(false);
+    if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+      void handleAttachFiles(e.dataTransfer.files);
+    }
+  }
+
+  async function submitPrompt(textToSend: string, overrideAttachments?: ChatAttachment[]) {
     const clean = textToSend.trim();
-    if (!clean || sending) return;
+    const attachmentsToSend = overrideAttachments ?? pendingAttachments;
+    if ((!clean && attachmentsToSend.length === 0) || sending || uploadingFiles.length > 0) return;
+
+    if (!hasPrimaryModel) {
+      setError(
+        'No Primary model selected yet. Choose your preferred Primary model in Settings → LLM Config before sending.',
+      );
+      return;
+    }
+
+    const displayPrompt =
+      clean ||
+      `Analyze the attached ${Array.from(new Set(attachmentsToSend.map((a) => a.kind))).join(', ')} file(s).`;
+
     setError(null);
     setSending(true);
     setStopping(false);
     setThinkingMenuOpen(false);
     setPrompt('');
+    if (!overrideAttachments) {
+      setPendingAttachments([]);
+    }
 
     stopRequestedRef.current = false;
     activeJobIdRef.current = null;
@@ -413,7 +690,8 @@ export function ChatView({
     let committedOnServer = false;
 
     try {
-      const derivedTitle = cleanThreadTitle(clean) || 'New Agent Session';
+      const derivedTitle =
+        cleanThreadTitle(clean || attachmentsToSend[0]?.name || '') || 'New Agent Session';
       if (!targetId) {
         const created = await createThread(derivedTitle);
         setThreads((prev) => [created, ...prev]);
@@ -433,8 +711,9 @@ export function ChatView({
                   {
                     id: optimisticId,
                     role: 'user',
-                    content: clean,
+                    content: displayPrompt,
                     timestamp: new Date().toISOString(),
+                    attachments: attachmentsToSend.length > 0 ? attachmentsToSend : undefined,
                   },
                 ],
               }
@@ -447,7 +726,10 @@ export function ChatView({
         jobId: 'starting',
         status: 'running',
         currentPhase: 'thinking',
-        lastEvent: 'Reviewing your request and choosing the best approach',
+        lastEvent:
+          attachmentsToSend.length > 0
+            ? 'Routing attached media and reviewing your request'
+            : 'Reviewing your request and choosing the best approach',
         elapsedSeconds: 0,
         turnCount: 1,
         thinking: null,
@@ -455,14 +737,23 @@ export function ChatView({
           {
             id: 'init-1',
             phase: 'thinking',
-            text: 'Reviewing your request and choosing the best approach',
+            text:
+              attachmentsToSend.length > 0
+                ? 'Routing attached media and reviewing your request'
+                : 'Reviewing your request and choosing the best approach',
           },
         ],
         toolEvents: [],
         fileChanges: [],
       });
 
-      const started = await startChatJob(targetId, clean, effectiveThinking, controller.signal);
+      const started = await startChatJob(
+        targetId,
+        clean,
+        effectiveThinking,
+        controller.signal,
+        attachmentsToSend.length > 0 ? attachmentsToSend : undefined,
+      );
       committedOnServer = true;
 
       // Commit the persisted user message from server right away
@@ -537,6 +828,9 @@ export function ChatView({
             ),
           );
           setPrompt(clean);
+          if (!overrideAttachments && attachmentsToSend.length > 0) {
+            setPendingAttachments(attachmentsToSend);
+          }
         }
         return;
       }
@@ -551,6 +845,9 @@ export function ChatView({
           ),
         );
         setPrompt(clean);
+        if (!overrideAttachments && attachmentsToSend.length > 0) {
+          setPendingAttachments(attachmentsToSend);
+        }
       }
       setError(err instanceof Error ? err.message : 'Failed to execute task.');
     } finally {
@@ -658,7 +955,23 @@ export function ChatView({
       </div>
 
       {/* Main Conversation Area */}
-      <div className="flex-1 flex flex-col min-w-0 min-h-0">
+      <div
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className="relative flex-1 flex flex-col min-w-0 min-h-0"
+      >
+        {dragActive && (
+          <div className="pointer-events-none absolute inset-3 z-40 rounded-2xl border-2 border-dashed border-[var(--signal)] bg-[var(--blush)]/75 backdrop-blur-[1px] flex flex-col items-center justify-center gap-2 text-center p-6">
+            <Paperclip className="w-7 h-7 text-[var(--signal)]" />
+            <div className="font-display text-base font-semibold text-[var(--ink)]">
+              Drop image, video, or audio files to attach
+            </div>
+            <p className="text-xs text-[var(--ink-soft)]">
+              Supported modalities go straight to your Main Agent; unsupported ones route automatically to your Accessory sub-agent.
+            </p>
+          </div>
+        )}
         {/* Conversation Header */}
         <div className="h-16 px-5 sm:px-6 border-b border-[var(--rule)] flex items-center justify-between gap-4 shrink-0 bg-[var(--paper)]">
           <div className="min-w-0">
@@ -672,23 +985,39 @@ export function ChatView({
               <button
                 type="button"
                 onClick={onOpenLLMSettings}
-                className="hidden sm:inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] hover:border-[var(--rule-strong)] text-xs text-[var(--ink-soft)] hover:text-[var(--ink)] transition-colors cursor-pointer"
-                title="Configure Nemo and Sub-Agent LLM settings"
+                data-testid="active-primary-model-button"
+                className={`hidden sm:inline-flex items-center gap-2 h-9 px-2.5 rounded-lg border text-xs transition-colors cursor-pointer ${
+                  hasPrimaryModel
+                    ? 'border-[var(--rule)] bg-[var(--paper-sunk)] hover:border-[var(--rule-strong)] text-[var(--ink-soft)] hover:text-[var(--ink)]'
+                    : 'border-[var(--signal)]/50 bg-[var(--blush)]/60 hover:border-[var(--signal)] text-[var(--signal)] font-medium'
+                }`}
+                title={
+                  hasPrimaryModel
+                    ? `Active Primary Model: ${llmConfig.primary.provider}: ${primaryModel}`
+                    : 'Select your Primary LLM model in Settings'
+                }
               >
-                <SlidersHorizontal className="w-3.5 h-3.5 text-[var(--signal)]" />
+                <SlidersHorizontal className="w-3.5 h-3.5 text-[var(--signal)] shrink-0" />
                 <span className="font-mono truncate max-w-[200px]">
-                  {llmConfig.primary.provider}: {llmConfig.primary.model}
+                  {hasPrimaryModel
+                    ? `${llmConfig.primary.provider}: ${primaryModel}`
+                    : 'Select primary model'}
                 </span>
               </button>
             )}
             <button
               type="button"
               onClick={handleNewThread}
-              className="md:hidden inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[var(--signal)] text-white text-xs font-semibold cursor-pointer"
+              className="md:hidden inline-flex items-center gap-1.5 h-9 px-2.5 rounded-lg bg-[var(--signal)] text-white text-xs font-semibold cursor-pointer"
             >
               <MessageSquarePlus className="w-3.5 h-3.5" />
               <span>New</span>
             </button>
+            <ContextUsageRing
+              usage={contextUsage}
+              modelConfigured={hasPrimaryModel}
+              onOpenLLMSettings={onOpenLLMSettings}
+            />
           </div>
         </div>
 
@@ -769,6 +1098,13 @@ export function ChatView({
                           fileChanges={msg.fileChanges}
                           prefs={activityPrefs}
                           onUpdatePrefs={handleUpdateActivityPrefs}
+                        />
+                      )}
+                      {msg.attachments && msg.attachments.length > 0 && (
+                        <MessageAttachments
+                          attachments={msg.attachments}
+                          isUser={isUser}
+                          onPreviewImage={setLightboxImage}
                         />
                       )}
                       <MarkdownMessage content={msg.content} isUser={isUser} />
@@ -877,30 +1213,153 @@ export function ChatView({
             {error && (
               <div
                 role="alert"
-                className="mb-3 rounded-lg border border-[var(--flare)]/30 bg-[var(--flare)]/10 px-3.5 py-2 text-xs text-[var(--flare)]"
+                className="mb-3 rounded-lg border border-[var(--flare)]/30 bg-[var(--flare)]/10 px-3.5 py-2 text-xs text-[var(--flare)] flex items-center justify-between gap-3"
               >
-                {error}
+                <span>{error}</span>
+                {!hasPrimaryModel && (
+                  <button
+                    type="button"
+                    onClick={onOpenLLMSettings}
+                    className="px-2.5 py-1 rounded-md border border-[var(--flare)]/40 bg-[var(--paper)] text-[var(--ink)] hover:border-[var(--signal)] font-medium cursor-pointer shrink-0"
+                  >
+                    Choose model
+                  </button>
+                )}
               </div>
             )}
 
             <form
               onSubmit={handleFormSubmit}
-              className="flex items-end gap-2 rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] p-2 focus-within:border-[var(--signal)] focus-within:ring-2 focus-within:ring-[var(--signal)]/15 transition-all"
+              className="rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] p-2 focus-within:border-[var(--signal)] focus-within:ring-2 focus-within:ring-[var(--signal)]/15 transition-all"
             >
-              <label htmlFor="chat-composer" className="sr-only">
-                Message Nemo
-              </label>
-              <textarea
-                ref={composerRef}
-                id="chat-composer"
-                rows={1}
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onKeyDown={handleTextareaKeyDown}
-                placeholder="Message Nemo — ask anything, build tables, charts, or code..."
-                disabled={sending}
-                className="flex-1 min-w-0 resize-none bg-transparent px-2.5 py-2 text-sm leading-5 text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none min-h-[36px] max-h-[220px] overflow-hidden scrollbar-none"
-              />
+              {/* Pending Multimodal Attachments Preview Tray */}
+              {(pendingAttachments.length > 0 || uploadingFiles.length > 0) && (
+                <div
+                  data-testid="composer-attachments-tray"
+                  className="mb-2 pb-2 border-b border-[var(--rule)] flex flex-wrap gap-2 px-1"
+                >
+                  {pendingAttachments.map((att) => {
+                    const isNative = primaryModalities.has(att.kind);
+                    const accCfg = normalizedAccessories[att.kind];
+                    const routeLabel = isNative
+                      ? 'Native'
+                      : accCfg.enabled
+                        ? `${att.kind[0].toUpperCase()}${att.kind.slice(1)} accessory`
+                        : 'Accessory off';
+                    const routeClass = isNative
+                      ? 'text-[var(--jade)]'
+                      : accCfg.enabled
+                        ? 'text-[var(--signal)]'
+                        : 'text-[var(--flare)]';
+
+                    return (
+                      <div
+                        key={att.id}
+                        className="group flex items-center gap-2.5 rounded-lg border border-[var(--rule)] bg-[var(--paper)] p-1.5 pr-2 max-w-[290px]"
+                      >
+                        {att.kind === 'image' ? (
+                          <img
+                            src={att.url}
+                            alt={att.name}
+                            className="w-10 h-10 rounded object-cover shrink-0 border border-[var(--rule)]"
+                          />
+                        ) : (
+                          <div className="w-10 h-10 rounded bg-[var(--paper-sunk)] border border-[var(--rule)] flex items-center justify-center shrink-0 text-[var(--signal)]">
+                            {att.kind === 'video' ? (
+                              <VideoIcon className="w-4 h-4" />
+                            ) : (
+                              <AudioLines className="w-4 h-4" />
+                            )}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-medium text-[var(--ink)] truncate" title={att.name}>
+                            {att.name}
+                          </div>
+                          <div className="flex items-center gap-1.5 text-[10px] font-mono whitespace-nowrap">
+                            <span className="text-[var(--ink-faint)] shrink-0">
+                              {formatFileSize(att.size)}
+                            </span>
+                            <span className="text-[var(--rule-strong)] shrink-0">·</span>
+                            {onOpenAccessoriesSettings && !isNative ? (
+                              <button
+                                type="button"
+                                onClick={onOpenAccessoriesSettings}
+                                title={`Routed through ${accCfg.provider}: ${accCfg.model} — click to edit Accessories`}
+                                className={`${routeClass} hover:underline cursor-pointer truncate`}
+                              >
+                                {routeLabel}
+                              </button>
+                            ) : (
+                              <span className={`${routeClass} truncate`}>{routeLabel}</span>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveAttachment(att.id)}
+                          aria-label={`Remove ${att.name}`}
+                          className="p-1 rounded text-[var(--ink-faint)] hover:text-[var(--flare)] hover:bg-[var(--paper-sunk)] transition-colors cursor-pointer shrink-0"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+
+                  {uploadingFiles.map((fname, idx) => (
+                    <div
+                      key={`${fname}-${idx}`}
+                      className="flex items-center gap-2 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] px-2.5 py-2 text-xs text-[var(--ink-soft)]"
+                    >
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--signal)] shrink-0" />
+                      <span className="truncate max-w-[160px]">Uploading {fname}...</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex items-end gap-2">
+                <input
+                  ref={fileInputRef}
+                  id="chat-media-input"
+                  type="file"
+                  multiple
+                  accept={MEDIA_ACCEPT_ATTR}
+                  className="hidden"
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files.length > 0) {
+                      void handleAttachFiles(e.target.files);
+                    }
+                    e.target.value = '';
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={sending || pendingAttachments.length >= 6}
+                  onClick={() => fileInputRef.current?.click()}
+                  aria-label="Attach image, video, or audio"
+                  title="Attach image, video, or audio (or drag & drop / paste)"
+                  className="h-9 w-9 inline-flex items-center justify-center rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] hover:border-[var(--signal)] text-[var(--ink-soft)] hover:text-[var(--signal)] disabled:opacity-45 transition-colors cursor-pointer shrink-0"
+                >
+                  <Paperclip className="w-4 h-4" />
+                </button>
+
+                <label htmlFor="chat-composer" className="sr-only">
+                  Message Nemo
+                </label>
+                <textarea
+                  ref={composerRef}
+                  id="chat-composer"
+                  rows={1}
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  onKeyDown={handleTextareaKeyDown}
+                  onPaste={handleComposerPaste}
+                  placeholder="Message Nemo, search the web, or attach media..."
+                  disabled={sending}
+                  className="flex-1 min-w-0 resize-none bg-transparent px-2 py-2 text-sm leading-5 text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none min-h-[36px] max-h-[220px] overflow-hidden scrollbar-none"
+                />
 
               {/* Adaptive Model Thinking Mode Selector (just left of Send) */}
               <div ref={thinkingMenuRef} className="relative shrink-0">
@@ -914,7 +1373,11 @@ export function ChatView({
                     thinkingProfile.options.find((o) => o.value === selectedThinking)?.label ||
                     'Standard'
                   } (${thinkingProfile.familyLabel})`}
-                  title={`Thinking mode for ${primaryModel} (${thinkingProfile.familyLabel})`}
+                    title={
+                      hasPrimaryModel
+                        ? `Thinking mode for ${primaryModel} (${thinkingProfile.familyLabel})`
+                        : 'Select a Primary model in Settings to configure thinking mode'
+                    }
                   className={`h-9 px-2.5 inline-flex items-center gap-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer disabled:opacity-50 ${
                     !thinkingProfile.supported
                       ? 'border-[var(--rule)] bg-[var(--paper-sunk)] text-[var(--ink-faint)] hover:text-[var(--ink-soft)]'
@@ -951,7 +1414,7 @@ export function ChatView({
                         </span>
                       </div>
                       <div className="text-[10px] font-mono text-[var(--ink-faint)] truncate mt-0.5">
-                        {primaryModel}
+                        {hasPrimaryModel ? primaryModel : 'No primary model selected'}
                       </div>
                     </div>
 
@@ -992,8 +1455,14 @@ export function ChatView({
                     ) : (
                       <div className="p-3 space-y-2.5 text-xs text-[var(--ink-soft)]">
                         <p className="leading-relaxed">
-                          <span className="font-mono text-[var(--ink)]">{primaryModel}</span> is a
-                          standard chat model and does not support configurable thinking levels.
+                          {hasPrimaryModel ? (
+                            <>
+                              <span className="font-mono text-[var(--ink)]">{primaryModel}</span> is a
+                              standard chat model and does not support configurable thinking levels.
+                            </>
+                          ) : (
+                            'Select your Primary model in Settings to view its supported thinking modes.'
+                          )}
                         </p>
                         <button
                           type="button"
@@ -1003,7 +1472,7 @@ export function ChatView({
                           }}
                           className="w-full py-1.5 px-2.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] text-[var(--ink)] text-xs font-medium transition-colors cursor-pointer"
                         >
-                          Switch model in Settings
+                          {hasPrimaryModel ? 'Switch model in Settings' : 'Select primary model'}
                         </button>
                       </div>
                     )}
@@ -1026,7 +1495,10 @@ export function ChatView({
               ) : (
                 <button
                   type="submit"
-                  disabled={!prompt.trim()}
+                  disabled={
+                    (!prompt.trim() && pendingAttachments.length === 0) ||
+                    uploadingFiles.length > 0
+                  }
                   aria-label="Send message"
                   className="h-9 px-3.5 inline-flex items-center gap-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-45 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
                 >
@@ -1034,10 +1506,48 @@ export function ChatView({
                   <span>Send</span>
                 </button>
               )}
+              </div>
             </form>
           </div>
         </div>
       </div>
+
+      {/* Image Preview Lightbox Modal */}
+      {lightboxImage && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Image preview: ${lightboxImage.name}`}
+          onClick={() => setLightboxImage(null)}
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 sm:p-8"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative max-w-4xl max-h-[88vh] flex flex-col items-center gap-3"
+          >
+            <button
+              type="button"
+              onClick={() => setLightboxImage(null)}
+              aria-label="Close image preview"
+              className="self-end inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-white text-xs font-medium cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+              <span>Close</span>
+            </button>
+            <img
+              src={lightboxImage.url}
+              alt={lightboxImage.name}
+              className="max-h-[78vh] max-w-full rounded-xl shadow-2xl object-contain border border-white/15"
+            />
+            <div className="inline-flex items-center gap-2 text-xs font-mono text-white/85">
+              <ImageIcon className="w-3.5 h-3.5" />
+              <span>{lightboxImage.name}</span>
+              <span>·</span>
+              <span>{formatFileSize(lightboxImage.size)}</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

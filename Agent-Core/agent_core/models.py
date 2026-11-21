@@ -167,6 +167,8 @@ class ModelSpec:
     timeout_seconds: float = 120.0
     max_retries: int = 2
     reasoning_effort: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
 
     def __repr__(self) -> str:
         return (
@@ -189,6 +191,8 @@ class ModelSpec:
             "timeout_seconds": self.timeout_seconds,
             "max_retries": self.max_retries,
             "reasoning_effort": self.reasoning_effort,
+            "context_window": self.context_window,
+            "max_output_tokens": self.max_output_tokens,
         }
 
 
@@ -242,7 +246,7 @@ def save_persisted_llm_config(
     config: dict[str, Any],
     config_path: Path | None = None,
 ) -> Path:
-    """Persist non-secret Main Agent & Sub-Agent LLM configuration cleanly to disk."""
+    """Persist non-secret Main Agent, Sub-Agent, and Accessories LLM configuration cleanly to disk."""
     path = config_path or DEFAULT_LLM_CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     # Strip any accidental secret fields before persisting
@@ -252,10 +256,101 @@ def save_persisted_llm_config(
             clean[key] = {
                 k: v for k, v in config[key].items() if k != "api_key" and v is not None
             }
+    if isinstance(config.get("accessories"), dict):
+        acc_clean: dict[str, dict[str, Any]] = {}
+        for mod in ("image", "video", "audio"):
+            mod_cfg = config["accessories"].get(mod)
+            if isinstance(mod_cfg, dict):
+                acc_clean[mod] = {
+                    k: v for k, v in mod_cfg.items() if k != "api_key" and v is not None
+                }
+        if acc_clean:
+            clean["accessories"] = acc_clean
     if "max_turns" in config and config["max_turns"] is not None:
         clean["max_turns"] = int(config["max_turns"])
     path.write_text(json.dumps(clean, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def load_persisted_accessories_config(config_path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load persisted Accessories configuration merged over sensible defaults."""
+    from agent_core.multimodal import default_accessories_config
+
+    defaults = default_accessories_config()
+    persisted = load_persisted_llm_config(config_path).get("accessories")
+    if not isinstance(persisted, dict):
+        return defaults
+    merged: dict[str, dict[str, Any]] = {}
+    for mod in ("image", "video", "audio"):
+        base = dict(defaults[mod])
+        raw_mod = persisted.get(mod)
+        if isinstance(raw_mod, dict):
+            for k, v in raw_mod.items():
+                if k != "api_key" and v is not None:
+                    base[k] = v
+        merged[mod] = base
+    return merged
+
+
+def resolve_accessory_model_spec(
+    modality: Literal["image", "video", "audio"],
+    *,
+    override: ModelOverride | dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[ModelSpec, bool]:
+    """Resolve an Accessory ModelSpec and enabled flag for image, video, or audio sub-agents."""
+    source_env = dict(os.environ) if env is None else env
+    persisted = load_persisted_accessories_config().get(modality, {})
+    merged: dict[str, Any] = dict(persisted)
+
+    if isinstance(override, dict):
+        for k, v in override.items():
+            if v is not None and (not isinstance(v, str) or v.strip()):
+                merged[k] = v
+    elif isinstance(override, ModelOverride):
+        for field_name in ("provider", "model", "base_url", "api_key", "temperature", "max_tokens", "reasoning_effort"):
+            val = getattr(override, field_name)
+            if val is not None and (not isinstance(val, str) or val.strip()):
+                merged[field_name] = val
+
+    enabled = bool(merged.get("enabled", True))
+    provider = canonicalize_provider(str(merged.get("provider") or "openrouter"))
+    default_base = PROVIDER_BASE_URLS.get(provider, "https://openrouter.ai/api/v1")
+    base_url = str(merged.get("base_url") or default_base).strip().rstrip("/")
+    model = str(merged.get("model") or "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free").strip()
+    explicit_key = str(merged.get("api_key") or "").strip() or None
+    api_key = explicit_key or _resolve_api_key(
+        provider,
+        "WORKER_API_KEY",
+        source_env,
+        allow_explicit_fallback=(provider == "custom"),
+    )
+    temperature = _parse_float(str(merged.get("temperature", 0.2)), 0.2, min_val=0.0)
+    max_tokens = _parse_int(str(merged.get("max_tokens", 4096)), 4096, min_val=64)
+    reasoning_effort = str(merged.get("reasoning_effort") or "").strip() or None
+    timeout_seconds = _parse_float(source_env.get("MODEL_TIMEOUT_SECONDS"), default=90.0, min_val=1.0)
+    max_retries = _parse_int(source_env.get("MODEL_MAX_RETRIES"), default=2, min_val=0)
+
+    if not model:
+        raise ModelConfigurationError(f"Accessory '{modality}' model must not be empty.")
+    if not base_url.startswith(("http://", "https://")):
+        raise ModelConfigurationError(
+            f"Accessory '{modality}' base_url must be a valid http(s) URL, got {base_url!r}."
+        )
+
+    spec = ModelSpec(
+        role="worker",
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        reasoning_effort=reasoning_effort,
+    )
+    return spec, enabled
 
 
 def load_model_spec(
@@ -352,6 +447,8 @@ class ModelOverride:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
 
     def __repr__(self) -> str:
         return (
@@ -371,6 +468,8 @@ class ModelOverride:
                 self.temperature,
                 self.max_tokens,
                 self.reasoning_effort,
+                self.context_window,
+                self.max_output_tokens,
             )
         )
 
@@ -408,6 +507,18 @@ def resolve_model_spec_with_override(
             reasoning_effort=(
                 str(override["reasoning_effort"]).strip()
                 if override.get("reasoning_effort")
+                else None
+            ),
+            context_window=(
+                int(override["context_window"])
+                if override.get("context_window") is not None
+                and str(override.get("context_window")) != ""
+                else None
+            ),
+            max_output_tokens=(
+                int(override["max_output_tokens"])
+                if override.get("max_output_tokens") is not None
+                and str(override.get("max_output_tokens")) != ""
                 else None
             ),
         )
@@ -466,6 +577,16 @@ def resolve_model_spec_with_override(
     reasoning_effort = (
         ov.reasoning_effort if ov.reasoning_effort is not None else base_spec.reasoning_effort
     )
+    context_window = (
+        ov.context_window
+        if ov.context_window is not None and ov.context_window >= 512
+        else base_spec.context_window
+    )
+    max_output_tokens = (
+        ov.max_output_tokens
+        if ov.max_output_tokens is not None and ov.max_output_tokens >= 256
+        else base_spec.max_output_tokens
+    )
 
     return ModelSpec(
         role=role,
@@ -478,6 +599,8 @@ def resolve_model_spec_with_override(
         timeout_seconds=base_spec.timeout_seconds,
         max_retries=base_spec.max_retries,
         reasoning_effort=reasoning_effort,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -886,11 +1009,18 @@ def build_chat_model(
         slug in ("o1", "o3", "o4", "gpt-5") or slug.startswith(("o1-", "o3-", "o4-", "gpt-5"))
     )
 
+    from agent_core.context_manager import resolve_model_max_output_tokens
+
+    model_max_out, _ = resolve_model_max_output_tokens(
+        resolved.provider, resolved.model, explicit_max_output_tokens=resolved.max_output_tokens
+    )
+    effective_max_tokens = max(64, min(int(resolved.max_tokens), int(model_max_out)))
+
     kwargs: dict[str, Any] = {
         "model": resolved.model,
         "api_key": SecretStr(resolved.api_key or "not-configured"),
         "base_url": resolved.base_url,
-        "max_tokens": resolved.max_tokens,
+        "max_tokens": effective_max_tokens,
         "timeout": resolved.timeout_seconds,
         "max_retries": resolved.max_retries,
         "streaming": streaming,
@@ -1023,11 +1153,23 @@ def _parse_models_payload(provider: str, payload: Any) -> list[dict[str, Any]]:
             item.get("context_length")
             or item.get("max_context_length")
             or item.get("input_token_limit")
+            or item.get("inputTokenLimit")
             or (item.get("top_provider") or {}).get("context_length")
         )
         context_length: int | None = None
         if isinstance(ctx_raw, (int, float)) and ctx_raw > 0:
             context_length = int(ctx_raw)
+
+        out_raw = (
+            item.get("max_output_tokens")
+            or item.get("max_completion_tokens")
+            or item.get("output_token_limit")
+            or item.get("outputTokenLimit")
+            or (item.get("top_provider") or {}).get("max_completion_tokens")
+        )
+        max_output_tokens: int | None = None
+        if isinstance(out_raw, (int, float)) and out_raw > 0:
+            max_output_tokens = int(out_raw)
 
         pricing = item.get("pricing")
         is_free = model_id.lower().endswith(":free")
@@ -1039,12 +1181,33 @@ def _parse_models_payload(provider: str, payload: Any) -> list[dict[str, Any]]:
             except (TypeError, ValueError):
                 is_free = False
 
+        input_modalities: list[str] | None = None
+        arch = item.get("architecture")
+        if isinstance(arch, dict) and isinstance(arch.get("input_modalities"), list):
+            mods = [
+                str(m).strip().lower()
+                for m in arch["input_modalities"]
+                if str(m).strip().lower() in {"text", "image", "audio", "video"}
+            ]
+            if mods:
+                input_modalities = mods
+        elif isinstance(item.get("input_modalities"), list):
+            mods = [
+                str(m).strip().lower()
+                for m in item["input_modalities"]
+                if str(m).strip().lower() in {"text", "image", "audio", "video"}
+            ]
+            if mods:
+                input_modalities = mods
+
         entry: dict[str, Any] = {
             "id": model_id,
             "name": display_name,
             "owned_by": owned_by,
             "context_length": context_length,
+            "max_output_tokens": max_output_tokens,
             "is_free": is_free,
+            "input_modalities": input_modalities,
             "source": "live",
         }
         all_parsed.append(entry)

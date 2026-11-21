@@ -5,7 +5,9 @@ export interface ProviderModelCatalogItem {
   name?: string;
   owned_by?: string;
   context_length?: number | null;
+  max_output_tokens?: number | null;
   is_free?: boolean;
+  input_modalities?: string[];
   source?: 'live' | 'preset';
 }
 
@@ -146,10 +148,37 @@ export function parseModelsPayload(payload: unknown, provider: string): Provider
         : undefined;
 
     let contextLength: number | null = null;
-    for (const field of ['context_length', 'context_window', 'max_context_length', 'inputTokenLimit']) {
-      const candidate = Number(record[field]);
+    const topProvider =
+      record.top_provider && typeof record.top_provider === 'object'
+        ? (record.top_provider as Record<string, unknown>)
+        : null;
+    for (const candidateRaw of [
+      record.context_length,
+      record.context_window,
+      record.max_context_length,
+      record.inputTokenLimit,
+      record.input_token_limit,
+      topProvider?.context_length,
+    ]) {
+      const candidate = Number(candidateRaw);
       if (Number.isFinite(candidate) && candidate > 0) {
         contextLength = Math.round(candidate);
+        break;
+      }
+    }
+
+    let maxOutputTokens: number | null = null;
+    for (const candidateRaw of [
+      record.max_output_tokens,
+      record.max_completion_tokens,
+      record.outputTokenLimit,
+      record.output_token_limit,
+      topProvider?.max_completion_tokens,
+      topProvider?.max_output_tokens,
+    ]) {
+      const candidate = Number(candidateRaw);
+      if (Number.isFinite(candidate) && candidate > 0) {
+        maxOutputTokens = Math.round(candidate);
         break;
       }
     }
@@ -164,11 +193,29 @@ export function parseModelsPayload(payload: unknown, provider: string): Provider
       }
     }
 
+    let inputModalities: string[] | undefined;
+    const arch = record.architecture as Record<string, unknown> | undefined;
+    const rawMods = Array.isArray(arch?.input_modalities)
+      ? arch.input_modalities
+      : Array.isArray(record.input_modalities)
+        ? record.input_modalities
+        : null;
+    if (rawMods) {
+      const cleanedMods = rawMods
+        .map((m) => String(m).trim().toLowerCase())
+        .filter((m) => m === 'text' || m === 'image' || m === 'audio' || m === 'video');
+      if (cleanedMods.length > 0) {
+        inputModalities = Array.from(new Set(cleanedMods));
+      }
+    }
+
     models.push({
       id: rawId,
       ...(displayName ? { name: displayName } : {}),
       ...(ownedBy ? { owned_by: ownedBy } : {}),
       ...(contextLength ? { context_length: contextLength } : {}),
+      ...(maxOutputTokens ? { max_output_tokens: maxOutputTokens } : {}),
+      ...(inputModalities ? { input_modalities: inputModalities } : {}),
       is_free: isFree,
       source: 'live',
     });

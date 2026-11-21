@@ -1,22 +1,24 @@
-import { Check, ChevronDown, Loader2, RefreshCw, Search, Sparkles } from 'lucide-react';
+import { Check, ChevronDown, Loader2, RefreshCw, Search, Sparkles, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchProviderModels } from '../lib/apiClient.ts';
 import {
   filterProviderModels,
   formatContextLength,
+  formatOutputLength,
   getProviderPreset,
   mergeProviderModels,
 } from '../lib/llmPresets.ts';
-import type { ProviderModelOption } from '../types/agent.ts';
+import type { ModelRoleKey, ProviderModelOption } from '../types/agent.ts';
 
 interface ModelSelectorComboboxProps {
   id: string;
-  role: 'primary' | 'worker';
+  role: ModelRoleKey;
   provider: string;
   baseUrl: string;
   apiKeyDraft: string;
   value: string;
   onChange: (nextModel: string) => void;
+  onSelectOption?: (option: ProviderModelOption) => void;
 }
 
 const MAX_VISIBLE_OPTIONS = 120;
@@ -29,6 +31,7 @@ export function ModelSelectorCombobox({
   apiKeyDraft,
   value,
   onChange,
+  onSelectOption,
 }: ModelSelectorComboboxProps) {
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -37,6 +40,7 @@ export function ModelSelectorCombobox({
   const [source, setSource] = useState<'idle' | 'live' | 'preset' | 'error'>('idle');
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [highlightIndex, setHighlightIndex] = useState(0);
+  const [hasNavigatedList, setHasNavigatedList] = useState(false);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -146,12 +150,17 @@ export function ModelSelectorCombobox({
 
   useEffect(() => {
     setHighlightIndex(0);
-  }, [searchQuery, provider]);
+    setHasNavigatedList(false);
+  }, [searchQuery, provider, open]);
 
-  function selectModel(modelId: string) {
+  function selectModel(modelId: string, option?: ProviderModelOption) {
     onChange(modelId);
+    if (option) {
+      onSelectOption?.(option);
+    }
     setOpen(false);
     setSearchQuery('');
+    setHasNavigatedList(false);
   }
 
   function handleKeyDown(event: React.KeyboardEvent) {
@@ -159,6 +168,7 @@ export function ModelSelectorCombobox({
       if (event.key === 'ArrowDown') {
         event.preventDefault();
         setOpen(true);
+        setHasNavigatedList(true);
       }
       return;
     }
@@ -170,21 +180,32 @@ export function ModelSelectorCombobox({
     }
     if (event.key === 'ArrowDown') {
       event.preventDefault();
+      setHasNavigatedList(true);
       setHighlightIndex((idx) => Math.min(visibleOptions.length - 1, idx + 1));
       return;
     }
     if (event.key === 'ArrowUp') {
       event.preventDefault();
+      setHasNavigatedList(true);
       setHighlightIndex((idx) => Math.max(0, idx - 1));
       return;
     }
     if (event.key === 'Enter') {
-      event.preventDefault();
-      const target = visibleOptions[highlightIndex];
-      if (target) {
-        selectModel(target.id);
-      } else if (searchQuery.trim()) {
-        selectModel(searchQuery.trim());
+      const inSearchBox =
+        typeof document !== 'undefined' && document.activeElement === searchInputRef.current;
+      // Only select from the dropdown if the user actively navigated the list or filtered inside search.
+      // Never hijack an empty/manually-typed primary model input with visibleOptions[0].
+      if (hasNavigatedList || (inSearchBox && searchQuery.trim().length > 0)) {
+        event.preventDefault();
+        const target = visibleOptions[highlightIndex];
+        if (target) {
+          selectModel(target.id, target);
+        } else if (searchQuery.trim()) {
+          selectModel(searchQuery.trim());
+        }
+      } else {
+        event.preventDefault();
+        setOpen(false);
       }
     }
   }
@@ -210,9 +231,21 @@ export function ModelSelectorCombobox({
             onClick={() => setOpen(true)}
             onFocus={() => setOpen(true)}
             onChange={(e) => onChange(e.target.value)}
-            placeholder={preset?.defaultModels[0] || 'Click to browse models or type a model ID'}
-            className="w-full h-10 pl-3 pr-9 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+            placeholder="Select or type a model ID..."
+            className="w-full h-10 pl-3 pr-14 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
           />
+          {value.trim().length > 0 && (
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={() => onChange('')}
+              aria-label="Clear model selection"
+              title="Clear model selection"
+              className="absolute right-8 top-1/2 -translate-y-1/2 p-1 text-[var(--ink-faint)] hover:text-[var(--ink)] cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
           <button
             type="button"
             tabIndex={-1}
@@ -319,8 +352,9 @@ export function ModelSelectorCombobox({
             {visibleOptions.length > 0 ? (
               visibleOptions.map((item, idx) => {
                 const isSelected = item.id === value;
-                const isHighlighted = idx === highlightIndex;
+                const isHighlighted = hasNavigatedList && idx === highlightIndex;
                 const ctxLabel = formatContextLength(item.context_length);
+                const outLabel = formatOutputLength(item.max_output_tokens);
 
                 return (
                   <button
@@ -328,8 +362,11 @@ export function ModelSelectorCombobox({
                     type="button"
                     role="option"
                     aria-selected={isSelected}
-                    onMouseEnter={() => setHighlightIndex(idx)}
-                    onClick={() => selectModel(item.id)}
+                    onMouseEnter={() => {
+                      setHighlightIndex(idx);
+                      setHasNavigatedList(true);
+                    }}
+                    onClick={() => selectModel(item.id, item)}
                     className={`w-full px-3 py-2 text-left flex items-center justify-between gap-2 transition-colors cursor-pointer ${
                       isSelected
                         ? 'bg-[var(--blush)] text-[var(--signal)]'
@@ -348,14 +385,26 @@ export function ModelSelectorCombobox({
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
+                      {item.input_modalities &&
+                        item.input_modalities
+                          .filter((m) => m === 'image' || m === 'audio' || m === 'video')
+                          .slice(0, 3)
+                          .map((mod) => (
+                            <span
+                              key={mod}
+                              className="px-1 py-0.5 rounded text-[9px] font-mono uppercase bg-[var(--paper-sunk)] border border-[var(--rule)] text-[var(--ink-soft)]"
+                            >
+                              {mod === 'image' ? 'img' : mod === 'audio' ? 'aud' : 'vid'}
+                            </span>
+                          ))}
                       {item.is_free && (
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-[var(--jade)]/12 text-[var(--jade)]">
                           free
                         </span>
                       )}
-                      {ctxLabel && (
-                        <span className="text-[10px] font-mono text-[var(--ink-faint)]">
-                          {ctxLabel}
+                      {(ctxLabel || outLabel) && (
+                        <span className="text-[10px] font-mono text-[var(--ink-faint)] tabular-nums">
+                          {[ctxLabel, outLabel].filter(Boolean).join(' · ')}
                         </span>
                       )}
                       {item.source === 'preset' && (

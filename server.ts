@@ -8,9 +8,13 @@ import { AuthStore, parseCookieHeader } from './server/authStore.ts';
 import { AgentCoreProcessManager } from './server/agentProcessManager.ts';
 import {
   WorkspaceAndConfigStore,
+  type AccessoryLLMConfig,
+  type ChatAttachmentRecord,
   type ChatMessageRecord,
   type ChatThreadRecord,
+  type ContextUsageSnapshot,
   type FileChangeRecord,
+  type MediaModality,
   type ToolEventRecord,
 } from './server/configStore.ts';
 import {
@@ -323,13 +327,133 @@ async function startServer(): Promise<void> {
     res.json({ ok: true });
   });
 
+  // ---------------------------------------------------------------------------
+  // Multimodal Media Upload & Authenticated Serving (image / video / audio)
+  // ---------------------------------------------------------------------------
+  app.post(
+    '/api/media/upload',
+    requireSession,
+    express.raw({ type: '*/*', limit: '42mb' }),
+    (req, res) => {
+      try {
+        const rawBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        const rawThreadId = String(req.headers['x-thread-id'] || req.query.threadId || 'draft');
+        const rawFilenameHeader = String(req.headers['x-file-name'] || req.query.filename || 'upload');
+        let decodedFilename = rawFilenameHeader;
+        try {
+          decodedFilename = decodeURIComponent(rawFilenameHeader);
+        } catch {
+          decodedFilename = rawFilenameHeader;
+        }
+        const mimeType = String(req.headers['x-file-type'] || req.headers['content-type'] || '');
+        const saved = store.saveUploadedMedia({
+          threadId: rawThreadId,
+          filename: decodedFilename,
+          mimeType,
+          buffer: rawBuf,
+        });
+        res.status(201).json({
+          attachment: {
+            id: saved.id,
+            name: saved.name,
+            kind: saved.kind,
+            mimeType: saved.mimeType,
+            size: saved.size,
+            url: saved.url,
+            storageKey: saved.storageKey,
+          },
+        });
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : 'Unable to upload media attachment.',
+        });
+      }
+    },
+  );
+
+  app.get('/api/media/:threadId/:filename', requireSession, (req, res) => {
+    const resolved = store.resolveUploadedMediaPath(req.params.threadId, req.params.filename);
+    if (!resolved) {
+      res.status(404).json({ error: 'Media attachment not found.' });
+      return;
+    }
+    res.setHeader('Content-Type', resolved.mimeType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.sendFile(resolved.fullPath);
+  });
+
+  const normalizeIncomingAttachments = (
+    rawList: unknown,
+  ): {
+    publicAttachments: ChatAttachmentRecord[];
+    agentAttachments: Array<{
+      id: string;
+      name: string;
+      kind: MediaModality;
+      mime_type: string;
+      size: number;
+      local_path: string;
+    }>;
+  } => {
+    if (!Array.isArray(rawList) || rawList.length === 0) {
+      return { publicAttachments: [], agentAttachments: [] };
+    }
+    const publicAttachments: ChatAttachmentRecord[] = [];
+    const agentAttachments: Array<{
+      id: string;
+      name: string;
+      kind: MediaModality;
+      mime_type: string;
+      size: number;
+      local_path: string;
+    }> = [];
+
+    for (const item of rawList.slice(0, 8)) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as Partial<ChatAttachmentRecord>;
+      const kind = rec.kind === 'image' || rec.kind === 'video' || rec.kind === 'audio' ? rec.kind : null;
+      const storageKey = typeof rec.storageKey === 'string' ? rec.storageKey.trim() : '';
+      if (!kind || !storageKey) continue;
+      const localPath = store.resolveAttachmentLocalPath(storageKey);
+      if (!localPath) continue;
+
+      const att: ChatAttachmentRecord = {
+        id: typeof rec.id === 'string' && rec.id.trim() ? rec.id.trim() : `att-${crypto.randomBytes(5).toString('hex')}`,
+        name: typeof rec.name === 'string' && rec.name.trim() ? rec.name.trim().slice(0, 120) : 'attachment',
+        kind,
+        mimeType: typeof rec.mimeType === 'string' && rec.mimeType.trim() ? rec.mimeType.trim() : 'application/octet-stream',
+        size: typeof rec.size === 'number' && Number.isFinite(rec.size) ? Math.max(0, Math.round(rec.size)) : 0,
+        url: typeof rec.url === 'string' && rec.url.startsWith('/api/media/') ? rec.url : `/api/media/${storageKey}`,
+        storageKey,
+      };
+      publicAttachments.push(att);
+      agentAttachments.push({
+        id: att.id,
+        name: att.name,
+        kind: att.kind,
+        mime_type: att.mimeType,
+        size: att.size,
+        local_path: localPath,
+      });
+    }
+    return { publicAttachments, agentAttachments };
+  };
+
   app.post('/api/chat/send', requireSession, async (req, res) => {
-    const { threadId, message, reasoningEffort } = (req.body || {}) as {
+    const { threadId, message, reasoningEffort, attachments } = (req.body || {}) as {
       threadId?: string;
       message?: string;
       reasoningEffort?: string;
+      attachments?: ChatAttachmentRecord[];
     };
-    const text = (message || '').trim();
+    const { publicAttachments, agentAttachments } = normalizeIncomingAttachments(attachments);
+    const rawText = (message || '').trim();
+    const text =
+      rawText ||
+      (publicAttachments.length > 0
+        ? `Analyze the attached ${Array.from(new Set(publicAttachments.map((a) => a.kind))).join(', ')} file(s).`
+        : '');
     if (!text) {
       res.status(400).json({ error: 'Message cannot be empty.' });
       return;
@@ -353,17 +477,24 @@ async function startServer(): Promise<void> {
       thread.title = derivedTitle;
     }
 
-    const userMsg = {
+    const userMsg: ChatMessageRecord = {
       id: `msg-${crypto.randomBytes(6).toString('hex')}`,
       role: 'user' as const,
       content: text,
       timestamp: now,
+      ...(publicAttachments.length > 0 ? { attachments: publicAttachments } : {}),
     };
     thread.messages.push(userMsg);
     thread.updatedAt = now;
     store.saveThreads(threads);
 
     let llmCfg = store.getLLMConfig();
+    if (!llmCfg.primary.model.trim()) {
+      res.status(400).json({
+        error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
+      });
+      return;
+    }
     const requestedEffort =
       typeof reasoningEffort === 'string' && reasoningEffort.trim()
         ? reasoningEffort.trim().toLowerCase()
@@ -391,6 +522,8 @@ async function startServer(): Promise<void> {
           temperature: llmCfg.primary.temperature,
           max_tokens: llmCfg.primary.max_tokens,
           reasoning_effort: requestedEffort,
+          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
+          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
         },
         worker_model: {
           provider: llmCfg.worker.provider,
@@ -399,7 +532,11 @@ async function startServer(): Promise<void> {
           temperature: llmCfg.worker.temperature,
           max_tokens: llmCfg.worker.max_tokens,
           reasoning_effort: llmCfg.worker.reasoning_effort,
+          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
+          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
         },
+        accessory_models: llmCfg.accessories,
+        attachments: agentAttachments.length > 0 ? agentAttachments : undefined,
         mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
       },
     });
@@ -452,6 +589,9 @@ async function startServer(): Promise<void> {
 
     thread.messages.push(assistantMsg);
     thread.pendingApproval = pendingApproval;
+    if (data.context_usage && typeof data.context_usage === 'object') {
+      thread.contextUsage = data.context_usage as ContextUsageSnapshot;
+    }
     thread.updatedAt = replyNow;
     store.saveThreads(threads);
     res.json({ thread, message: assistantMsg });
@@ -493,6 +633,12 @@ async function startServer(): Promise<void> {
     const activityFeed = Array.isArray(data.activity_feed)
       ? (data.activity_feed as Array<{ id: string; phase: string; text: string; timestamp?: string }>)
       : [];
+    const contextUsage =
+      data.context_usage && typeof data.context_usage === 'object'
+        ? (data.context_usage as ContextUsageSnapshot)
+        : resultObj?.context_usage && typeof resultObj.context_usage === 'object'
+          ? (resultObj.context_usage as ContextUsageSnapshot)
+          : null;
     return {
       jobId,
       status: String(data.status || 'running'),
@@ -504,17 +650,25 @@ async function startServer(): Promise<void> {
       activityFeed,
       toolEvents,
       fileChanges,
+      contextUsage,
     };
   };
 
   app.post('/api/chat/jobs/start', requireSession, async (req, res) => {
     pruneChatJobs();
-    const { threadId, message, reasoningEffort } = (req.body || {}) as {
+    const { threadId, message, reasoningEffort, attachments } = (req.body || {}) as {
       threadId?: string;
       message?: string;
       reasoningEffort?: string;
+      attachments?: ChatAttachmentRecord[];
     };
-    const text = (message || '').trim();
+    const { publicAttachments, agentAttachments } = normalizeIncomingAttachments(attachments);
+    const rawText = (message || '').trim();
+    const text =
+      rawText ||
+      (publicAttachments.length > 0
+        ? `Analyze the attached ${Array.from(new Set(publicAttachments.map((a) => a.kind))).join(', ')} file(s).`
+        : '');
     if (!text) {
       res.status(400).json({ error: 'Message cannot be empty.' });
       return;
@@ -543,12 +697,19 @@ async function startServer(): Promise<void> {
       role: 'user',
       content: text,
       timestamp: now,
+      ...(publicAttachments.length > 0 ? { attachments: publicAttachments } : {}),
     };
     thread.messages.push(userMsg);
     thread.updatedAt = now;
     store.saveThreads(threads);
 
     let llmCfg = store.getLLMConfig();
+    if (!llmCfg.primary.model.trim()) {
+      res.status(400).json({
+        error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
+      });
+      return;
+    }
     const requestedEffort =
       typeof reasoningEffort === 'string' && reasoningEffort.trim()
         ? reasoningEffort.trim().toLowerCase()
@@ -577,6 +738,8 @@ async function startServer(): Promise<void> {
           temperature: llmCfg.primary.temperature,
           max_tokens: llmCfg.primary.max_tokens,
           reasoning_effort: requestedEffort,
+          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
+          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
         },
         worker_model: {
           provider: llmCfg.worker.provider,
@@ -585,7 +748,11 @@ async function startServer(): Promise<void> {
           temperature: llmCfg.worker.temperature,
           max_tokens: llmCfg.worker.max_tokens,
           reasoning_effort: llmCfg.worker.reasoning_effort,
+          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
+          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
         },
+        accessory_models: llmCfg.accessories,
+        attachments: agentAttachments.length > 0 ? agentAttachments : undefined,
         mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
       },
     });
@@ -702,6 +869,9 @@ async function startServer(): Promise<void> {
 
       thread.messages.push(assistantMsg);
       thread.pendingApproval = pendingApproval;
+      if (activity.contextUsage) {
+        thread.contextUsage = activity.contextUsage;
+      }
       thread.updatedAt = replyNow;
       store.saveThreads(threads);
       res.json({ done: true, activity, thread, message: assistantMsg });
@@ -787,6 +957,8 @@ async function startServer(): Promise<void> {
           temperature: llmCfg.primary.temperature,
           max_tokens: llmCfg.primary.max_tokens,
           reasoning_effort: llmCfg.primary.reasoning_effort,
+          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
+          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
         },
         worker_model: {
           provider: llmCfg.worker.provider,
@@ -795,6 +967,8 @@ async function startServer(): Promise<void> {
           temperature: llmCfg.worker.temperature,
           max_tokens: llmCfg.worker.max_tokens,
           reasoning_effort: llmCfg.worker.reasoning_effort,
+          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
+          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
         },
       },
     });
@@ -837,6 +1011,9 @@ async function startServer(): Promise<void> {
     if (thread) {
       thread.messages.push(assistantMsg);
       thread.pendingApproval = pendingApproval;
+      if (data.context_usage && typeof data.context_usage === 'object') {
+        thread.contextUsage = data.context_usage as ContextUsageSnapshot;
+      }
       thread.updatedAt = now;
       store.saveThreads(threads);
     }
@@ -847,11 +1024,27 @@ async function startServer(): Promise<void> {
   // ---------------------------------------------------------------------------
   // Workspace Filesystem API (/workspace)
   // ---------------------------------------------------------------------------
-  app.get('/api/filesystem/tree', requireSession, (_req, res) => {
-    res.json({
-      root: '/workspace',
-      entries: store.listWorkspaceTree(),
-    });
+  app.get('/api/filesystem/tree', requireSession, (req, res) => {
+    const dirParam = typeof req.query.dir === 'string' ? req.query.dir.trim() : '';
+    try {
+      if (dirParam) {
+        const listed = store.listWorkspaceDirectory(dirParam);
+        res.json({
+          root: '/workspace',
+          dir: dirParam,
+          entries: listed.entries,
+          totalCount: listed.totalCount,
+          truncated: listed.truncated,
+        });
+        return;
+      }
+      res.json({
+        root: '/workspace',
+        entries: store.listWorkspaceTree(),
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to read workspace tree.' });
+    }
   });
 
   app.get('/api/filesystem/file', requireSession, (req, res) => {
@@ -911,16 +1104,25 @@ async function startServer(): Promise<void> {
     const body = (req.body || {}) as {
       primary?: Partial<ReturnType<typeof store.getLLMConfig>['primary']>;
       worker?: Partial<ReturnType<typeof store.getLLMConfig>['worker']>;
+      accessories?: Partial<{
+        image: Partial<AccessoryLLMConfig>;
+        video: Partial<AccessoryLLMConfig>;
+        audio: Partial<AccessoryLLMConfig>;
+      }>;
       max_turns?: number;
       api_keys?: {
         primary?: string;
         worker?: string;
+        image?: string;
+        video?: string;
+        audio?: string;
       };
     };
 
     const saved = store.saveLLMConfig({
       primary: body.primary as ReturnType<typeof store.getLLMConfig>['primary'],
       worker: body.worker as ReturnType<typeof store.getLLMConfig>['worker'],
+      accessories: body.accessories,
       max_turns: body.max_turns,
     });
 
@@ -932,6 +1134,13 @@ async function startServer(): Promise<void> {
     if (body.api_keys?.worker && body.api_keys.worker.trim()) {
       const envVar = store.getEnvVarForProvider(saved.worker.provider, 'worker');
       vaultUpdates[envVar] = body.api_keys.worker.trim();
+    }
+    for (const mod of ['image', 'video', 'audio'] as const) {
+      const keyVal = body.api_keys?.[mod];
+      if (keyVal && keyVal.trim()) {
+        const envVar = store.getEnvVarForProvider(saved.accessories[mod].provider, 'worker');
+        vaultUpdates[envVar] = keyVal.trim();
+      }
     }
 
     // Store API keys encrypted at rest inside this user's profile vault (AES-256-GCM)
@@ -1046,7 +1255,7 @@ async function startServer(): Promise<void> {
       provider?: string;
       base_url?: string;
       api_key?: string;
-      role?: 'primary' | 'worker';
+      role?: 'primary' | 'worker' | 'image' | 'video' | 'audio';
     };
     const cleanProvider = (provider || '').trim();
     if (!cleanProvider) {
@@ -1059,7 +1268,7 @@ async function startServer(): Promise<void> {
       provider: cleanProvider,
       base_url: base_url?.trim() || undefined,
       api_key: api_key?.trim() || undefined,
-      role: role === 'worker' ? 'worker' : 'primary',
+      role: role === 'primary' ? 'primary' : 'worker',
       env: profileSecrets,
     });
 
@@ -1069,17 +1278,21 @@ async function startServer(): Promise<void> {
   app.post('/api/settings/probe', requireSession, async (req, res) => {
     const username = getSessionUsername(res);
     const { role, override, apiKey } = (req.body || {}) as {
-      role?: 'primary' | 'worker';
+      role?: 'primary' | 'worker' | 'image' | 'video' | 'audio';
       override?: Partial<ReturnType<typeof store.getLLMConfig>['primary']> & { api_key?: string };
       apiKey?: string;
     };
-    const targetRole = role === 'worker' ? 'worker' : 'primary';
     const profileSecrets = loadProfileSecrets(username);
     const persisted = store.getLLMConfig();
+    const isAccessory = role === 'image' || role === 'video' || role === 'audio';
+    const targetRole: 'primary' | 'worker' = role === 'primary' ? 'primary' : 'worker';
+    const persistedRoleConfig = isAccessory
+      ? persisted.accessories[role]
+      : persisted[targetRole];
     const result = await probeProviderModelDirect({
       role: targetRole,
       override,
-      persistedRoleConfig: persisted[targetRole],
+      persistedRoleConfig,
       apiKey,
       env: profileSecrets,
     });

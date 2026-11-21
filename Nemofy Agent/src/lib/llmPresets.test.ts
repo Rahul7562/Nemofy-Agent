@@ -4,10 +4,15 @@ import {
   LLM_PROVIDER_PRESETS,
   applyProviderPreset,
   canonicalizeProviderId,
+  classifyFileModality,
+  detectModelInputModalities,
   filterProviderModels,
   formatContextLength,
+  formatFileSize,
+  getDefaultAccessoriesConfig,
   getProviderPreset,
   mergeProviderModels,
+  normalizeAccessoriesConfig,
   validateLLMConfig,
 } from './llmPresets.ts';
 import { getThinkingProfile } from './thinkingModes.ts';
@@ -128,4 +133,45 @@ test('validateLLMConfig catches missing URLs and accepts valid NVIDIA config', (
     max_turns: 30,
   });
   assert.equal(invalid.valid, false);
+});
+
+test('detectModelInputModalities matches DeepSeek-V4.1-Flash, Nemotron Omni, and text-only models', () => {
+  const ds = detectModelInputModalities('river_ai', 'deepseek-ai/DeepSeek-V4.1-Flash');
+  assert.equal(ds.has('text'), true);
+  assert.equal(ds.has('image'), true);
+  assert.equal(ds.has('audio'), false);
+  assert.equal(ds.has('video'), false);
+
+  const omni = detectModelInputModalities(
+    'openrouter',
+    'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+  );
+  assert.equal(omni.has('text'), true);
+  assert.equal(omni.has('image'), true);
+  assert.equal(omni.has('audio'), true);
+  assert.equal(omni.has('video'), true);
+
+  const r1 = detectModelInputModalities('deepseek', 'deepseek-r1');
+  assert.equal(r1.has('image'), false);
+  assert.equal(r1.has('audio'), false);
+  assert.equal(r1.has('video'), false);
+});
+
+test('classifyFileModality, formatFileSize, and normalizeAccessoriesConfig behave cleanly', () => {
+  assert.equal(classifyFileModality('image/png', 'pic.png'), 'image');
+  assert.equal(classifyFileModality('video/mp4', 'demo.mp4'), 'video');
+  assert.equal(classifyFileModality('audio/wav', 'voice.wav'), 'audio');
+  assert.equal(classifyFileModality('image/svg+xml', 'bad.svg'), null);
+  assert.equal(classifyFileModality('text/plain', 'notes.txt'), null);
+
+  assert.equal(formatFileSize(512), '512 B');
+  assert.equal(formatFileSize(2048), '2.0 KB');
+  assert.equal(formatFileSize(5 * 1024 * 1024), '5.0 MB');
+
+  const defaults = getDefaultAccessoriesConfig();
+  assert.equal(defaults.video.provider, 'openrouter');
+  assert.equal(defaults.video.model, 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free');
+  const normalized = normalizeAccessoriesConfig({ audio: { enabled: false } });
+  assert.equal(normalized.audio.enabled, false);
+  assert.equal(normalized.video.enabled, true);
 });

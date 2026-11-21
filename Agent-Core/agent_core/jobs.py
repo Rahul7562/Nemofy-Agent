@@ -86,6 +86,7 @@ class AgentJob:
     activity_feed: list[dict[str, Any]] = field(default_factory=list)
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     file_changes: list[dict[str, Any]] = field(default_factory=list)
+    context_usage: dict[str, Any] | None = None
     _update_event: asyncio.Event = field(default_factory=asyncio.Event)
     _runner_task: asyncio.Task[None] | None = None
     _watchdog_task: asyncio.Task[None] | None = None
@@ -146,6 +147,10 @@ class AgentJob:
                 if isinstance(item, dict) and item.get("path"):
                     self.file_changes.append(dict(item))
 
+        ctx_usage = event.get("context_usage")
+        if isinstance(ctx_usage, dict) and ctx_usage.get("context_window"):
+            self.context_usage = dict(ctx_usage)
+
         detail = str(event.get("detail") or event.get("tool") or phase).strip()
         self.last_event = detail[:240]
 
@@ -195,6 +200,14 @@ class AgentJob:
         if not merged_files and isinstance(self.result, dict) and isinstance(self.result.get("file_changes"), list):
             merged_files = list(self.result["file_changes"])
 
+        merged_context_usage = self.context_usage
+        if (
+            isinstance(self.result, dict)
+            and isinstance(self.result.get("context_usage"), dict)
+            and self.result["context_usage"].get("context_window")
+        ):
+            merged_context_usage = dict(self.result["context_usage"])
+
         return {
             "job_id": self.job_id,
             "thread_id": self.thread_id,
@@ -217,6 +230,7 @@ class AgentJob:
             "activity_feed": list(self.activity_feed),
             "tool_events": merged_tools,
             "file_changes": merged_files,
+            "context_usage": merged_context_usage,
             "error": self.error,
             "result": self.result,
         }

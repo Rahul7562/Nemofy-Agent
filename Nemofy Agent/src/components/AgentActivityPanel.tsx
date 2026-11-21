@@ -93,6 +93,14 @@ function FileChangeRow({ item }: { item: FileChangeItem }) {
   );
 }
 
+function formatToolDisplayName(toolName: string): string {
+  if (toolName === 'accessory_image_subagent') return 'Image Accessory Sub-Agent';
+  if (toolName === 'accessory_video_subagent') return 'Video Accessory Sub-Agent';
+  if (toolName === 'accessory_audio_subagent') return 'Audio Accessory Sub-Agent';
+  if (toolName === 'auto_compact_context') return 'Auto-Compact Context (80%)';
+  return toolName;
+}
+
 function ToolEventRow({ item }: { item: ToolEventItem }) {
   const isRunning = item.status === 'running';
   const isError = item.status === 'error';
@@ -112,7 +120,7 @@ function ToolEventRow({ item }: { item: ToolEventItem }) {
             <CheckCircle2 className="w-3.5 h-3.5 text-[var(--jade)] shrink-0" />
           )}
           <span className="font-mono text-[11px] font-semibold text-[var(--ink)] shrink-0">
-            {item.tool}
+            {formatToolDisplayName(item.tool)}
           </span>
           {item.args_summary && (
             <span

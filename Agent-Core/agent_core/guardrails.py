@@ -22,6 +22,7 @@ EXPLICIT_SAFE_TOOLS: frozenset[str] = frozenset(
     {
         "read_file",
         "list_dir",
+        "web_search",
         "web_fetch",
         "load_skill",
         "write_file",
@@ -224,6 +225,15 @@ _BUILTIN_ARG_ALIASES: dict[str, dict[str, str]] = {
     },
     "list_dir": {"dir_path": "path", "directory": "path", "folder": "path"},
     "load_skill": {"skill": "name", "skill_name": "name"},
+    "web_search": {
+        "q": "query",
+        "search_query": "query",
+        "keywords": "query",
+        "term": "query",
+        "limit": "max_results",
+        "num_results": "max_results",
+        "count": "max_results",
+    },
     "web_fetch": {"uri": "url", "link": "url"},
 }
 

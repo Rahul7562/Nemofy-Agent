@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { maskEnvSecret, upsertEnvContent } from './configStore.ts';
+import {
+  WorkspaceAndConfigStore,
+  getDefaultAccessoriesConfig,
+  maskEnvSecret,
+  upsertEnvContent,
+} from './configStore.ts';
 
 test('upsertEnvContent preserves comments, updates existing keys, and appends new keys', () => {
   const initial = [
@@ -27,3 +35,170 @@ test('maskEnvSecret redacts secrets safely', () => {
   assert.equal(maskEnvSecret('short'), '****');
   assert.equal(maskEnvSecret('sk-proj-1234567890abcd'), 'sk-p...abcd');
 });
+
+test('WorkspaceAndConfigStore persists accessories config with Nemotron Omni defaults', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-cfg-test-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+    const initial = store.getLLMConfig();
+    assert.ok(initial.accessories);
+    assert.equal(initial.accessories.video.provider, 'openrouter');
+    assert.equal(
+      initial.accessories.video.model,
+      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    );
+    assert.equal(initial.accessories.audio.enabled, true);
+
+    const updated = store.saveLLMConfig({
+      ...initial,
+      accessories: {
+        ...getDefaultAccessoriesConfig(),
+        audio: {
+          ...getDefaultAccessoriesConfig().audio,
+          provider: 'gemini',
+          model: 'gemini-2.5-flash',
+          base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        },
+      },
+    });
+    assert.equal(updated.accessories?.audio.provider, 'gemini');
+    assert.equal(updated.accessories?.audio.model, 'gemini-2.5-flash');
+
+    // Re-read from disk to confirm persistence
+    const reloaded = new WorkspaceAndConfigStore(tmpRoot).getLLMConfig();
+    assert.equal(reloaded.accessories?.audio.provider, 'gemini');
+    assert.equal(reloaded.accessories?.audio.model, 'gemini-2.5-flash');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('saveUploadedMedia enforces MIME allowlist, rejects SVG, and confines paths against traversal', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-media-test-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+
+    // Valid PNG upload
+    const pngAtt = store.saveUploadedMedia({
+      threadId: 'thread-abc123',
+      filename: 'chart.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    });
+    assert.equal(pngAtt.kind, 'image');
+    assert.equal(pngAtt.mimeType, 'image/png');
+    assert.ok(pngAtt.url.startsWith('/api/media/thread-abc123/'));
+    const storedName = pngAtt.storageKey.split('/')[1] || '';
+    const resolved = store.resolveUploadedMediaPath('thread-abc123', storedName);
+    assert.ok(resolved);
+    assert.ok(fs.existsSync(resolved.fullPath));
+    assert.equal(store.resolveAttachmentLocalPath(pngAtt.storageKey), resolved.fullPath);
+
+    // Valid WAV upload
+    const wavAtt = store.saveUploadedMedia({
+      threadId: 'thread-abc123',
+      filename: 'memo.wav',
+      mimeType: 'audio/wav',
+      buffer: Buffer.from('RIFF....WAVE'),
+    });
+    assert.equal(wavAtt.kind, 'audio');
+
+    // Reject SVG to prevent stored XSS
+    assert.throws(
+      () =>
+        store.saveUploadedMedia({
+          threadId: 'thread-abc123',
+          filename: 'evil.svg',
+          mimeType: 'image/svg+xml',
+          buffer: Buffer.from('<svg onload="alert(1)"/>'),
+        }),
+      /Unsupported media type/i,
+    );
+
+    // Reject path traversal on media resolution
+    assert.equal(store.resolveUploadedMediaPath('..', 'llm_config.json'), null);
+    assert.equal(store.resolveUploadedMediaPath('thread-abc123', '../secret.txt'), null);
+    assert.equal(store.resolveAttachmentLocalPath('../llm_config.json'), null);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('listWorkspaceTree skips .cache/node_modules, supports lazy listWorkspaceDirectory, and readWorkspaceFile guards binary/oversized files', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-fs-test-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+    const ws = store.workspaceDir;
+
+    // Create noisy cache/venv directories that should be excluded from workspace explorer
+    fs.mkdirSync(path.join(ws, '.cache', 'pip', 'wheels'), { recursive: true });
+    fs.writeFileSync(path.join(ws, '.cache', 'pip', 'wheels', 'huge.whl'), 'cached', 'utf-8');
+    fs.mkdirSync(path.join(ws, 'node_modules', 'pkg'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'node_modules', 'pkg', 'index.js'), 'module.exports = 1;', 'utf-8');
+
+    // Create normal workspace content including nested folder and binary artifact
+    fs.writeFileSync(path.join(ws, 'script.py'), 'print("hello")\n', 'utf-8');
+    fs.mkdirSync(path.join(ws, 'project', 'deep', 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'project', 'deep', 'nested', 'leaf.txt'), 'leaf', 'utf-8');
+    fs.writeFileSync(path.join(ws, 'binary.o'), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01]));
+
+    const tree = store.listWorkspaceTree();
+    const rootNames = tree.map((n) => n.name);
+    assert.equal(rootNames.includes('.cache'), false);
+    assert.equal(rootNames.includes('node_modules'), false);
+    assert.equal(rootNames.includes('script.py'), true);
+    assert.equal(rootNames.includes('project'), true);
+
+    // Lazy directory listing works for nested paths
+    const nestedListing = store.listWorkspaceDirectory('project/deep');
+    assert.equal(nestedListing.entries.length, 1);
+    assert.equal(nestedListing.entries[0].name, 'nested');
+    assert.equal(nestedListing.entries[0].hasChildren, true);
+
+    // Normal text file reads cleanly
+    const pyFile = store.readWorkspaceFile('script.py');
+    assert.equal(pyFile.content, 'print("hello")\n');
+
+    // Binary file throws a friendly error instead of returning garbage
+    assert.throws(() => store.readWorkspaceFile('binary.o'), /Binary file/i);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('WorkspaceAndConfigStore preserves blank primary.model and explicit context_window without snapping to a fallback', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-primary-blank-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+    const initial = store.getLLMConfig();
+
+    const cleared = store.saveLLMConfig({
+      ...initial,
+      primary: {
+        ...initial.primary,
+        provider: 'openrouter',
+        model: '',
+        base_url: 'https://openrouter.ai/api/v1',
+        context_window: null,
+      },
+    });
+    assert.equal(cleared.primary.model, '');
+
+    const reloaded = new WorkspaceAndConfigStore(tmpRoot).getLLMConfig();
+    assert.equal(reloaded.primary.model, '');
+
+    const withWindow = store.saveLLMConfig({
+      ...reloaded,
+      primary: {
+        ...reloaded.primary,
+        model: 'anthropic/claude-opus-4.6',
+        context_window: 200_000,
+      },
+    });
+    assert.equal(withWindow.primary.model, 'anthropic/claude-opus-4.6');
+    assert.equal(withWindow.primary.context_window, 200_000);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+

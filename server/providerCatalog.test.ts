@@ -39,7 +39,7 @@ test('parseModelsPayload handles OpenAI/NVIDIA/OpenRouter/Gemini/Together/Ollama
   const geminiModels = parseModelsPayload(
     {
       data: [
-        { id: 'models/gemini-2.5-pro', inputTokenLimit: 1000000 },
+        { id: 'models/gemini-2.5-pro', inputTokenLimit: 1048576, outputTokenLimit: 65536 },
         { id: 'models/text-embedding-004' },
       ],
     },
@@ -47,7 +47,8 @@ test('parseModelsPayload handles OpenAI/NVIDIA/OpenRouter/Gemini/Together/Ollama
   );
   assert.equal(geminiModels.length, 1);
   assert.equal(geminiModels[0].id, 'gemini-2.5-pro');
-  assert.equal(geminiModels[0].context_length, 1000000);
+  assert.equal(geminiModels[0].context_length, 1048576);
+  assert.equal(geminiModels[0].max_output_tokens, 65536);
 
   const openRouterModels = parseModelsPayload(
     {
@@ -55,7 +56,8 @@ test('parseModelsPayload handles OpenAI/NVIDIA/OpenRouter/Gemini/Together/Ollama
         {
           id: 'openai/gpt-5.2',
           name: 'OpenAI GPT-5.2',
-          context_length: 128000,
+          context_length: 400000,
+          top_provider: { max_completion_tokens: 128000 },
           pricing: { prompt: '0.00001', completion: '0.00003' },
         },
         {
@@ -69,6 +71,8 @@ test('parseModelsPayload handles OpenAI/NVIDIA/OpenRouter/Gemini/Together/Ollama
   );
   assert.equal(openRouterModels.find((m) => m.id === 'deepseek/deepseek-r1:free')?.is_free, true);
   assert.equal(openRouterModels.find((m) => m.id === 'openai/gpt-5.2')?.is_free, false);
+  assert.equal(openRouterModels.find((m) => m.id === 'openai/gpt-5.2')?.context_length, 400000);
+  assert.equal(openRouterModels.find((m) => m.id === 'openai/gpt-5.2')?.max_output_tokens, 128000);
 });
 
 test('probeProviderModelDirect rejects missing key for cloud providers instead of returning false Connected', async () => {

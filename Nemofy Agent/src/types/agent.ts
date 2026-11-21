@@ -1,6 +1,18 @@
 export type NavSection = 'chat' | 'filesystem' | 'settings';
-export type SettingsTab = 'llm' | 'password' | 'skills-mcps' | 'appearance';
+export type SettingsTab = 'llm' | 'accessories' | 'password' | 'skills-mcps' | 'appearance';
 export type ThemeMode = 'light' | 'dark';
+export type MediaModality = 'image' | 'video' | 'audio';
+export type ModelRoleKey = 'primary' | 'worker' | MediaModality;
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  kind: MediaModality;
+  mimeType: string;
+  size: number;
+  url: string;
+  storageKey?: string;
+}
 
 export interface AuthSession {
   authenticated: boolean;
@@ -51,6 +63,52 @@ export interface ActivityFeedItem {
   timestamp?: string;
 }
 
+export type ContextCategoryKey =
+  | 'system_prompt'
+  | 'tools'
+  | 'skills'
+  | 'user_messages'
+  | 'assistant_messages'
+  | 'tool_outputs'
+  | 'compacted_summary';
+
+export type ContextClassificationLevel = 'optimal' | 'moderate' | 'high' | 'critical';
+
+export interface ContextClassification {
+  level: ContextClassificationLevel;
+  label: string;
+  description: string;
+}
+
+export interface ContextCategoryBreakdown {
+  key: ContextCategoryKey;
+  label: string;
+  description: string;
+  tokens: number;
+  percent: number;
+  share_of_used: number;
+}
+
+export interface ContextUsageSnapshot {
+  model: string;
+  provider: string;
+  context_window: number;
+  context_window_source: string;
+  max_output_tokens?: number;
+  max_output_tokens_source?: string;
+  configured_max_tokens?: number;
+  used_tokens: number;
+  free_tokens: number;
+  usage_percent: number;
+  auto_compact_threshold_percent: number;
+  classification: ContextClassification;
+  categories: ContextCategoryBreakdown[];
+  compacted_count: number;
+  last_compacted_at: string | null;
+  tokens_saved_last_compaction: number;
+  calibrated_from_provider: boolean;
+}
+
 export interface LiveAgentActivity {
   jobId: string;
   status: string;
@@ -62,6 +120,7 @@ export interface LiveAgentActivity {
   activityFeed?: ActivityFeedItem[];
   toolEvents: ToolEventItem[];
   fileChanges: FileChangeItem[];
+  contextUsage?: ContextUsageSnapshot | null;
 }
 
 export interface ChatMessage {
@@ -69,6 +128,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: string;
+  attachments?: ChatAttachment[];
   plan?: PlanStep[];
   activeSkills?: string[];
   subagentReports?: Array<Record<string, unknown>>;
@@ -90,6 +150,7 @@ export interface ChatThread {
   updatedAt: string;
   messages: ChatMessage[];
   pendingApproval?: PendingApproval | null;
+  contextUsage?: ContextUsageSnapshot | null;
 }
 
 export interface WorkspaceNode {
@@ -99,6 +160,9 @@ export interface WorkspaceNode {
   size?: number;
   modifiedAt?: string;
   children?: WorkspaceNode[];
+  hasChildren?: boolean;
+  childCount?: number;
+  truncated?: boolean;
 }
 
 export interface RoleLLMConfig {
@@ -108,11 +172,24 @@ export interface RoleLLMConfig {
   temperature: number;
   max_tokens: number;
   reasoning_effort: string;
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+}
+
+export interface AccessoryLLMConfig extends RoleLLMConfig {
+  enabled: boolean;
+}
+
+export interface AccessoriesConfig {
+  image: AccessoryLLMConfig;
+  video: AccessoryLLMConfig;
+  audio: AccessoryLLMConfig;
 }
 
 export interface PersistedLLMConfig {
   primary: RoleLLMConfig;
   worker: RoleLLMConfig;
+  accessories?: AccessoriesConfig;
   max_turns: number;
 }
 
@@ -146,7 +223,9 @@ export interface ProviderModelOption {
   name?: string | null;
   owned_by?: string | null;
   context_length?: number | null;
+  max_output_tokens?: number | null;
   is_free?: boolean;
+  input_modalities?: string[];
   source?: 'live' | 'preset' | 'custom';
 }
 

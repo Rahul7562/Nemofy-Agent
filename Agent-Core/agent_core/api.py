@@ -54,12 +54,15 @@ from agent_core.models import (
     get_worker_model,
     list_provider_models,
     load_model_spec,
+    load_persisted_accessories_config,
     load_persisted_llm_config,
     probe_model_connectivity,
     reload_env_file,
+    resolve_accessory_model_spec,
     resolve_model_spec_with_override,
     save_persisted_llm_config,
 )
+from agent_core.multimodal import MediaAttachment
 from agent_core.sandbox import SandboxManager
 from agent_core.skills import SkillRegistry, get_skills_health
 from MCPs.manager import MCPRegistryManager, MCPServerConfig, load_mcp_tools_from_configs
@@ -77,8 +80,10 @@ class ModelConfigOverride(BaseModel):
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=512)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
-    max_tokens: int | None = Field(default=None, ge=64, le=128_000)
+    max_tokens: int | None = Field(default=None, ge=64, le=20_000_000)
     reasoning_effort: str | None = Field(default=None, max_length=32)
+    context_window: int | None = Field(default=None, ge=512, le=20_000_000)
+    max_output_tokens: int | None = Field(default=None, ge=256, le=20_000_000)
 
     def to_model_override(self) -> ModelOverride | None:
         ov = ModelOverride(
@@ -89,18 +94,33 @@ class ModelConfigOverride(BaseModel):
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             reasoning_effort=self.reasoning_effort.strip() if self.reasoning_effort else None,
+            context_window=self.context_window,
+            max_output_tokens=self.max_output_tokens,
         )
         return ov if ov.has_any_override() else None
+
+
+class AccessoryModelConfigOverride(ModelConfigOverride):
+    """Per-modality Accessory LLM configuration (image, video, audio)."""
+
+    enabled: bool = True
+
+
+class AccessoriesConfigPayload(BaseModel):
+    image: AccessoryModelConfigOverride | None = None
+    video: AccessoryModelConfigOverride | None = None
+    audio: AccessoryModelConfigOverride | None = None
 
 
 class LLMConfigUpdateRequest(BaseModel):
     primary: ModelConfigOverride | None = None
     worker: ModelConfigOverride | None = None
+    accessories: AccessoriesConfigPayload | None = None
     max_turns: int | None = Field(default=None, ge=1, le=100)
 
 
 class ModelProbeRequest(BaseModel):
-    role: Literal["primary", "worker"] = "primary"
+    role: Literal["primary", "worker", "image", "video", "audio"] = "primary"
     override: ModelConfigOverride | None = None
     run_inference: bool = False
 
@@ -109,7 +129,7 @@ class ModelListRequest(BaseModel):
     provider: str = Field(..., min_length=1, max_length=64)
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=512)
-    role: Literal["primary", "worker"] = "primary"
+    role: Literal["primary", "worker", "image", "video", "audio"] = "primary"
 
 
 ALLOWED_PROFILE_SECRET_KEYS: frozenset[str] = frozenset(
@@ -138,22 +158,17 @@ class ProfileSecretsRequest(BaseModel):
 
 
 class AgentRunRequest(BaseModel):
-    task: str = Field(..., min_length=1, max_length=32_000)
+    task: str = Field(default="", max_length=32_000)
     thread_id: str | None = Field(default=None, max_length=128)
     max_turns: int | None = Field(default=None, ge=1, le=100)
     primary_model: ModelConfigOverride | None = None
     worker_model: ModelConfigOverride | None = None
+    accessory_models: AccessoriesConfigPayload | None = None
+    attachments: list[MediaAttachment] | None = None
+    primary_input_modalities: list[str] | None = None
     dynamic_skills: list[DynamicSkillSpec] | None = None
     mcp_servers: list[MCPServerConfig] | None = None
     stall_timeout_seconds: float | None = Field(default=None, ge=0.2, le=3600.0)
-
-    @field_validator("task")
-    @classmethod
-    def _strip_task(cls, v: str) -> str:
-        cleaned = v.strip()
-        if not cleaned:
-            raise ValueError("task must not be blank.")
-        return cleaned
 
     @field_validator("thread_id")
     @classmethod
@@ -189,6 +204,7 @@ class AgentRunResponse(BaseModel):
     pending_approval: dict[str, Any] | None = None
     subagent_reports: list[dict[str, Any]] = Field(default_factory=list)
     active_models: dict[str, Any] | None = None
+    context_usage: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -450,6 +466,7 @@ def create_app(
         return {
             "primary": load_model_spec("primary", include_persisted=True).safe_summary(),
             "worker": load_model_spec("worker", include_persisted=True).safe_summary(),
+            "accessories": load_persisted_accessories_config(),
             "max_turns": int(persisted.get("max_turns") or os.getenv("MAX_TURNS", "30")),
             "providers": get_provider_presets()["providers"],
         }
@@ -469,6 +486,15 @@ def create_app(
                 work_dict = payload.worker.model_dump(exclude_none=True, exclude={"api_key"})
                 resolve_model_spec_with_override("worker", override=work_dict)
                 current["worker"] = work_dict
+            if payload.accessories is not None:
+                acc_current = load_persisted_accessories_config()
+                for mod in ("image", "video", "audio"):
+                    mod_ov = getattr(payload.accessories, mod, None)
+                    if mod_ov is not None:
+                        mod_dict = mod_ov.model_dump(exclude_none=True, exclude={"api_key"})
+                        resolve_accessory_model_spec(mod, override=mod_dict)
+                        acc_current[mod] = mod_dict
+                current["accessories"] = acc_current
         except ModelConfigurationError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -485,17 +511,21 @@ def create_app(
             "ok": True,
             "primary": prim_spec.safe_summary(),
             "worker": work_spec.safe_summary(),
+            "accessories": load_persisted_accessories_config(),
             "max_turns": int(current.get("max_turns") or os.getenv("MAX_TURNS", "30")),
         }
 
     @app.post("/models/list", dependencies=[Depends(require_auth)])
     async def list_models(payload: ModelListRequest) -> dict[str, Any]:
         _sync_env_with_profile_secrets()
+        list_role: Literal["primary", "worker"] = (
+            "primary" if payload.role == "primary" else "worker"
+        )
         return await list_provider_models(
             payload.provider,
             base_url=payload.base_url,
             api_key=payload.api_key,
-            role=payload.role,
+            role=list_role,
         )
 
     @app.post("/models/probe", dependencies=[Depends(require_auth)])
@@ -503,15 +533,20 @@ def create_app(
         _sync_env_with_profile_secrets()
         ov = payload.override.to_model_override() if payload.override else None
         try:
-            spec = (
-                resolve_model_spec_with_override(payload.role, override=ov)
-                if ov is not None
-                else load_model_spec(payload.role, include_persisted=True)
-            )
+            if payload.role in ("image", "video", "audio"):
+                spec, _enabled = resolve_accessory_model_spec(payload.role, override=ov)
+                probe_role: Literal["primary", "worker"] = "worker"
+            else:
+                probe_role = payload.role
+                spec = (
+                    resolve_model_spec_with_override(probe_role, override=ov)
+                    if ov is not None
+                    else load_model_spec(probe_role, include_persisted=True)
+                )
         except ModelConfigurationError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return await probe_model_connectivity(
-            payload.role,
+            probe_role,
             spec=spec,
             run_inference=payload.run_inference,
         )
@@ -583,6 +618,12 @@ def create_app(
                     progress_callback=job.record_progress,
                 )
 
+            acc_raw = req.get("accessory_models")
+            acc_overrides: dict[str, Any] | None = acc_raw if isinstance(acc_raw, dict) else None
+            att_raw = req.get("attachments")
+            attachments_list = att_raw if isinstance(att_raw, list) and att_raw else None
+            prim_mods = req.get("primary_input_modalities")
+
             return await runtime.run_task(
                 str(req.get("task") or ""),
                 thread_id=job.thread_id,
@@ -593,6 +634,9 @@ def create_app(
                 extra_mcp_tool_names=dyn_mcp_names or None,
                 dynamic_skills=skill_dicts or None,
                 progress_callback=job.record_progress,
+                attachments=attachments_list,
+                accessory_models=acc_overrides,
+                primary_input_modalities=prim_mods if isinstance(prim_mods, list) else None,
             )
 
         return _runner
@@ -610,6 +654,11 @@ def create_app(
             )
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
 
+        if not payload.task.strip() and not payload.attachments:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="task must not be blank when no attachments are provided.",
+            )
         thread_id = payload.thread_id or f"thread-{uuid.uuid4().hex[:12]}"
         job_mgr: JobManager = request.app.state.job_manager
         job = job_mgr.create_job(
@@ -676,10 +725,20 @@ def create_app(
             )
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
 
+        if not payload.task.strip() and not payload.attachments:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="task must not be blank when no attachments are provided.",
+            )
         _sync_env_with_profile_secrets()
         thread_id = payload.thread_id or f"thread-{uuid.uuid4().hex[:12]}"
         prim_ov = _effective_override(payload.primary_model, "primary")
         work_ov = _effective_override(payload.worker_model, "worker")
+        acc_ov = (
+            payload.accessory_models.model_dump(exclude_none=True)
+            if payload.accessory_models
+            else None
+        )
         skill_dicts = (
             [s.model_dump() for s in payload.dynamic_skills] if payload.dynamic_skills else None
         )
@@ -694,6 +753,9 @@ def create_app(
                 extra_tools=ext_tools or None,
                 extra_mcp_tool_names=ext_mcp or None,
                 dynamic_skills=skill_dicts,
+                attachments=payload.attachments,
+                accessory_models=acc_ov,
+                primary_input_modalities=payload.primary_input_modalities,
             )
             return AgentRunResponse(
                 **{k: result[k] for k in AgentRunResponse.model_fields if k in result}
