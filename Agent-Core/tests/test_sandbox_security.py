@@ -318,3 +318,67 @@ async def test_local_sandbox_node_venv_path_rewrite_and_env_scrubbing(
     assert ex_res.exit_code == 0
     assert ".env.example" in ex_res.stdout
 
+
+@pytest.mark.asyncio
+async def test_sandbox_path_env_rewrite_script_hint_crlf_edit_and_malformed_args(
+    tmp_workspace: Path,
+) -> None:
+    """Verify PATH/PYTHONPATH /workspace rewriting, script error hint, CRLF edit_file, and malformed JSON arg errors."""
+    from agent_core.guardrails import normalize_tool_arguments, validate_tool_arguments
+    from agent_core.sandbox import rewrite_workspace_paths_in_command
+    from agent_core.tools.local import build_local_tools
+
+    ws_str = str(tmp_workspace.resolve())
+
+    # 1. PATH and PYTHONPATH containing :/workspace and /workspace: rewrite cleanly while URLs stay intact
+    assert (
+        rewrite_workspace_paths_in_command("PATH=/usr/bin:/workspace/bin python3 app.py", tmp_workspace)
+        == f"PATH=/usr/bin:{ws_str}/bin python3 app.py"
+    )
+    assert (
+        rewrite_workspace_paths_in_command("PYTHONPATH=/workspace:/tmp/lib python3 app.py", tmp_workspace)
+        == f"PYTHONPATH={ws_str}:/tmp/lib python3 app.py"
+    )
+    assert (
+        rewrite_workspace_paths_in_command("curl http://127.0.0.1:8080/workspace/api", tmp_workspace)
+        == "curl http://127.0.0.1:8080/workspace/api"
+    )
+
+    cfg = SandboxConfig(workspace_dir=tmp_workspace, backend="local_isolated", timeout_seconds=10)
+    mgr = SandboxManager(cfg)
+
+    # 2. Script crashing with FileNotFoundError on literal /workspace/... receives actionable hint
+    mgr.write_file("/workspace/bad_path.py", "open('/workspace/missing_data.txt').read()\n")
+    res = await mgr.exec_command("python3 bad_path.py")
+    assert res.exit_code != 0
+    assert "Sandbox hint" in res.stderr
+    assert "relative paths" in res.stderr
+
+    # 3. edit_file handles CRLF file with LF old_text and gives line-count hint when not found
+    crlf_path = tmp_workspace / "crlf.txt"
+    crlf_path.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+    edit_msg = mgr.edit_file("/workspace/crlf.txt", "alpha\nbeta", "alpha\nBETA")
+    assert "Updated" in edit_msg
+    assert crlf_path.read_bytes() == b"alpha\r\nBETA\r\ngamma\r\n"
+
+    with pytest.raises(ValueError, match="file has 3 lines"):
+        mgr.edit_file("/workspace/crlf.txt", "does_not_exist", "x")
+
+    # 4. Expanded aliases + malformed JSON string surfaces explicit validation error
+    assert normalize_tool_arguments("write_file", {"file_path": "a.py", "code": "x=1"}) == {
+        "path": "a.py",
+        "content": "x=1",
+    }
+    assert normalize_tool_arguments("edit_file", {"path": "a.py", "search": "1", "replace": "2"}) == {
+        "path": "a.py",
+        "old_text": "1",
+        "new_text": "2",
+    }
+    bad_norm = normalize_tool_arguments("write_file", '{"path": "a.py", "content": "unterminated')
+    assert "__invalid_json__" in bad_norm
+    tools = {t.name: t for t in build_local_tools(mgr)}
+    validated, err = validate_tool_arguments(tools["write_file"], bad_norm)
+    assert validated is None
+    assert err is not None and "Malformed JSON arguments" in err
+
+

@@ -21,6 +21,20 @@ from agent_core.state import compact_tool_output
 import re
 
 _WORKER_THINK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.IGNORECASE)
+_WORKER_UNCLOSED_THINK_RE = re.compile(r"<think>[\s\S]*$", flags=re.IGNORECASE)
+
+
+def _normalize_worker_finish_reason(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if "length" in s or "max_tokens" in s:
+        return "length"
+    if "tool_calls" in s:
+        return "tool_calls"
+    if "stop" in s or "end_turn" in s:
+        return "stop"
+    return s
 
 
 def _extract_worker_text(msg: Any) -> str:
@@ -39,7 +53,46 @@ def _extract_worker_text(msg: Any) -> str:
         text = "\n".join(parts)
     else:
         text = str(raw or "")
-    return _WORKER_THINK_RE.sub("", text).strip()
+    text = _WORKER_THINK_RE.sub("", text)
+    text = _WORKER_UNCLOSED_THINK_RE.sub("", text)
+    return text.strip()
+
+
+def _build_worker_recovery_messages(
+    messages: list[BaseMessage],
+    nudge: str,
+) -> list[BaseMessage]:
+    msgs = list(messages)
+    if not msgs:
+        return [HumanMessage(content=nudge)]
+    last = msgs[-1]
+    if isinstance(last, HumanMessage):
+        existing = str(last.content or "").rstrip()
+        msgs[-1] = HumanMessage(content=f"{existing}\n\n{nudge}" if existing else nudge)
+        return msgs
+    if isinstance(last, ToolMessage):
+        msgs.append(AIMessage(content="I reviewed the tool outputs above."))
+        msgs.append(HumanMessage(content=nudge))
+        return msgs
+    msgs.append(HumanMessage(content=nudge))
+    return msgs
+
+
+def _sanitize_worker_ai_message(msg: AIMessage) -> AIMessage:
+    valid_tcs = list(getattr(msg, "tool_calls", None) or [])
+    extra = dict(getattr(msg, "additional_kwargs", None) or {})
+    inv_tcs = list(getattr(msg, "invalid_tool_calls", None) or [])
+    if "tool_calls" not in extra and "function_call" not in extra and not inv_tcs:
+        return msg
+    extra.pop("tool_calls", None)
+    extra.pop("function_call", None)
+    return AIMessage(
+        content=msg.content,
+        additional_kwargs=extra,
+        response_metadata=dict(getattr(msg, "response_metadata", None) or {}),
+        tool_calls=valid_tcs,
+        invalid_tool_calls=[],
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -186,25 +239,31 @@ async def run_isolated_subagent(
         else worker_model
     )
 
-    async def _invoke_worker_resilient(prompt_msgs: list[BaseMessage]) -> AIMessage:
+    async def _invoke_worker_resilient(
+        model_to_call: Any,
+        base_obj: Any,
+        prompt_msgs: list[BaseMessage],
+        *,
+        bind_permitted_tools: bool = True,
+    ) -> AIMessage:
         try:
-            res = await bound_model.ainvoke(prompt_msgs)
+            res = await model_to_call.ainvoke(prompt_msgs)
         except GraphInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
             err_lower = str(exc).lower()
-            extra_body = getattr(worker_model, "extra_body", None)
+            extra_body = getattr(base_obj, "extra_body", None)
             if (
                 isinstance(extra_body, dict)
                 and "reasoning_effort" in extra_body
                 and ("reasoning" in err_lower or "400" in err_lower or "invalid_request" in err_lower)
-                and hasattr(worker_model, "model_copy")
+                and hasattr(base_obj, "model_copy")
             ):
                 stripped = {k: v for k, v in extra_body.items() if k != "reasoning_effort"}
-                fb = worker_model.model_copy(update={"extra_body": stripped or None})
+                fb = base_obj.model_copy(update={"extra_body": stripped or None})
                 fb_bound = (
                     fb.bind_tools(list(permitted_tools.values()))
-                    if permitted_tools and hasattr(fb, "bind_tools")
+                    if bind_permitted_tools and permitted_tools and hasattr(fb, "bind_tools")
                     else fb
                 )
                 res = await fb_bound.ainvoke(prompt_msgs)
@@ -212,49 +271,117 @@ async def run_isolated_subagent(
                 raise
         return res if isinstance(res, AIMessage) else AIMessage(content=str(getattr(res, "content", "") or ""))
 
+    def _bump_worker_model(
+        cur_base: Any,
+        *,
+        bind_permitted_tools: bool,
+        attempt: int,
+    ) -> tuple[Any, Any]:
+        updates: dict[str, Any] = {}
+        cur_max = getattr(cur_base, "max_tokens", None)
+        if isinstance(cur_max, int) and cur_max < 16384:
+            updates["max_tokens"] = min(max(cur_max * 2, 4096), 16384)
+        extra_body = getattr(cur_base, "extra_body", None)
+        if isinstance(extra_body, dict) and "reasoning_effort" in extra_body:
+            new_extra = dict(extra_body)
+            if attempt == 1 and str(new_extra.get("reasoning_effort", "")).lower() not in ("low", "minimal", "none"):
+                new_extra["reasoning_effort"] = "low"
+            else:
+                new_extra.pop("reasoning_effort", None)
+            updates["extra_body"] = new_extra or None
+        if not updates or not hasattr(cur_base, "model_copy"):
+            target = (
+                cur_base.bind_tools(list(permitted_tools.values()))
+                if bind_permitted_tools and permitted_tools and hasattr(cur_base, "bind_tools")
+                else cur_base
+            )
+            return target, cur_base
+        try:
+            copied = cur_base.model_copy(update=updates)
+            target = (
+                copied.bind_tools(list(permitted_tools.values()))
+                if bind_permitted_tools and permitted_tools and hasattr(copied, "bind_tools")
+                else copied
+            )
+            return target, copied
+        except Exception:  # noqa: BLE001
+            target = (
+                cur_base.bind_tools(list(permitted_tools.values()))
+                if bind_permitted_tools and permitted_tools and hasattr(cur_base, "bind_tools")
+                else cur_base
+            )
+            return target, cur_base
+
     async def worker_reason(state: WorkerState) -> dict[str, Any]:
         next_turn = state["turn_count"] + 1
+        is_final_turn = next_turn >= state["max_turns"]
         emit_progress(
             "subagent_reason",
             detail=f"Sub-agent '{normalized_role}' reasoning (worker turn {next_turn})",
         )
-        response = await _invoke_worker_resilient(state["messages"])
+        prompt_msgs = list(state["messages"])
+        bind_tools_now = not is_final_turn
+        if is_final_turn and state["turn_count"] > 0:
+            prompt_msgs = _build_worker_recovery_messages(
+                prompt_msgs,
+                "This is your final worker turn. Do not call any more tools; synthesize and return your final JSON report now based on all tool outputs above.",
+            )
+        active_model = bound_model if bind_tools_now else worker_model
+        response = await _invoke_worker_resilient(
+            active_model,
+            worker_model,
+            prompt_msgs,
+            bind_permitted_tools=bind_tools_now,
+        )
         content_text = _extract_worker_text(response)
-        tcs = list(getattr(response, "tool_calls", None) or [])
+        tcs = list(getattr(response, "tool_calls", None) or []) if bind_tools_now else []
         inv_tcs = list(getattr(response, "invalid_tool_calls", None) or [])
-        finish_reason = str(
-            (getattr(response, "response_metadata", None) or {}).get("finish_reason") or ""
-        ).lower()
+        finish_reason = _normalize_worker_finish_reason(
+            (getattr(response, "response_metadata", None) or {}).get("finish_reason")
+        )
 
-        if not tcs and (inv_tcs or not content_text):
+        retry_base = worker_model
+        for attempt in range(1, 3):
+            if tcs or (content_text and not inv_tcs):
+                break
             nudge = (
                 "Your previous output truncated or produced invalid tool JSON. "
                 "Keep reasoning concise and emit either a smaller valid tool call or your final JSON report now."
                 if (finish_reason == "length" or inv_tcs)
                 else "Your previous output was empty. Please call the next tool or return your final JSON report now."
             )
+            if not bind_tools_now:
+                nudge = (
+                    "Your previous output was empty or truncated. "
+                    "Keep reasoning minimal and immediately return your concise final JSON report now."
+                )
+            retry_model = active_model
+            if finish_reason == "length":
+                retry_model, retry_base = _bump_worker_model(
+                    retry_base,
+                    bind_permitted_tools=bind_tools_now,
+                    attempt=attempt,
+                )
+            retry_msgs = _build_worker_recovery_messages(prompt_msgs, nudge)
             try:
                 response = await _invoke_worker_resilient(
-                    [*state["messages"], HumanMessage(content=nudge)]
+                    retry_model,
+                    retry_base,
+                    retry_msgs,
+                    bind_permitted_tools=bind_tools_now,
                 )
-                content_text = _extract_worker_text(response)
             except GraphInterrupt:
                 raise
             except Exception:  # noqa: BLE001
-                pass
+                break
+            content_text = _extract_worker_text(response)
+            tcs = list(getattr(response, "tool_calls", None) or []) if bind_tools_now else []
+            inv_tcs = list(getattr(response, "invalid_tool_calls", None) or [])
+            finish_reason = _normalize_worker_finish_reason(
+                (getattr(response, "response_metadata", None) or {}).get("finish_reason")
+            )
 
-        # Strip stale additional_kwargs.tool_calls if no valid tool_calls exist
-        if not getattr(response, "tool_calls", None):
-            extra = dict(getattr(response, "additional_kwargs", None) or {})
-            if "tool_calls" in extra or "function_call" in extra:
-                extra.pop("tool_calls", None)
-                extra.pop("function_call", None)
-                response = AIMessage(
-                    content=response.content,
-                    additional_kwargs=extra,
-                    response_metadata=dict(getattr(response, "response_metadata", None) or {}),
-                    tool_calls=[],
-                )
+        response = _sanitize_worker_ai_message(response)
 
         emit_progress(
             "subagent_reason_done",

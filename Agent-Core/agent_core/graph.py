@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiosqlite
+import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -558,6 +559,80 @@ def _latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
 
 
 _THINK_TAG_RE = re.compile(r"<think>([\s\S]*?)</think>", flags=re.IGNORECASE)
+_UNCLOSED_THINK_TAG_RE = re.compile(r"<think>([\s\S]*)$", flags=re.IGNORECASE)
+_BASH_EXIT_CODE_RE = re.compile(r"^exit_code:\s*(-?\d+)\b", re.MULTILINE)
+_KNOWN_FINISH_REASONS: tuple[str, ...] = (
+    "length",
+    "max_tokens",
+    "stop",
+    "end_turn",
+    "tool_calls",
+    "function_call",
+    "content_filter",
+)
+
+
+def _normalize_finish_reason(raw: Any) -> str:
+    """Normalize provider finish_reason values, including duplicated chunk merges like 'lengthlength'."""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if s in _KNOWN_FINISH_REASONS:
+        return "length" if s == "max_tokens" else ("stop" if s == "end_turn" else s)
+    for known in _KNOWN_FINISH_REASONS:
+        klen = len(known)
+        if len(s) % klen == 0 and s == known * (len(s) // klen):
+            return "length" if known == "max_tokens" else ("stop" if known == "end_turn" else known)
+    if "length" in s or "max_tokens" in s:
+        return "length"
+    if "tool_calls" in s:
+        return "tool_calls"
+    if "content_filter" in s:
+        return "content_filter"
+    if "stop" in s or "end_turn" in s:
+        return "stop"
+    return s
+
+
+def _is_tool_output_error(tool_name: str, raw_output: str) -> bool:
+    """Detect tool execution failures including non-zero exit codes or timeouts from bash_exec."""
+    if raw_output.startswith("ERROR:"):
+        return True
+    if tool_name == "bash_exec":
+        if "status: TIMED_OUT" in raw_output:
+            return True
+        match = _BASH_EXIT_CODE_RE.search(raw_output)
+        if match is not None:
+            try:
+                if int(match.group(1)) != 0:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def _extract_reasoning_from_extra(extra: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        val = extra.get(key)
+        if isinstance(val, str) and val.strip():
+            found.append(val.strip())
+    if not found:
+        details = extra.get("reasoning_details")
+        if isinstance(details, list):
+            parts: list[str] = []
+            for item in details:
+                if isinstance(item, dict):
+                    item_type = str(item.get("type") or "").lower()
+                    if item_type and "encrypted" in item_type:
+                        continue
+                    t = item.get("text") or item.get("summary") or item.get("content")
+                    if isinstance(t, str) and t:
+                        parts.append(t)
+            joined = "".join(parts).strip()
+            if joined:
+                found.append(joined)
+    return found
 
 
 def _extract_text_and_thinking(ai_msg: AIMessage) -> tuple[str, str | None]:
@@ -582,20 +657,26 @@ def _extract_text_and_thinking(ai_msg: AIMessage) -> tuple[str, str | None]:
     else:
         text = str(raw_content or "")
 
-    # Check LangChain / OpenAI-compatible reasoning_content in additional_kwargs
+    # Check LangChain / OpenAI-compatible reasoning_content / reasoning_details in additional_kwargs
     extra = getattr(ai_msg, "additional_kwargs", None) or {}
-    for key in ("reasoning_content", "reasoning", "thinking"):
-        val = extra.get(key)
-        if isinstance(val, str) and val.strip():
-            thinking_parts.append(val.strip())
+    if isinstance(extra, dict):
+        thinking_parts.extend(_extract_reasoning_from_extra(extra))
 
-    # Strip inline <think>...</think> blocks emitted by R1/QwQ/Qwen3 models
+    # Strip inline closed <think>...</think> blocks emitted by R1/QwQ/Qwen3 models
     inline_thinks = _THINK_TAG_RE.findall(text)
     if inline_thinks:
         for block in inline_thinks:
             if block.strip():
                 thinking_parts.append(block.strip())
         text = _THINK_TAG_RE.sub("", text)
+
+    # Also strip any unclosed trailing <think>... block (e.g. model truncated on max_tokens mid-thought)
+    unclosed_match = _UNCLOSED_THINK_TAG_RE.search(text)
+    if unclosed_match:
+        unclosed_inner = unclosed_match.group(1).strip()
+        if unclosed_inner:
+            thinking_parts.append(unclosed_inner)
+        text = text[: unclosed_match.start()]
 
     clean_text = text.strip()
     thinking = "\n\n".join(thinking_parts).strip() or None
@@ -606,10 +687,24 @@ def _extract_chunk_thinking_delta(chunk: Any) -> str:
     """Extract incremental reasoning/thinking text from a streamed AIMessageChunk."""
     parts: list[str] = []
     extra = getattr(chunk, "additional_kwargs", None) or {}
-    for key in ("reasoning_content", "reasoning", "thinking"):
-        val = extra.get(key)
-        if isinstance(val, str) and val:
-            parts.append(val)
+    if isinstance(extra, dict):
+        found_plain = False
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            val = extra.get(key)
+            if isinstance(val, str) and val:
+                parts.append(val)
+                found_plain = True
+        if not found_plain:
+            details = extra.get("reasoning_details")
+            if isinstance(details, list):
+                for item in details:
+                    if isinstance(item, dict):
+                        item_type = str(item.get("type") or "").lower()
+                        if item_type and "encrypted" in item_type:
+                            continue
+                        t = item.get("text") or item.get("summary") or item.get("content")
+                        if isinstance(t, str) and t:
+                            parts.append(t)
     raw_content = getattr(chunk, "content", None)
     if isinstance(raw_content, list):
         for item in raw_content:
@@ -634,6 +729,7 @@ async def _invoke_model_with_live_thinking(
         return raw if isinstance(raw, AIMessage) else AIMessage(content=str(getattr(raw, "content", "") or ""))
 
     merged: AIMessageChunk | None = None
+    last_finish_reason = ""
     announced_tools: set[str] = set()
     announced_responding = False
     pending_delta = ""
@@ -658,6 +754,14 @@ async def _invoke_model_with_live_thinking(
 
     try:
         async for chunk in bound_model.astream(input_messages):
+            chunk_meta = getattr(chunk, "response_metadata", None) or {}
+            if isinstance(chunk_meta, dict):
+                chunk_fr = _normalize_finish_reason(
+                    chunk_meta.get("finish_reason") or chunk_meta.get("normalized_finish_reason")
+                )
+                if chunk_fr:
+                    last_finish_reason = chunk_fr
+
             if isinstance(chunk, AIMessageChunk):
                 merged = chunk if merged is None else merged + chunk
             elif isinstance(chunk, AIMessage):
@@ -726,13 +830,37 @@ async def _invoke_model_with_live_thinking(
                     )
     except GraphInterrupt:
         raise
-    except NotImplementedError:
+    except (
+        NotImplementedError,
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        httpx.StreamError,
+        json.JSONDecodeError,
+    ) as stream_exc:
+        logger.warning(
+            "Streaming interrupted (%s); falling back to non-streaming ainvoke on turn %d.",
+            type(stream_exc).__name__,
+            turn_count,
+        )
+        _flush_thinking(force=True)
         raw = await bound_model.ainvoke(input_messages)
         return raw if isinstance(raw, AIMessage) else AIMessage(content=str(getattr(raw, "content", "") or ""))
 
     _flush_thinking(force=True)
 
     if merged is None:
+        # Provider returned an empty SSE stream (e.g. transient free-tier [DONE] with 0 chunks);
+        # try a single non-streaming fallback before declaring empty output.
+        if hasattr(bound_model, "ainvoke"):
+            try:
+                raw = await bound_model.ainvoke(input_messages)
+                if isinstance(raw, AIMessage):
+                    return raw
+                return AIMessage(content=str(getattr(raw, "content", "") or ""))
+            except GraphInterrupt:
+                raise
+            except Exception as fallback_exc:  # noqa: BLE001
+                logger.warning("Empty-stream ainvoke fallback failed: %s", fallback_exc)
         return AIMessage(content="")
 
     merged_tool_calls = list(getattr(merged, "tool_calls", None) or [])
@@ -770,10 +898,16 @@ async def _invoke_model_with_live_thinking(
                         }
                     )
 
+    final_meta = dict(merged.response_metadata or {})
+    if last_finish_reason:
+        final_meta["finish_reason"] = last_finish_reason
+    elif final_meta.get("finish_reason"):
+        final_meta["finish_reason"] = _normalize_finish_reason(final_meta.get("finish_reason"))
+
     ai_kwargs: dict[str, Any] = {
         "content": merged.content,
         "additional_kwargs": merged_extra,
-        "response_metadata": dict(merged.response_metadata or {}),
+        "response_metadata": final_meta,
         "tool_calls": merged_tool_calls,
         "invalid_tool_calls": merged_invalid_tcs,
     }
@@ -788,25 +922,30 @@ def _get_finish_reason(ai_msg: AIMessage | None) -> str:
     if ai_msg is None:
         return ""
     meta = getattr(ai_msg, "response_metadata", None) or {}
-    return str(meta.get("finish_reason") or meta.get("normalized_finish_reason") or "").strip().lower()
+    return _normalize_finish_reason(
+        meta.get("finish_reason") or meta.get("normalized_finish_reason")
+    )
 
 
 def _sanitize_ai_message_for_history(ai_msg: AIMessage) -> AIMessage:
-    """Ensure saved AIMessages without valid tool_calls never retain stale raw tool_calls in additional_kwargs."""
+    """Ensure saved AIMessages never retain invalid_tool_calls or mismatched raw tool_calls in additional_kwargs."""
     valid_tcs = list(getattr(ai_msg, "tool_calls", None) or [])
     extra = dict(getattr(ai_msg, "additional_kwargs", None) or {})
     inv_tcs = list(getattr(ai_msg, "invalid_tool_calls", None) or [])
-    if valid_tcs:
+    has_raw_ak = "tool_calls" in extra or "function_call" in extra
+
+    if not has_raw_ak and not inv_tcs:
         return ai_msg
-    if "tool_calls" not in extra and "function_call" not in extra and not inv_tcs:
-        return ai_msg
+
+    # Always strip raw additional_kwargs tool_calls/function_call (LangChain serializes
+    # AIMessage.tool_calls directly) and clear invalid_tool_calls so broken IDs never leak into history.
     extra.pop("tool_calls", None)
     extra.pop("function_call", None)
     cleaned_kwargs: dict[str, Any] = {
         "content": ai_msg.content,
         "additional_kwargs": extra,
         "response_metadata": dict(getattr(ai_msg, "response_metadata", None) or {}),
-        "tool_calls": [],
+        "tool_calls": valid_tcs,
         "invalid_tool_calls": [],
     }
     if getattr(ai_msg, "id", None):
@@ -817,17 +956,36 @@ def _sanitize_ai_message_for_history(ai_msg: AIMessage) -> AIMessage:
 
 
 def _sanitize_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Repair any orphaned assistant tool_calls from prior interrupted/truncated checkpoints before calling an LLM."""
+    """Repair orphaned assistant tool_calls AND drop orphaned ToolMessages before calling an LLM."""
     sanitized: list[BaseMessage] = []
     n = len(messages)
+    active_tool_ids: set[str] | None = None
+    active_allow_any_id = False
+
     for idx, msg in enumerate(messages):
+        if isinstance(msg, ToolMessage):
+            tid = str(getattr(msg, "tool_call_id", "") or "")
+            if active_tool_ids is not None:
+                if active_allow_any_id:
+                    sanitized.append(msg)
+                elif tid and tid in active_tool_ids:
+                    active_tool_ids.remove(tid)
+                    sanitized.append(msg)
+            # Otherwise drop orphaned ToolMessage whose parent AIMessage was missing or stripped
+            continue
+
+        active_tool_ids = None
+        active_allow_any_id = False
+
         if not isinstance(msg, AIMessage):
             sanitized.append(msg)
             continue
+
         tcs = list(getattr(msg, "tool_calls", None) or [])
         ak = dict(getattr(msg, "additional_kwargs", None) or {})
+        inv_tcs = list(getattr(msg, "invalid_tool_calls", None) or [])
         has_raw_ak_tc = bool(ak.get("tool_calls") or ak.get("function_call"))
-        if not tcs and not has_raw_ak_tc:
+        if not tcs and not has_raw_ak_tc and not inv_tcs:
             sanitized.append(msg)
             continue
 
@@ -843,9 +1001,12 @@ def _sanitize_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]
             j += 1
 
         if tcs and (not expected_ids or expected_ids.issubset(seen_ids)):
-            sanitized.append(msg)
+            sanitized.append(_sanitize_ai_message_for_history(msg))
+            active_tool_ids = set(expected_ids)
+            active_allow_any_id = len(expected_ids) == 0
         else:
-            # Strip orphaned/incomplete tool_calls so OpenAI-compatible gateways never reject the thread with HTTP 400
+            # Strip orphaned/incomplete tool_calls so OpenAI-compatible gateways never reject the thread with HTTP 400.
+            # Leaving active_tool_ids = None also drops any partial ToolMessages that immediately followed.
             ak.pop("tool_calls", None)
             ak.pop("function_call", None)
             clean_text, _ = _extract_text_and_thinking(msg)
@@ -861,35 +1022,94 @@ def _sanitize_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]
     return sanitized
 
 
+def _build_recovery_messages(
+    prompt_messages: list[BaseMessage],
+    nudge_text: str,
+) -> list[BaseMessage]:
+    """Construct role-alternation-safe retry messages accepted by strict OpenAI/Anthropic/Gemini gateways."""
+    msgs = list(prompt_messages)
+    if not msgs:
+        return [HumanMessage(content=nudge_text)]
+
+    last = msgs[-1]
+    if isinstance(last, HumanMessage):
+        if isinstance(last.content, list):
+            merged_content: Any = [*last.content, {"type": "text", "text": f"\n\n{nudge_text}"}]
+        else:
+            existing = str(last.content or "").rstrip()
+            merged_content = f"{existing}\n\n{nudge_text}" if existing else nudge_text
+        msgs[-1] = HumanMessage(
+            content=merged_content,
+            additional_kwargs=dict(getattr(last, "additional_kwargs", None) or {}),
+        )
+        return msgs
+
+    if isinstance(last, ToolMessage):
+        msgs.append(AIMessage(content="I reviewed the tool outputs above."))
+        msgs.append(HumanMessage(content=nudge_text))
+        return msgs
+
+    msgs.append(HumanMessage(content=nudge_text))
+    return msgs
+
+
 def _build_model_with_bumped_max_tokens(
     base_model: Any,
     active_tool_list: list[BaseTool],
-) -> tuple[Any, int | None]:
-    """Return a copied bound model with a larger max_tokens ceiling when an output truncated on finish_reason=length."""
+    *,
+    lower_reasoning: bool = False,
+    attempt: int = 1,
+) -> tuple[Any, Any, int | None]:
+    """Return a copied (bound_model, base_model, max_tokens) with a larger ceiling and reduced reasoning effort."""
     cur_max = getattr(base_model, "max_tokens", None)
-    if not isinstance(cur_max, int) or cur_max >= 16384 or not hasattr(base_model, "model_copy"):
+    updates: dict[str, Any] = {}
+    effective_max: int | None = cur_max if isinstance(cur_max, int) else None
+
+    if isinstance(cur_max, int) and cur_max < 32768:
+        bumped = min(max(cur_max * 2, 8192), 32768)
+        updates["max_tokens"] = bumped
+        effective_max = bumped
+
+    if lower_reasoning:
+        extra_body = getattr(base_model, "extra_body", None)
+        if isinstance(extra_body, dict) and "reasoning_effort" in extra_body:
+            new_extra = dict(extra_body)
+            cur_eff = str(new_extra.get("reasoning_effort") or "").strip().lower()
+            if attempt == 1 and cur_eff not in ("low", "minimal", "none"):
+                new_extra["reasoning_effort"] = "low"
+            else:
+                new_extra.pop("reasoning_effort", None)
+            updates["extra_body"] = new_extra or None
+        direct_eff = getattr(base_model, "reasoning_effort", None)
+        if isinstance(direct_eff, str) and direct_eff.strip():
+            if attempt == 1 and direct_eff.strip().lower() not in ("low", "minimal", "none"):
+                updates["reasoning_effort"] = "low"
+            else:
+                updates["reasoning_effort"] = None
+
+    if not updates or not hasattr(base_model, "model_copy"):
         bound = (
             base_model.bind_tools(active_tool_list)
             if hasattr(base_model, "bind_tools")
             else base_model
         )
-        return bound, cur_max if isinstance(cur_max, int) else None
-    bumped = min(max(cur_max * 2, 8192), 16384)
+        return bound, base_model, effective_max
+
     try:
-        copied = base_model.model_copy(update={"max_tokens": bumped})
+        copied = base_model.model_copy(update=updates)
         bound = (
             copied.bind_tools(active_tool_list)
             if hasattr(copied, "bind_tools")
             else copied
         )
-        return bound, bumped
+        return bound, copied, effective_max
     except Exception:  # noqa: BLE001
         bound = (
             base_model.bind_tools(active_tool_list)
             if hasattr(base_model, "bind_tools")
             else base_model
         )
-        return bound, cur_max
+        return bound, base_model, cur_max if isinstance(cur_max, int) else None
 
 
 def _build_empty_output_diagnostic(
@@ -1188,9 +1408,12 @@ def build_supervisor_graph(
 
         # Self-healing recovery: if the model truncated mid-tool-call (finish_reason=length),
         # produced malformed tool JSON, or returned empty content (e.g. thinking-only output),
-        # retry automatically up to 2 times with a higher token ceiling and targeted guidance.
+        # retry automatically up to 2 times with escalating token ceiling, reduced reasoning
+        # effort on length truncation, and role-safe continuation guidance.
         max_recovery_attempts = 2
         recovery_attempt = 0
+        current_retry_base = base_candidate
+        current_retry_bound = active_bound_model
         while not tool_calls and (invalid_tool_calls or not clean_preamble) and recovery_attempt < max_recovery_attempts:
             recovery_attempt += 1
             bad_names = ", ".join(
@@ -1202,18 +1425,19 @@ def build_supervisor_graph(
                 if isinstance(itc, dict)
             )
 
-            retry_bound = active_bound_model
-            retry_base = base_candidate
+            retry_bound = current_retry_bound
+            retry_base = current_retry_base
             if finish_reason == "length":
-                bumped_bound, bumped_limit = _build_model_with_bumped_max_tokens(
-                    base_candidate, active_tool_list
+                bumped_bound, bumped_base, _bumped_limit = _build_model_with_bumped_max_tokens(
+                    current_retry_base,
+                    active_tool_list,
+                    lower_reasoning=True,
+                    attempt=recovery_attempt,
                 )
                 retry_bound = bumped_bound
-                if bumped_limit is not None and hasattr(base_candidate, "model_copy"):
-                    try:
-                        retry_base = base_candidate.model_copy(update={"max_tokens": bumped_limit})
-                    except Exception:  # noqa: BLE001
-                        retry_base = base_candidate
+                retry_base = bumped_base
+                current_retry_bound = bumped_bound
+                current_retry_base = bumped_base
 
                 if bad_names:
                     recovery_note = (
@@ -1273,21 +1497,28 @@ def build_supervisor_graph(
                 detail=recovery_note,
             )
 
-            retry_messages = [*llm_input_messages, HumanMessage(content=nudge_text)]
+            retry_messages = _build_recovery_messages(llm_input_messages, nudge_text)
             try:
                 ai_reply = await _call_model_resilient(retry_bound, retry_base, retry_messages)
             except GraphInterrupt:
                 raise
             except Exception as retry_exc:  # noqa: BLE001
-                # If bumping max_tokens triggered a provider 400 limit error, fall back to original model
-                if retry_bound is not active_bound_model and ("max_tokens" in str(retry_exc).lower() or "400" in str(retry_exc).lower()):
+                # If bumping max_tokens or modifying reasoning_effort triggered a provider 400 error,
+                # fall back to the original model with the role-safe retry messages.
+                if retry_bound is not active_bound_model and (
+                    "max_tokens" in str(retry_exc).lower()
+                    or "max_completion_tokens" in str(retry_exc).lower()
+                    or "reasoning" in str(retry_exc).lower()
+                    or "400" in str(retry_exc).lower()
+                ):
                     try:
                         ai_reply = await _call_model_resilient(
                             active_bound_model, base_candidate, retry_messages
                         )
                     except GraphInterrupt:
                         raise
-                    except Exception:  # noqa: BLE001
+                    except Exception as fb_exc:  # noqa: BLE001
+                        logger.warning("Recovery fallback retry %d failed: %s", recovery_attempt, fb_exc)
                         break
                 else:
                     logger.warning("Recovery retry %d failed: %s", recovery_attempt, retry_exc)
@@ -1305,7 +1536,26 @@ def build_supervisor_graph(
             invalid_tool_calls = list(getattr(ai_reply, "invalid_tool_calls", None) or [])
             finish_reason = _get_finish_reason(ai_reply)
 
+        dropped_invalid_notes: list[str] = []
+        if tool_calls and invalid_tool_calls:
+            for itc in invalid_tool_calls[:3]:
+                if isinstance(itc, dict):
+                    iname = str(itc.get("name") or "tool")
+                    ierr = str(itc.get("error") or "malformed JSON")[:140]
+                    dropped_invalid_notes.append(f"`{iname}` ({ierr})")
+            logger.warning(
+                "Turn %d had %d valid and %d invalid tool calls; dropping invalid calls: %s",
+                turn_count,
+                len(tool_calls),
+                len(invalid_tool_calls),
+                "; ".join(dropped_invalid_notes),
+            )
+
         ai_reply = _sanitize_ai_message_for_history(ai_reply)
+        if dropped_invalid_notes:
+            meta_copy = dict(getattr(ai_reply, "response_metadata", None) or {})
+            meta_copy["_dropped_invalid_tool_calls"] = dropped_invalid_notes
+            ai_reply = ai_reply.model_copy(update={"response_metadata": meta_copy})
         tool_calls = list(getattr(ai_reply, "tool_calls", None) or [])
 
         tool_list_label = ", ".join(str(tc.get("name", "tool")) for tc in tool_calls[:4])
@@ -1483,7 +1733,7 @@ def build_supervisor_graph(
 
             if not audit.get("approved", True):
                 obs_status = "rejected"
-            elif raw_output.startswith("ERROR:"):
+            elif _is_tool_output_error(tc_name, raw_output):
                 obs_status = "error"
                 retry_counts[retry_key] = prior_failures + 1
             else:
@@ -1559,6 +1809,24 @@ def build_supervisor_graph(
                     "archived_log": archived_log,
                     "audit": audit,
                 }
+            )
+
+        dropped_invalid = (
+            (getattr(last_ai, "response_metadata", None) or {}).get("_dropped_invalid_tool_calls")
+            if last_ai is not None
+            else None
+        )
+        if isinstance(dropped_invalid, list) and dropped_invalid and tool_messages:
+            note = (
+                "\n\n[SYSTEM NOTE: Additional tool call(s) in the same turn were skipped due to "
+                f"malformed JSON arguments: {', '.join(str(x) for x in dropped_invalid)}. "
+                "Re-issue them with valid JSON if still needed.]"
+            )
+            last_tm = tool_messages[-1]
+            tool_messages[-1] = ToolMessage(
+                content=f"{last_tm.content}{note}",
+                tool_call_id=last_tm.tool_call_id,
+                name=last_tm.name,
             )
 
         return {

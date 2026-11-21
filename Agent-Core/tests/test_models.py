@@ -374,3 +374,82 @@ def test_nvidia_provider_resolution_and_api_key_isolation() -> None:
     assert presets["providers"]["nvidia"]["base_url"] == "https://integrate.api.nvidia.com/v1"
 
 
+def test_openrouter_reasoning_details_extraction() -> None:
+    """Verify _extract_reasoning_field extracts OpenRouter reasoning_details without duplicating plain reasoning."""
+    from agent_core.models import _extract_reasoning_field
+
+    # 1. Only reasoning_details present (list of dicts)
+    details_only = {
+        "content": "",
+        "reasoning_details": [
+            {"type": "reasoning.text", "text": "Step 1. "},
+            {"type": "reasoning.encrypted", "data": "opaque-blob"},
+            {"type": "reasoning.summary", "summary": "Step 2."},
+        ],
+    }
+    assert _extract_reasoning_field(details_only) == "Step 1. Step 2."
+
+    # 2. Both reasoning and reasoning_details present -> prefers plain reasoning without doubling
+    both = {
+        "reasoning": "Single reasoning string.",
+        "reasoning_details": [{"type": "reasoning.text", "text": "Single reasoning string."}],
+    }
+    assert _extract_reasoning_field(both) == "Single reasoning string."
+
+
+def test_gemini3_tool_call_thought_signature_roundtrip() -> None:
+    """Verify ReasoningChatOpenAI captures Gemini 3 extra_content.google.thought_signature and re-attaches it on Turn 2."""
+    from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+    from agent_core.models import ReasoningChatOpenAI
+
+    llm = ReasoningChatOpenAI(
+        model="gemini-3-flash-preview",
+        api_key="sk-test",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+    )
+    sig = {"google": {"thought_signature": "EpUB-test-signature-123"}}
+    raw_chunk = {
+        "id": "chatcmpl-g3",
+        "object": "chat.completion.chunk",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_g3_1",
+                            "type": "function",
+                            "function": {"name": "bash_exec", "arguments": '{"command":"echo 391"}'},
+                            "extra_content": sig,
+                        }
+                    ],
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    gen = llm._convert_chunk_to_generation_chunk(raw_chunk, AIMessageChunk, None)
+    assert gen is not None
+    assert gen.message.additional_kwargs["tool_call_extra_content"] == {"call_g3_1": sig}
+
+    ai_msg = AIMessage(
+        content="",
+        tool_calls=[{"id": "call_g3_1", "name": "bash_exec", "args": {"command": "echo 391"}}],
+        additional_kwargs={"tool_call_extra_content": {"call_g3_1": sig}},
+    )
+    payload = llm._get_request_payload(
+        [
+            HumanMessage(content="Compute 17 * 23"),
+            ai_msg,
+            ToolMessage(content="exit_code: 0\nstdout:\n391\n", tool_call_id="call_g3_1", name="bash_exec"),
+        ]
+    )
+    assistant_msgs = [m for m in payload["messages"] if m.get("role") == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["tool_calls"][0]["extra_content"] == sig
+
+
+
+

@@ -628,4 +628,302 @@ async def test_tool_argument_alias_normalization_and_guardrail_safety(
     assert all(ev["status"] == "ok" for ev in res["tool_events"])
 
 
+@pytest.mark.asyncio
+async def test_streamed_duplicate_finish_reason_unclosed_think_and_escalating_recovery(
+    isolated_sandbox: SandboxManager,
+    repo_skills: SkillRegistry,
+    tmp_checkpoint_db: Path,
+) -> None:
+    """Verify OpenRouter duplicate finish_reason='lengthlength', unclosed <think>, role-safe nudge, and escalating max_tokens + lowered reasoning."""
+    from collections.abc import AsyncIterator
+    from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
+
+    from agent_core.graph import (
+        _build_model_with_bumped_max_tokens,
+        _build_recovery_messages,
+        _extract_text_and_thinking,
+        _invoke_model_with_live_thinking,
+        _normalize_finish_reason,
+    )
+    from agent_core.jobs import current_progress_callback
+    from agent_core.models import ReasoningChatOpenAI
+
+    # 1. Duplicate chunk finish_reason normalization
+    assert _normalize_finish_reason("lengthlength") == "length"
+    assert _normalize_finish_reason("stopstop") == "stop"
+    assert _normalize_finish_reason("max_tokens") == "length"
+
+    # 2. Unclosed <think> tag must NOT leak into clean visible text
+    clean, thinking = _extract_text_and_thinking(
+        AIMessage(content="<think>Deep internal reasoning cut off before closing tag")
+    )
+    assert clean == ""
+    assert thinking == "Deep internal reasoning cut off before closing tag"
+
+    # 3. Role-alternation-safe recovery messages never emit consecutive HumanMessages or ToolMessage->HumanMessage
+    turn1_retry = _build_recovery_messages([HumanMessage(content="Solve X")], "SYSTEM RECOVERY: retry")
+    assert len(turn1_retry) == 1
+    assert isinstance(turn1_retry[0], HumanMessage)
+    assert "Solve X" in str(turn1_retry[0].content)
+    assert "SYSTEM RECOVERY" in str(turn1_retry[0].content)
+
+    turn2_retry = _build_recovery_messages(
+        [
+            HumanMessage(content="Run tool"),
+            AIMessage(content="", tool_calls=[{"id": "c1", "name": "bash_exec", "args": {"command": "ls"}}]),
+            ToolMessage(content="exit_code: 0", tool_call_id="c1", name="bash_exec"),
+        ],
+        "SYSTEM RECOVERY: continue",
+    )
+    assert isinstance(turn2_retry[-2], AIMessage)
+    assert isinstance(turn2_retry[-1], HumanMessage)
+
+    # 4. Escalating max_tokens + lowered/cleared reasoning_effort across attempts
+    base_llm = ReasoningChatOpenAI(
+        model="test-model",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        max_tokens=4096,
+        extra_body={"reasoning_effort": "high"},
+    )
+    _b1, copied1, lim1 = _build_model_with_bumped_max_tokens(
+        base_llm, [], lower_reasoning=True, attempt=1
+    )
+    assert lim1 == 8192
+    assert copied1.max_tokens == 8192
+    assert copied1.extra_body == {"reasoning_effort": "low"}
+
+    _b2, copied2, lim2 = _build_model_with_bumped_max_tokens(
+        copied1, [], lower_reasoning=True, attempt=2
+    )
+    assert lim2 == 16384
+    assert copied2.max_tokens == 16384
+    assert copied2.extra_body is None
+
+    # 5. Live streaming with duplicate finish_reason="length" chunks (OpenRouter pattern)
+    class DuplicateFinishStreamModel:
+        async def astream(self, _msgs: list[Any]) -> AsyncIterator[AIMessageChunk]:
+            yield AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "Thinking..."},
+                response_metadata={"finish_reason": None},
+            )
+            yield AIMessageChunk(
+                content="",
+                response_metadata={"finish_reason": "length"},
+            )
+            yield AIMessageChunk(
+                content="",
+                response_metadata={"finish_reason": "length"},
+            )
+
+        async def ainvoke(self, _msgs: list[Any]) -> AIMessage:
+            return AIMessage(content="fallback")
+
+    events: list[dict[str, Any]] = []
+    tok = current_progress_callback.set(lambda ev: events.append(ev))
+    try:
+        streamed_ai = await _invoke_model_with_live_thinking(
+            DuplicateFinishStreamModel(),
+            [HumanMessage(content="Hi")],
+            turn_count=1,
+        )
+    finally:
+        current_progress_callback.reset(tok)
+
+    assert streamed_ai.response_metadata["finish_reason"] == "length"
+
+    # 6. End-to-end recovery when model emits unclosed <think> on turn 1
+    seen_prompts: list[list[Any]] = []
+
+    def unclosed_think_handler(msgs: list[Any], idx: int) -> AIMessage:
+        seen_prompts.append(list(msgs))
+        if idx == 0:
+            return AIMessage(
+                content="<think>Let me analyze this step by step...",
+                response_metadata={"finish_reason": "lengthlength"},
+            )
+        return AIMessage(content="Recovered cleanly after unclosed think block.")
+
+    model = ScriptedChatModel(handler=unclosed_think_handler)
+    async with create_agent_runtime(
+        primary_model=model,
+        worker_model=model,
+        checkpoint_db_path=tmp_checkpoint_db,
+        sandbox=isolated_sandbox,
+        skills=repo_skills,
+        connect_mcp=False,
+    ) as runtime:
+        res = await runtime.run_task("Explain primes", thread_id="unclosed-think-1")
+
+    assert res["status"] == "completed"
+    assert res["final_response"] == "Recovered cleanly after unclosed think block."
+    assert "<think>" not in res["final_response"]
+    # Verify no consecutive HumanMessages were sent on retry
+    for i in range(len(seen_prompts[1]) - 1):
+        assert not (
+            isinstance(seen_prompts[1][i], HumanMessage)
+            and isinstance(seen_prompts[1][i + 1], HumanMessage)
+        )
+
+
+@pytest.mark.asyncio
+async def test_orphaned_tool_message_sanitization_and_mixed_valid_invalid_tool_calls(
+    isolated_sandbox: SandboxManager,
+    repo_skills: SkillRegistry,
+    tmp_checkpoint_db: Path,
+) -> None:
+    """Verify orphaned ToolMessages are dropped when parent AIMessage is incomplete, and mixed valid+invalid tool calls inform the LLM."""
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from agent_core.graph import _sanitize_messages_for_llm
+
+    # 1. Partial ToolMessage after an incomplete AIMessage (2 calls expected, only 1 ToolMessage present)
+    dirty = [
+        HumanMessage(content="Do two things"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "tc-1", "name": "write_file", "args": {"path": "a.txt", "content": "1"}},
+                {"id": "tc-2", "name": "write_file", "args": {"path": "b.txt", "content": "2"}},
+            ],
+        ),
+        ToolMessage(content="Wrote 1 characters to /workspace/a.txt", tool_call_id="tc-1", name="write_file"),
+        HumanMessage(content="Continue"),
+        ToolMessage(content="Stray orphan", tool_call_id="tc-stray", name="bash_exec"),
+    ]
+    cleaned = _sanitize_messages_for_llm(dirty)
+    assert not any(isinstance(m, ToolMessage) for m in cleaned)
+    assert cleaned[1].tool_calls == []
+
+    # 2. Mixed valid + invalid tool calls in a single turn
+    seen_prompts: list[list[Any]] = []
+
+    def mixed_handler(msgs: list[Any], idx: int) -> AIMessage:
+        seen_prompts.append(list(msgs))
+        if idx == 0:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "tc-ok-1",
+                        "name": "write_file",
+                        "args": {"path": "/workspace/good.txt", "content": "ok"},
+                    }
+                ],
+                invalid_tool_calls=[
+                    {
+                        "id": "tc-bad-2",
+                        "name": "write_file",
+                        "args": '{"path": "/workspace/bad.txt", "content": "cut off',
+                        "error": "Unterminated string",
+                        "type": "invalid_tool_call",
+                    }
+                ],
+                additional_kwargs={
+                    "tool_calls": [
+                        {"id": "tc-ok-1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}},
+                        {"id": "tc-bad-2", "type": "function", "function": {"name": "write_file", "arguments": "{"}},
+                    ]
+                },
+            )
+        return AIMessage(content="Handled valid call and noticed skipped invalid call.")
+
+    model = ScriptedChatModel(handler=mixed_handler)
+    async with create_agent_runtime(
+        primary_model=model,
+        worker_model=model,
+        checkpoint_db_path=tmp_checkpoint_db,
+        sandbox=isolated_sandbox,
+        skills=repo_skills,
+        connect_mcp=False,
+    ) as runtime:
+        res = await runtime.run_task("Write two files", thread_id="mixed-tc-1")
+
+    assert res["status"] == "completed"
+    assert isolated_sandbox.read_file("/workspace/good.txt") == "ok"
+    # Second LLM call received the SYSTEM NOTE about the skipped invalid tool call
+    assert any(
+        isinstance(m, ToolMessage) and "malformed JSON arguments" in str(m.content)
+        for m in seen_prompts[1]
+    )
+    # Saved AIMessage in history has clean additional_kwargs without stale tc-bad-2
+    ai_msgs_in_prompt = [m for m in seen_prompts[1] if isinstance(m, AIMessage)]
+    assert ai_msgs_in_prompt
+    assert "tool_calls" not in (ai_msgs_in_prompt[0].additional_kwargs or {})
+
+
+@pytest.mark.asyncio
+async def test_bash_exec_nonzero_exit_marked_error_and_stream_fallback(
+    isolated_sandbox: SandboxManager,
+    repo_skills: SkillRegistry,
+    tmp_checkpoint_db: Path,
+) -> None:
+    """Verify non-zero bash_exec exit codes record status='error', enforce bounded retries, and stream errors fall back to ainvoke."""
+    import httpx
+    from collections.abc import AsyncIterator
+    from langchain_core.messages import AIMessageChunk, HumanMessage
+
+    from agent_core.graph import _invoke_model_with_live_thinking
+    from agent_core.jobs import current_progress_callback
+
+    # 1. Repeated failing bash_exec command hits bounded retry limit and reports status='error'
+    call_count = 0
+
+    def failing_bash_handler(_msgs: list[Any], idx: int) -> AIMessage:
+        nonlocal call_count
+        call_count += 1
+        if idx < 3:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"bash-fail-{idx}",
+                        "name": "bash_exec",
+                        "args": {"command": "python3 -c 'import sys; sys.exit(2)'"},
+                    }
+                ],
+            )
+        return AIMessage(content="Stopped after observing repeated non-zero exit codes.")
+
+    model = ScriptedChatModel(handler=failing_bash_handler)
+    async with create_agent_runtime(
+        primary_model=model,
+        worker_model=model,
+        checkpoint_db_path=tmp_checkpoint_db,
+        sandbox=isolated_sandbox,
+        skills=repo_skills,
+        connect_mcp=False,
+        max_tool_retries=2,
+    ) as runtime:
+        res = await runtime.run_task("Run failing python command", thread_id="bash-err-1")
+
+    assert res["status"] == "completed"
+    # First 2 executions ran and returned status="error"; 3rd hit RETRY LIMIT EXCEEDED
+    assert len(res["tool_events"]) == 2
+    assert all(ev["status"] == "error" for ev in res["tool_events"])
+
+    # 2. Mid-stream httpx.RemoteProtocolError falls back cleanly to non-streaming ainvoke
+    class FlakyStreamModel:
+        async def astream(self, _msgs: list[Any]) -> AsyncIterator[AIMessageChunk]:
+            if False:
+                yield AIMessageChunk(content="")
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+        async def ainvoke(self, _msgs: list[Any]) -> AIMessage:
+            return AIMessage(content="Recovered via non-streaming ainvoke.")
+
+    tok = current_progress_callback.set(lambda _ev: None)
+    try:
+        recovered = await _invoke_model_with_live_thinking(
+            FlakyStreamModel(),
+            [HumanMessage(content="Hello")],
+            turn_count=1,
+        )
+    finally:
+        current_progress_callback.reset(tok)
+    assert recovered.content == "Recovered via non-streaming ainvoke."
+
+
+
 

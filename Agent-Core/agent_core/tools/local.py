@@ -127,10 +127,15 @@ def build_local_tools(
 
     @tool("bash_exec")
     async def bash_exec(command: str, timeout: int | None = None) -> str:
-        """Execute a shell or Python command inside the isolated /workspace sandbox.
+        """Execute a shell or Python command inside the isolated workspace sandbox.
+
+        The command starts with the workspace root as its current working directory (CWD) and
+        sets the WORKSPACE environment variable to the workspace directory. Inside scripts/code
+        you write, prefer relative paths (e.g. 'data.txt') or os.environ.get('WORKSPACE', '.')
+        instead of hardcoding literal '/workspace/...' paths.
 
         Args:
-            command: Shell command to run with working directory /workspace (e.g. `python3 script.py`).
+            command: Shell command to run with working directory set to the workspace root (e.g. `python3 script.py`).
             timeout: Optional timeout in seconds (defaults to sandbox limit).
         """
         session_id = current_session_id.get()
@@ -149,7 +154,7 @@ def build_local_tools(
         """Read a UTF-8 text file inside /workspace, optionally sliced by 1-indexed line numbers.
 
         Args:
-            path: File path inside /workspace (e.g. '/workspace/app.py' or 'app.py').
+            path: File path inside /workspace (e.g. 'app.py' or '/workspace/app.py').
             start_line: Optional 1-indexed starting line number.
             end_line: Optional 1-indexed ending line number (inclusive).
         """
@@ -170,9 +175,11 @@ def build_local_tools(
 
         For very large files (>200 lines), prefer writing modular files or building in chunks
         with write_file + edit_file so tool-call JSON stays compact and never truncates.
+        Inside scripts you write, use relative paths (e.g. 'data.txt') or os.environ.get('WORKSPACE', '.')
+        rather than hardcoding '/workspace/...'.
 
         Args:
-            path: Target file path inside /workspace (e.g. '/workspace/main.py').
+            path: Target file path inside /workspace (e.g. 'main.py' or '/workspace/main.py').
             content: Full UTF-8 text content to write.
         """
         session_id = current_session_id.get()

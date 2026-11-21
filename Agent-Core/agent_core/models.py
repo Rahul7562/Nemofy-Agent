@@ -702,11 +702,55 @@ def _extract_reasoning_field(payload: Any) -> str | None:
         val = payload.get(key)
         if isinstance(val, str) and val:
             return val
+        if isinstance(val, list):
+            parts: list[str] = []
+            for item in val:
+                if isinstance(item, str) and item:
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    t = item.get("text") or item.get("summary") or item.get("content") or item.get("thinking")
+                    if isinstance(t, str) and t:
+                        parts.append(t)
+            if parts:
+                return "".join(parts)
+
+    details = payload.get("reasoning_details")
+    if isinstance(details, list):
+        parts = []
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type and "encrypted" in item_type:
+                continue
+            t = item.get("text") or item.get("summary") or item.get("content")
+            if isinstance(t, str) and t:
+                parts.append(t)
+        if parts:
+            return "".join(parts)
     return None
 
 
+def _extract_tool_call_extra_content(tool_calls: Any) -> dict[str, Any]:
+    """Extract per-tool-call extra_content (e.g. Gemini 3 thought_signature) keyed by call id or index."""
+    if not isinstance(tool_calls, list):
+        return {}
+    captured: dict[str, Any] = {}
+    for pos, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            continue
+        ec = tc.get("extra_content")
+        if not isinstance(ec, dict) or not ec:
+            continue
+        tc_id = str(tc.get("id") or "").strip()
+        idx_val = tc.get("index")
+        key = tc_id if tc_id else f"idx:{idx_val if idx_val is not None else pos}"
+        captured[key] = ec
+    return captured
+
+
 class ReasoningChatOpenAI(ChatOpenAI):
-    """ChatOpenAI subclass that preserves reasoning_content from OpenAI-compatible gateways."""
+    """ChatOpenAI subclass that preserves reasoning_content and provider tool_call extra_content (e.g. Gemini 3 thought_signature)."""
 
     def _convert_chunk_to_generation_chunk(
         self,
@@ -725,6 +769,10 @@ class ReasoningChatOpenAI(ChatOpenAI):
             reasoning = _extract_reasoning_field(delta)
             if reasoning:
                 gen.message.additional_kwargs["reasoning_content"] = reasoning
+            if isinstance(delta, dict):
+                tc_extras = _extract_tool_call_extra_content(delta.get("tool_calls"))
+                if tc_extras:
+                    gen.message.additional_kwargs["tool_call_extra_content"] = tc_extras
         return gen
 
     def _create_chat_result(
@@ -745,10 +793,66 @@ class ReasoningChatOpenAI(ChatOpenAI):
         if isinstance(choices, list):
             for gen, choice in zip(result.generations, choices, strict=False):
                 if isinstance(choice, dict):
-                    reasoning = _extract_reasoning_field(choice.get("message"))
+                    msg_dict = choice.get("message")
+                    reasoning = _extract_reasoning_field(msg_dict)
                     if reasoning and not gen.message.additional_kwargs.get("reasoning_content"):
                         gen.message.additional_kwargs["reasoning_content"] = reasoning
+                    if isinstance(msg_dict, dict):
+                        tc_extras = _extract_tool_call_extra_content(msg_dict.get("tool_calls"))
+                        if tc_extras:
+                            gen.message.additional_kwargs["tool_call_extra_content"] = tc_extras
         return result
+
+    def _get_request_payload(
+        self,
+        input_: Any,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        try:
+            input_messages = self._convert_input(input_).to_messages()
+        except Exception:  # noqa: BLE001
+            return payload
+
+        extra_by_id: dict[str, Any] = {}
+        extra_by_msg_pos: list[dict[str, Any]] = []
+        for msg in input_messages:
+            ak = getattr(msg, "additional_kwargs", None)
+            tc_extras = ak.get("tool_call_extra_content") if isinstance(ak, dict) else None
+            if isinstance(tc_extras, dict) and tc_extras:
+                extra_by_msg_pos.append(tc_extras)
+                for k, v in tc_extras.items():
+                    if not k.startswith("idx:"):
+                        extra_by_id[k] = v
+            elif getattr(msg, "type", None) == "ai":
+                extra_by_msg_pos.append({})
+
+        if not extra_by_id and not any(extra_by_msg_pos):
+            return payload
+
+        ai_idx = 0
+        for pmsg in payload.get("messages", []):
+            if not isinstance(pmsg, dict) or pmsg.get("role") != "assistant":
+                continue
+            pos_map = extra_by_msg_pos[ai_idx] if ai_idx < len(extra_by_msg_pos) else {}
+            ai_idx += 1
+            p_tcs = pmsg.get("tool_calls")
+            if not isinstance(p_tcs, list):
+                continue
+            for tc_pos, ptc in enumerate(p_tcs):
+                if not isinstance(ptc, dict) or "extra_content" in ptc:
+                    continue
+                tc_id = str(ptc.get("id") or "").strip()
+                ec = (
+                    (pos_map.get(tc_id) if tc_id else None)
+                    or (extra_by_id.get(tc_id) if tc_id else None)
+                    or pos_map.get(f"idx:{tc_pos}")
+                )
+                if isinstance(ec, dict) and ec:
+                    ptc["extra_content"] = ec
+        return payload
 
 
 def build_chat_model(

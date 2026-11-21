@@ -352,3 +352,66 @@ async def test_per_request_dynamic_brain_and_subagent_model_switching(
             thread_id="dyn-model-thread-2",
         )
         assert res_default["final_response"] == "Default brain response."
+
+
+@pytest.mark.asyncio
+async def test_subagent_unclosed_think_recovery_and_final_turn_synthesis(
+    isolated_sandbox: SandboxManager,
+) -> None:
+    """Verify subagent recovers from unclosed <think>/length truncation with role-safe nudges and synthesizes on final turn."""
+    from langchain_core.messages import HumanMessage
+
+    isolated_sandbox.write_file("/workspace/metrics.txt", "throughput=420 req/s\n")
+    local_tools = {t.name: t for t in build_local_tools(isolated_sandbox)}
+    seen_worker_prompts: list[list[Any]] = []
+
+    def worker_handler(msgs: list[Any], idx: int) -> AIMessage:
+        seen_worker_prompts.append(list(msgs))
+        if idx == 0:
+            # Truncated mid-thought with unclosed <think>
+            return AIMessage(
+                content="<think>Let me inspect metrics.txt first...",
+                response_metadata={"finish_reason": "length"},
+            )
+        if idx == 1:
+            # Recovered on retry: calls read_file
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "w-read-1", "name": "read_file", "args": {"path": "/workspace/metrics.txt"}}
+                ],
+            )
+        # Final turn (turn 2 of max_turns=2) synthesizes report cleanly
+        return AIMessage(
+            content=json.dumps(
+                {
+                    "summary": "Measured throughput is 420 req/s.",
+                    "key_findings": ["throughput=420 req/s"],
+                    "artifacts": ["/workspace/metrics.txt"],
+                }
+            )
+        )
+
+    worker_model = ScriptedChatModel(handler=worker_handler, model_name="worker-recover")
+    report = await run_isolated_subagent(
+        task="Read metrics.txt and summarize",
+        role="data_analysis",
+        worker_model=worker_model,
+        available_tools=local_tools,
+        allowed_tool_names=["read_file"],
+        max_turns=2,
+        workspace_dir=str(isolated_sandbox.config.workspace_dir),
+    )
+
+    assert report.status == "completed"
+    assert "420 req/s" in report.summary
+    assert report.tools_used == ["read_file"]
+    # Verify retry prompt had no consecutive HumanMessages
+    for i in range(len(seen_worker_prompts[1]) - 1):
+        assert not (
+            isinstance(seen_worker_prompts[1][i], HumanMessage)
+            and isinstance(seen_worker_prompts[1][i + 1], HumanMessage)
+        )
+    # Verify final-turn synthesis prompt instructed worker to synthesize without more tools
+    assert "final worker turn" in str(seen_worker_prompts[2][-1].content).lower()
+

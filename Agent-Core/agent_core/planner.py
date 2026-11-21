@@ -185,7 +185,11 @@ def build_supervisor_system_prompt(
         (
             "Workspace & capabilities:\n"
             "- Workspace tools: bash_exec, read_file, write_file, edit_file, list_dir, and "
-            "web_fetch operate safely inside /workspace.\n"
+            "web_fetch operate safely inside the workspace sandbox. File tools accept relative paths "
+            "(e.g. 'src/app.py') or '/workspace/...'. Inside scripts or code run via bash_exec, the "
+            "current working directory (CWD) is already the workspace root and $WORKSPACE points to "
+            "it — use relative paths (e.g. 'data.txt') or os.environ.get('WORKSPACE', '.') rather "
+            "than hardcoding literal '/workspace/...' paths inside script source code.\n"
             "- External integrations: Connected Model Context Protocol (MCP) tools handle live "
             "external services when configured.\n"
             "- Skills: Call load_skill(name) FIRST whenever a task matches a skill in the catalog "

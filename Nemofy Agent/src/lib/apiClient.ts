@@ -117,7 +117,7 @@ function getDefaultLLMConfig(): PersistedLLMConfig {
       model: 'deepseek-ai/DeepSeek-V4.1-Flash',
       base_url: 'https://api.river.ai/v1',
       temperature: 0.2,
-      max_tokens: 4096,
+      max_tokens: 16384,
       reasoning_effort: 'off',
     },
     worker: {
@@ -125,7 +125,7 @@ function getDefaultLLMConfig(): PersistedLLMConfig {
       model: 'deepseek-ai/DeepSeek-V4.1-Flash',
       base_url: 'https://api.river.ai/v1',
       temperature: 0.1,
-      max_tokens: 2048,
+      max_tokens: 8192,
       reasoning_effort: 'off',
     },
     max_turns: 30,

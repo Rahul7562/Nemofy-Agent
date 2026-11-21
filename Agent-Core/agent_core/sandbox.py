@@ -49,7 +49,7 @@ _LOCAL_ESCAPE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _WORKSPACE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_./:-])/workspace(?=/|[\s\"'`;|&<>)]|$)"
+    r"(?<![A-Za-z0-9_./-])/workspace(?=/|[\s\"'`;|&<>):]|$)"
 )
 
 
@@ -517,10 +517,34 @@ class SandboxManager:
 
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout))
+            exit_code = int(proc.returncode or 0)
+            stdout_str = stdout_b.decode("utf-8", errors="replace")
+            stderr_str = stderr_b.decode("utf-8", errors="replace")
+            if (
+                exit_code != 0
+                and "/workspace" in stderr_str
+                and any(
+                    marker in stderr_str
+                    for marker in (
+                        "FileNotFoundError",
+                        "No such file or directory",
+                        "ENOENT",
+                        "cannot open",
+                        "does not exist",
+                    )
+                )
+            ):
+                hint = (
+                    "\n[Sandbox hint: In local-isolated mode, commands already run with the workspace "
+                    "as the current working directory (CWD), while literal '/workspace/...' paths inside "
+                    "script source code are not mounted at root. Use relative paths (e.g. 'data.txt') "
+                    "or os.environ.get('WORKSPACE', '.') / $WORKSPACE inside scripts.]"
+                )
+                stderr_str = stderr_str.rstrip() + hint
             return ExecResult(
-                exit_code=int(proc.returncode or 0),
-                stdout=stdout_b.decode("utf-8", errors="replace"),
-                stderr=stderr_b.decode("utf-8", errors="replace"),
+                exit_code=exit_code,
+                stdout=stdout_str,
+                stderr=stderr_str,
                 timed_out=False,
                 backend="local_isolated",
                 session_id=session_id,
@@ -593,16 +617,36 @@ class SandboxManager:
             raise FileNotFoundError(f"Cannot edit non-existent file: {path}")
         if not old_text:
             raise ValueError("old_text must not be empty.")
-        current = resolved.read_text(encoding="utf-8", errors="replace")
+        current = resolved.read_bytes().decode("utf-8", errors="replace")
         count = current.count(old_text)
-        if count == 0:
-            raise ValueError(f"old_text was not found in {path}.")
-        if count > 1:
+        updated: str | None = None
+        if count == 1:
+            updated = current.replace(old_text, new_text, 1)
+        elif count > 1:
             raise ValueError(
                 f"old_text matched {count} locations in {path}; provide more surrounding context."
             )
-        updated = current.replace(old_text, new_text, 1)
-        resolved.write_text(updated, encoding="utf-8")
+        else:
+            # Handle CRLF vs LF line-ending mismatches gracefully when unique
+            norm_current = current.replace("\r\n", "\n")
+            norm_old = old_text.replace("\r\n", "\n")
+            norm_count = norm_current.count(norm_old)
+            if norm_count == 1:
+                uses_crlf = "\r\n" in current
+                norm_new = new_text.replace("\r\n", "\n")
+                replaced = norm_current.replace(norm_old, norm_new, 1)
+                updated = replaced.replace("\n", "\r\n") if uses_crlf else replaced
+            elif norm_count > 1:
+                raise ValueError(
+                    f"old_text matched {norm_count} locations in {path}; provide more surrounding context."
+                )
+            else:
+                line_count = len(current.splitlines())
+                raise ValueError(
+                    f"old_text was not found in {path} (file has {line_count} lines). "
+                    "Call read_file first to inspect the exact current text."
+                )
+        resolved.write_bytes(updated.encode("utf-8"))
         vpath = to_virtual_workspace_path(resolved, ws)
         return f"Updated {vpath} (replaced 1 occurrence)."
 

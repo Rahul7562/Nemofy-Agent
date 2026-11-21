@@ -189,9 +189,24 @@ def classify_tool_call(
 
 
 _BUILTIN_ARG_ALIASES: dict[str, dict[str, str]] = {
-    "bash_exec": {"cmd": "command", "script": "command"},
-    "read_file": {"file_path": "path", "filepath": "path", "filename": "path"},
-    "write_file": {"file_path": "path", "filepath": "path", "filename": "path", "text": "content"},
+    "bash_exec": {"cmd": "command", "script": "command", "bash": "command", "shell": "command"},
+    "read_file": {
+        "file_path": "path",
+        "filepath": "path",
+        "filename": "path",
+        "start": "start_line",
+        "end": "end_line",
+    },
+    "write_file": {
+        "file_path": "path",
+        "filepath": "path",
+        "filename": "path",
+        "text": "content",
+        "file_content": "content",
+        "body": "content",
+        "code": "content",
+        "data": "content",
+    },
     "edit_file": {
         "file_path": "path",
         "filepath": "path",
@@ -200,21 +215,33 @@ _BUILTIN_ARG_ALIASES: dict[str, dict[str, str]] = {
         "new_str": "new_text",
         "old_string": "old_text",
         "new_string": "new_text",
+        "old": "old_text",
+        "new": "new_text",
+        "search": "old_text",
+        "replace": "new_text",
+        "target": "old_text",
+        "replacement": "new_text",
     },
     "list_dir": {"dir_path": "path", "directory": "path", "folder": "path"},
     "load_skill": {"skill": "name", "skill_name": "name"},
+    "web_fetch": {"uri": "url", "link": "url"},
 }
 
 
 def normalize_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
     """Normalize JSON-string args or common LLM parameter aliases for built-in tools."""
     if isinstance(arguments, str):
+        raw_str = arguments.strip()
+        if not raw_str:
+            return {}
         try:
-            parsed = json.loads(arguments)
+            parsed = json.loads(raw_str)
             if isinstance(parsed, dict):
                 arguments = parsed
-        except json.JSONDecodeError:
-            return {}
+            else:
+                return {"__invalid_json__": raw_str[:240]}
+        except json.JSONDecodeError as exc:
+            return {"__invalid_json__": f"{exc.msg}: {raw_str[:200]}"}
     if not isinstance(arguments, dict):
         return {}
     aliases = _BUILTIN_ARG_ALIASES.get(tool_name.strip().lower())
@@ -233,6 +260,12 @@ def validate_tool_arguments(
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(arguments, dict):
         return None, "Edited arguments must be a valid JSON object (dictionary)."
+    if "__invalid_json__" in arguments:
+        return (
+            None,
+            f"Malformed JSON arguments for '{getattr(tool_obj, 'name', 'tool')}': "
+            f"{str(arguments.get('__invalid_json__'))[:240]}",
+        )
 
     if tool_obj is None:
         return dict(arguments), None
