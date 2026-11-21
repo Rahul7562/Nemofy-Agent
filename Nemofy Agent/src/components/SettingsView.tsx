@@ -5,11 +5,13 @@ import {
   EyeOff,
   KeyRound,
   Layers,
+  Lock,
   Moon,
   Palette,
   Plus,
   Save,
   Server,
+  ShieldCheck,
   Sparkles,
   Sun,
   Trash2,
@@ -18,6 +20,7 @@ import {
 import { type FormEvent, useEffect, useState } from 'react';
 import {
   changeAdminPassword,
+  deleteProfileVaultKey,
   deleteSkillDocument,
   fetchAgentHealth,
   fetchLLMSettings,
@@ -28,21 +31,25 @@ import {
   probeLLMModel,
   saveLLMSettings,
   saveMCPServers,
+  saveProfileVaultKey,
   saveSkillDocument,
   setRemoteBackendUrl,
 } from '../lib/apiClient.ts';
 import { validatePasswordChange } from '../lib/authValidation.ts';
 import {
   LLM_PROVIDER_PRESETS,
-  REASONING_EFFORT_OPTIONS,
   applyProviderPreset,
+  canonicalizeProviderId,
   getProviderPreset,
   validateLLMConfig,
 } from '../lib/llmPresets.ts';
+import { getThinkingProfile, normalizeThinkingLevel } from '../lib/thinkingModes.ts';
+import { ModelSelectorCombobox } from './ModelSelectorCombobox.tsx';
 import type {
   AgentHealthResponse,
   MCPServerItem,
   PersistedLLMConfig,
+  ProfileVaultSummary,
   ProviderAvailability,
   RoleLLMConfig,
   SettingsTab,
@@ -70,6 +77,8 @@ function RoleConfigCard({
   roleKey,
   config,
   providers,
+  apiKeyDraft,
+  onApiKeyChange,
   onChange,
   onProbe,
   probeState,
@@ -79,12 +88,46 @@ function RoleConfigCard({
   roleKey: 'primary' | 'worker';
   config: RoleLLMConfig;
   providers: Record<string, ProviderAvailability>;
+  apiKeyDraft: string;
+  onApiKeyChange: (val: string) => void;
   onChange: (next: RoleLLMConfig) => void;
   onProbe: () => void;
   probeState: { loading: boolean; message?: string; ok?: boolean };
 }) {
-  const preset = getProviderPreset(config.provider);
-  const avail = providers[config.provider];
+  const [showKey, setShowKey] = useState(false);
+  const [tempDraft, setTempDraft] = useState(String(config.temperature));
+  const [tokensDraft, setTokensDraft] = useState(String(config.max_tokens));
+
+  useEffect(() => {
+    setTempDraft(String(config.temperature));
+  }, [config.temperature]);
+
+  useEffect(() => {
+    setTokensDraft(String(config.max_tokens));
+  }, [config.max_tokens]);
+
+  const canonicalProvider = canonicalizeProviderId(config.provider);
+  const preset = getProviderPreset(canonicalProvider);
+  const selectValue = preset ? preset.id : 'custom';
+  const avail = providers[canonicalProvider] || providers[selectValue];
+  const thinkingProfile = getThinkingProfile(canonicalProvider, config.model);
+  const effectiveThinking = normalizeThinkingLevel(thinkingProfile, config.reasoning_effort);
+  const envVarName =
+    selectValue === 'custom'
+      ? roleKey === 'worker'
+        ? 'WORKER_API_KEY'
+        : 'PRIMARY_API_KEY'
+      : avail?.primary_env_var || preset?.envVars[0] || 'PRIMARY_API_KEY';
+
+  function handleModelChange(nextModel: string) {
+    const nextProfile = getThinkingProfile(canonicalProvider, nextModel);
+    onChange({
+      ...config,
+      provider: canonicalProvider,
+      model: nextModel,
+      reasoning_effort: normalizeThinkingLevel(nextProfile, config.reasoning_effort),
+    });
+  }
 
   return (
     <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 sm:p-6 space-y-4">
@@ -114,7 +157,7 @@ function RoleConfigCard({
         </label>
         <select
           id={`${roleKey}-provider`}
-          value={config.provider}
+          value={selectValue}
           onChange={(e) => onChange(applyProviderPreset(config, e.target.value))}
           className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
         >
@@ -124,54 +167,75 @@ function RoleConfigCard({
             </option>
           ))}
         </select>
-        {avail && (
-          <p className="mt-1.5 text-[11px] text-[var(--ink-faint)]">
-            Server credentials ({avail.env_keys.join(' / ')}):{' '}
-            <span className={avail.api_key_configured ? 'text-[var(--jade)] font-medium' : 'text-[var(--honey)] font-medium'}>
-              {avail.requires_api_key
-                ? avail.api_key_configured
-                  ? 'Configured in server environment'
-                  : 'Not set in server .env'
-                : 'No API key required'}
-            </span>
-          </p>
-        )}
       </div>
 
-      {/* Model ID */}
+      {/* Model ID (Live Provider Model Dropdown + Search + Custom ID) */}
       <div>
         <label
           htmlFor={`${roleKey}-model`}
           className="block text-xs font-medium text-[var(--ink)] mb-1.5"
         >
-          Model Identifier
+          Model
         </label>
-        <input
+        <ModelSelectorCombobox
           id={`${roleKey}-model`}
-          type="text"
+          role={roleKey}
+          provider={selectValue}
+          baseUrl={config.base_url}
+          apiKeyDraft={apiKeyDraft}
           value={config.model}
-          onChange={(e) => onChange({ ...config, model: e.target.value })}
-          placeholder="e.g. deepseek-ai/DeepSeek-V4.1-Flash"
-          className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+          onChange={handleModelChange}
         />
-        {preset && preset.defaultModels.length > 0 && (
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {preset.defaultModels.map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => onChange({ ...config, model: m })}
-                className={`px-2 py-1 rounded-md border text-[11px] font-mono transition-colors cursor-pointer ${
-                  config.model === m
-                    ? 'border-[var(--signal)] bg-[var(--blush)] text-[var(--signal)]'
-                    : 'border-[var(--rule)] bg-[var(--paper-sunk)] text-[var(--ink-soft)] hover:text-[var(--ink)]'
-                }`}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-        )}
+      </div>
+
+      {/* Provider API Key (encrypted inside signed-in user's profile vault) */}
+      <div>
+        <div className="flex items-center justify-between gap-2 mb-1.5">
+          <label
+            htmlFor={`${roleKey}-apikey`}
+            className="block text-xs font-medium text-[var(--ink)]"
+          >
+            API Key <span className="font-mono text-[11px] text-[var(--ink-faint)]">(Vault: {envVarName})</span>
+          </label>
+          {avail && (
+            <span
+              className={`text-[11px] font-medium ${
+                avail.api_key_configured ? 'text-[var(--jade)]' : 'text-[var(--honey)]'
+              }`}
+            >
+              {avail.requires_api_key
+                ? avail.api_key_configured
+                  ? avail.masked_key
+                    ? `In vault (${avail.masked_key})`
+                    : 'Saved in vault'
+                  : 'Not saved yet'
+                : 'Optional (local)'}
+            </span>
+          )}
+        </div>
+        <div className="relative">
+          <input
+            id={`${roleKey}-apikey`}
+            type={showKey ? 'text' : 'password'}
+            autoComplete="off"
+            value={apiKeyDraft}
+            onChange={(e) => onApiKeyChange(e.target.value)}
+            placeholder={
+              avail?.api_key_configured && avail.masked_key
+                ? `Leave blank to keep ${avail.masked_key}, or paste new key`
+                : `Paste ${envVarName} to encrypt in your profile vault`
+            }
+            className="w-full h-10 pl-3 pr-10 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+          />
+          <button
+            type="button"
+            onClick={() => setShowKey((v) => !v)}
+            aria-label={showKey ? 'Hide API key' : 'Show API key'}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[var(--ink-faint)] hover:text-[var(--ink)] cursor-pointer"
+          >
+            {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+          </button>
+        </div>
       </div>
 
       {/* Base URL */}
@@ -187,7 +251,7 @@ function RoleConfigCard({
           type="url"
           value={config.base_url}
           onChange={(e) => onChange({ ...config, base_url: e.target.value })}
-          placeholder="https://api.openai.com/v1"
+          placeholder={preset?.baseUrl || 'https://api.openai.com/v1'}
           className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
         />
       </div>
@@ -207,8 +271,22 @@ function RoleConfigCard({
             step="0.01"
             min={0}
             max={2}
-            value={config.temperature}
-            onChange={(e) => onChange({ ...config, temperature: Number(e.target.value) })}
+            value={tempDraft}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setTempDraft(raw);
+              if (raw.trim() === '') return;
+              const num = Number(raw);
+              if (Number.isFinite(num)) {
+                onChange({ ...config, temperature: num });
+              }
+            }}
+            onBlur={() => {
+              const num = Number(tempDraft);
+              if (!tempDraft.trim() || !Number.isFinite(num)) {
+                setTempDraft(String(config.temperature));
+              }
+            }}
             className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
           />
         </div>
@@ -225,8 +303,22 @@ function RoleConfigCard({
             step="1"
             min={128}
             max={128000}
-            value={config.max_tokens}
-            onChange={(e) => onChange({ ...config, max_tokens: Number(e.target.value) })}
+            value={tokensDraft}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setTokensDraft(raw);
+              if (raw.trim() === '') return;
+              const num = Number(raw);
+              if (Number.isFinite(num)) {
+                onChange({ ...config, max_tokens: Math.round(num) });
+              }
+            }}
+            onBlur={() => {
+              const num = Number(tokensDraft);
+              if (!tokensDraft.trim() || !Number.isFinite(num)) {
+                setTokensDraft(String(config.max_tokens));
+              }
+            }}
             className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
           />
         </div>
@@ -235,20 +327,24 @@ function RoleConfigCard({
             htmlFor={`${roleKey}-reasoning`}
             className="block text-xs font-medium text-[var(--ink)] mb-1.5"
           >
-            Reasoning Effort
+            Thinking Mode
           </label>
           <select
             id={`${roleKey}-reasoning`}
-            value={config.reasoning_effort}
+            value={effectiveThinking}
+            disabled={!thinkingProfile.supported}
             onChange={(e) => onChange({ ...config, reasoning_effort: e.target.value })}
-            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] disabled:opacity-60 focus:outline-none focus:border-[var(--signal)]"
           >
-            {REASONING_EFFORT_OPTIONS.map((opt) => (
-              <option key={opt} value={opt}>
-                {opt}
+            {thinkingProfile.options.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
               </option>
             ))}
           </select>
+          <p className="mt-1 text-[10px] text-[var(--ink-faint)] truncate" title={thinkingProfile.familyLabel}>
+            {thinkingProfile.familyLabel}
+          </p>
         </div>
       </div>
 
@@ -275,9 +371,18 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
 
-  // LLM Config State
+  // LLM Config & Profile API Key Vault State
   const [llmConfig, setLlmConfig] = useState<PersistedLLMConfig | null>(null);
+  const [llmLoadError, setLlmLoadError] = useState<string | null>(null);
   const [providers, setProviders] = useState<Record<string, ProviderAvailability>>({});
+  const [vault, setVault] = useState<ProfileVaultSummary | null>(null);
+  const [vaultProvider, setVaultProvider] = useState('nvidia');
+  const [vaultKeyInput, setVaultKeyInput] = useState('');
+  const [showVaultKeyInput, setShowVaultKeyInput] = useState(false);
+  const [vaultBusy, setVaultBusy] = useState(false);
+  const [vaultMessage, setVaultMessage] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
+  const [primaryApiKey, setPrimaryApiKey] = useState('');
+  const [workerApiKey, setWorkerApiKey] = useState('');
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmMessage, setLlmMessage] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
   const [primaryProbe, setPrimaryProbe] = useState<{ loading: boolean; message?: string; ok?: boolean }>({
@@ -317,34 +422,49 @@ export function SettingsView({
     setActiveTab(initialTab);
   }, [initialTab]);
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        const [llmRes, skillsRes, mcpsRes, healthRes] = await Promise.all([
-          fetchLLMSettings(),
-          fetchSkills(),
-          fetchMCPServers(),
-          fetchAgentHealth(),
-        ]);
-        if (!mounted) return;
-        setLlmConfig(llmRes.config);
-        setProviders(llmRes.providers);
-        setSkills(skillsRes);
-        if (skillsRes.length > 0) {
-          setSelectedSkillName(skillsRes[0].name);
-          setSkillDraftName(skillsRes[0].name);
-          setSkillDraftContent(skillsRes[0].content);
-        }
-        setMcpServers(mcpsRes);
-        setHealth(healthRes);
-      } catch {
-        // handled per section
+  async function loadAllSettings() {
+    setLlmLoadError(null);
+    const [llmResult, skillsResult, mcpsResult, healthResult] = await Promise.allSettled([
+      fetchLLMSettings(),
+      fetchSkills(),
+      fetchMCPServers(),
+      fetchAgentHealth(),
+    ]);
+
+    if (llmResult.status === 'fulfilled') {
+      setLlmConfig(llmResult.value.config);
+      setProviders(llmResult.value.providers);
+      if (llmResult.value.vault) {
+        setVault(llmResult.value.vault);
       }
-    })();
-    return () => {
-      mounted = false;
-    };
+    } else {
+      setLlmLoadError(
+        llmResult.reason instanceof Error
+          ? llmResult.reason.message
+          : 'Unable to load LLM settings from the server.',
+      );
+    }
+
+    if (skillsResult.status === 'fulfilled') {
+      setSkills(skillsResult.value);
+      if (skillsResult.value.length > 0) {
+        setSelectedSkillName((prev) => prev || skillsResult.value[0].name);
+        setSkillDraftName((prev) => prev || skillsResult.value[0].name);
+        setSkillDraftContent((prev) => prev || skillsResult.value[0].content);
+      }
+    }
+
+    if (mcpsResult.status === 'fulfilled') {
+      setMcpServers(mcpsResult.value);
+    }
+
+    if (healthResult.status === 'fulfilled') {
+      setHealth(healthResult.value);
+    }
+  }
+
+  useEffect(() => {
+    void loadAllSettings();
   }, []);
 
   async function handleSaveLLM(e: FormEvent) {
@@ -359,13 +479,30 @@ export function SettingsView({
 
     setLlmSaving(true);
     try {
-      const saved = await saveLLMSettings(llmConfig);
+      const apiKeysPayload: { primary?: string; worker?: string } = {};
+      if (primaryApiKey.trim()) apiKeysPayload.primary = primaryApiKey.trim();
+      if (workerApiKey.trim()) apiKeysPayload.worker = workerApiKey.trim();
+
+      const saved = await saveLLMSettings(
+        llmConfig,
+        Object.keys(apiKeysPayload).length > 0 ? apiKeysPayload : undefined,
+      );
       setLlmConfig(saved.config);
       setProviders(saved.providers);
+      if (saved.vault) {
+        setVault(saved.vault);
+      }
+      setPrimaryApiKey('');
+      setWorkerApiKey('');
       onLLMConfigSaved(saved.config);
+      const envSummary =
+        saved.savedEnvKeys && saved.savedEnvKeys.length > 0
+          ? ` Encrypted & stored in profile vault: ${saved.savedEnvKeys.join(', ')}.`
+          : '';
+      const syncNote = saved.syncWarning ? ` Note: ${saved.syncWarning}` : '';
       setLlmMessage({
         type: 'ok',
-        text: 'Main Agent and Sub-Agent LLM configuration saved and synced to Agent-Core.',
+        text: `Main Agent (Nemo) and Sub-Agent LLM configuration saved.${envSummary}${syncNote}`,
       });
     } catch (err) {
       setLlmMessage({
@@ -377,18 +514,78 @@ export function SettingsView({
     }
   }
 
+  async function handleSaveVaultKey() {
+    const cleanKey = vaultKeyInput.trim();
+    if (!cleanKey) {
+      setVaultMessage({ type: 'error', text: 'Paste an API key before saving.' });
+      return;
+    }
+    setVaultBusy(true);
+    setVaultMessage(null);
+    try {
+      const res = await saveProfileVaultKey({
+        provider: vaultProvider,
+        api_key: cleanKey,
+      });
+      setVault(res.vault);
+      setProviders(res.providers);
+      setVaultKeyInput('');
+      setVaultMessage({
+        type: 'ok',
+        text: `Encrypted and saved ${res.savedKey} to ${res.vault.username}'s profile vault.`,
+      });
+    } catch (err) {
+      setVaultMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to store API key.',
+      });
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handleDeleteVaultKey(envVar: string) {
+    setVaultBusy(true);
+    setVaultMessage(null);
+    try {
+      const res = await deleteProfileVaultKey(envVar);
+      setVault(res.vault);
+      setProviders(res.providers);
+      setVaultMessage({
+        type: 'ok',
+        text: `Removed ${envVar} from ${res.vault.username}'s profile vault.`,
+      });
+    } catch (err) {
+      setVaultMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to remove API key.',
+      });
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
   async function handleProbe(role: 'primary' | 'worker') {
     if (!llmConfig) return;
     const setter = role === 'primary' ? setPrimaryProbe : setWorkerProbe;
+    const keyDraft = role === 'primary' ? primaryApiKey.trim() : workerApiKey.trim();
     setter({ loading: true });
     try {
-      const res = await probeLLMModel(role, llmConfig[role]);
-      const ok = Boolean(res.ok);
+      const res = await probeLLMModel(role, llmConfig[role], keyDraft || undefined);
+      const ok = Boolean(
+        res.ok !== undefined
+          ? res.ok
+          : res.authenticated === true && !res.error,
+      );
+      const modelListedNote =
+        ok && res.model_listed === false
+          ? ' (Endpoint authenticated, though this exact model ID was not found in /models — verify spelling.)'
+          : '';
       setter({
         loading: false,
         ok,
         message: ok
-          ? `Connected to ${String(res.provider || llmConfig[role].provider)} (${String(res.model || llmConfig[role].model)}).`
+          ? `Connected to ${String(res.provider || llmConfig[role].provider)} (${String(res.model || llmConfig[role].model)}).${modelListedNote}`
           : String(res.error || res.detail || 'Probe failed. Check provider key or endpoint.'),
       });
     } catch (err) {
@@ -562,22 +759,38 @@ export function SettingsView({
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                   <RoleConfigCard
-                    title="Main Agent (Brain)"
-                    subtitle="Handles planning, reasoning, tool selection, and final responses."
+                    title="Main Agent (Nemo)"
+                    subtitle="Handles conversation, planning, reasoning, and final responses."
                     roleKey="primary"
                     config={llmConfig.primary}
                     providers={providers}
-                    onChange={(next) => setLlmConfig({ ...llmConfig, primary: next })}
+                    apiKeyDraft={primaryApiKey}
+                    onApiKeyChange={(val) => {
+                      setPrimaryApiKey(val);
+                      setPrimaryProbe({ loading: false });
+                    }}
+                    onChange={(next) => {
+                      setLlmConfig({ ...llmConfig, primary: next });
+                      setPrimaryProbe({ loading: false });
+                    }}
                     onProbe={() => void handleProbe('primary')}
                     probeState={primaryProbe}
                   />
                   <RoleConfigCard
                     title="Sub-Agent (Worker)"
-                    subtitle="Executes delegated research, coding, and isolated sub-tasks."
+                    subtitle="Executes delegated research, coding, and parallel sub-tasks."
                     roleKey="worker"
                     config={llmConfig.worker}
                     providers={providers}
-                    onChange={(next) => setLlmConfig({ ...llmConfig, worker: next })}
+                    apiKeyDraft={workerApiKey}
+                    onApiKeyChange={(val) => {
+                      setWorkerApiKey(val);
+                      setWorkerProbe({ loading: false });
+                    }}
+                    onChange={(next) => {
+                      setLlmConfig({ ...llmConfig, worker: next });
+                      setWorkerProbe({ loading: false });
+                    }}
                     onProbe={() => void handleProbe('worker')}
                     probeState={workerProbe}
                   />
@@ -601,10 +814,15 @@ export function SettingsView({
                       type="number"
                       min={1}
                       max={100}
-                      value={llmConfig.max_turns}
-                      onChange={(e) =>
-                        setLlmConfig({ ...llmConfig, max_turns: Number(e.target.value) })
-                      }
+                      value={llmConfig.max_turns || ''}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        if (!raw.trim()) return;
+                        const num = Number(raw);
+                        if (Number.isFinite(num)) {
+                          setLlmConfig({ ...llmConfig, max_turns: Math.round(num) });
+                        }
+                      }}
                       className="w-24 h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                     />
                   </div>
@@ -618,7 +836,152 @@ export function SettingsView({
                     <span>{llmSaving ? 'Saving...' : 'Save LLM Config'}</span>
                   </button>
                 </div>
+
+                {/* Per-Profile Encrypted API Key Vault */}
+                <section
+                  aria-label="Profile API Key Vault"
+                  className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 sm:p-6 space-y-4"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h2 className="font-display text-base font-semibold text-[var(--ink)] flex items-center gap-2">
+                        <ShieldCheck className="w-4 h-4 text-[var(--jade)]" />
+                        <span>
+                          Profile API Key Vault ({vault?.username || 'admin'})
+                        </span>
+                      </h2>
+                      <p className="text-xs text-[var(--ink-soft)] mt-0.5">
+                        API keys are encrypted at rest on the server and automatically loaded whenever you sign in as{' '}
+                        <span className="font-mono text-[var(--ink)]">{vault?.username || 'admin'}</span>.
+                      </p>
+                    </div>
+                    <span className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[var(--jade)]">
+                      <Lock className="w-3 h-3" />
+                      <span>AES-256-GCM · Auto-loaded</span>
+                    </span>
+                  </div>
+
+                  {vaultMessage && (
+                    <div
+                      role={vaultMessage.type === 'error' ? 'alert' : 'status'}
+                      className={`rounded-lg px-3.5 py-2 text-xs border ${
+                        vaultMessage.type === 'ok'
+                          ? 'border-[var(--jade)]/35 bg-[var(--jade)]/10 text-[var(--jade)]'
+                          : 'border-[var(--flare)]/35 bg-[var(--flare)]/10 text-[var(--flare)]'
+                      }`}
+                    >
+                      {vaultMessage.text}
+                    </div>
+                  )}
+
+                  {vault && vault.entries.length > 0 ? (
+                    <div className="divide-y divide-[var(--rule)] border border-[var(--rule)] rounded-lg overflow-hidden">
+                      {vault.entries.map((entry) => (
+                        <div
+                          key={entry.env_var}
+                          className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 bg-[var(--paper)]"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-semibold text-[var(--ink)]">
+                                {entry.provider_label}
+                              </span>
+                              <span className="font-mono text-[11px] text-[var(--ink-faint)]">
+                                {entry.env_var}
+                              </span>
+                            </div>
+                            <div className="font-mono text-xs text-[var(--jade)] mt-0.5">
+                              {entry.masked_key}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={vaultBusy}
+                            onClick={() => void handleDeleteVaultKey(entry.env_var)}
+                            aria-label={`Remove ${entry.env_var} from profile vault`}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-[var(--rule)] text-xs text-[var(--ink-soft)] hover:text-[var(--flare)] hover:border-[var(--flare)]/40 disabled:opacity-50 transition-colors cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Remove</span>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-[var(--ink-faint)]">
+                      No API keys stored in this profile vault yet. Add a provider key below or save one from either agent card above.
+                    </p>
+                  )}
+
+                  {/* Quick-Add Provider Key to Profile Vault */}
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 pt-1">
+                    <div className="sm:col-span-4">
+                      <label htmlFor="vault-provider-select" className="sr-only">
+                        Provider for new vault API key
+                      </label>
+                      <select
+                        id="vault-provider-select"
+                        value={vaultProvider}
+                        onChange={(e) => setVaultProvider(e.target.value)}
+                        className="w-full h-9 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                      >
+                        {LLM_PROVIDER_PRESETS.filter((p) => p.requiresApiKey).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label} ({p.envVars[0] || 'PRIMARY_API_KEY'})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="sm:col-span-6 relative">
+                      <label htmlFor="vault-apikey-input" className="sr-only">
+                        API Key value
+                      </label>
+                      <input
+                        id="vault-apikey-input"
+                        type={showVaultKeyInput ? 'text' : 'password'}
+                        autoComplete="off"
+                        value={vaultKeyInput}
+                        onChange={(e) => setVaultKeyInput(e.target.value)}
+                        placeholder="Paste API key to store securely in your profile"
+                        className="w-full h-9 pl-3 pr-9 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowVaultKeyInput((v) => !v)}
+                        aria-label={showVaultKeyInput ? 'Hide vault API key' : 'Show vault API key'}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink-faint)] hover:text-[var(--ink)] cursor-pointer"
+                      >
+                        {showVaultKeyInput ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                    <div className="sm:col-span-2">
+                      <button
+                        type="button"
+                        disabled={vaultBusy || !vaultKeyInput.trim()}
+                        onClick={() => void handleSaveVaultKey()}
+                        className="w-full h-9 px-3 inline-flex items-center justify-center gap-1.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] hover:text-[var(--signal)] disabled:opacity-45 text-xs font-semibold text-[var(--ink)] transition-colors cursor-pointer"
+                      >
+                        <KeyRound className="w-3.5 h-3.5" />
+                        <span>Store Key</span>
+                      </button>
+                    </div>
+                  </div>
+                </section>
               </>
+            ) : llmLoadError ? (
+              <div
+                role="alert"
+                className="rounded-xl border border-[var(--flare)]/35 bg-[var(--flare)]/10 p-4 flex items-center justify-between gap-3 text-sm text-[var(--flare)]"
+              >
+                <span>{llmLoadError}</span>
+                <button
+                  type="button"
+                  onClick={() => void loadAllSettings()}
+                  className="px-3 py-1.5 rounded-lg border border-[var(--flare)]/40 bg-[var(--paper)] text-xs font-medium text-[var(--ink)] hover:border-[var(--signal)] cursor-pointer shrink-0"
+                >
+                  Retry
+                </button>
+              </div>
             ) : (
               <div className="text-sm text-[var(--ink-faint)]">Loading LLM configuration...</div>
             )}
@@ -1022,7 +1385,9 @@ export function SettingsView({
                 <div>
                   <div className="text-[var(--ink-faint)]">Python Sandbox Backend</div>
                   <div className="font-mono text-[var(--ink)] mt-0.5">
-                    {health?.core?.sandbox_backend || (health?.connected ? 'Connected' : 'Standby')}
+                    {health?.core?.sandbox?.backend ||
+                      health?.core?.sandbox_backend ||
+                      (health?.connected ? 'Connected' : 'Standby')}
                   </div>
                 </div>
               </div>

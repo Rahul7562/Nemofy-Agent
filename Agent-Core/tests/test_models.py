@@ -140,11 +140,22 @@ async def test_live_river_ai_endpoint_probe_and_invalid_key_rejection() -> None:
 
     # 2. If a real RIVER_AI_API credential is present in environment, verify actual auth & inference
     if os.getenv("RIVER_AI_API", "").strip():
-        live_probe = await probe_model_connectivity("primary", run_inference=True)
+        river_spec = load_model_spec("primary", include_persisted=False)
+        live_probe = await probe_model_connectivity("primary", spec=river_spec, run_inference=True)
         assert live_probe["endpoint_reachable"] is True
         assert live_probe["authenticated"] is True
         assert live_probe["model_listed"] is True
         assert live_probe["inference_ok"] is True
+
+    # 3. Public /models endpoints (e.g. OpenRouter, NVIDIA) must NOT report authenticated=True when key is missing
+    missing_or_spec = load_model_spec(
+        "primary",
+        env={"PRIMARY_PROVIDER": "openrouter", "PRIMARY_MODEL": "openai/gpt-5.2"},
+    )
+    missing_or_probe = await probe_model_connectivity("primary", spec=missing_or_spec, run_inference=False)
+    assert missing_or_probe["endpoint_reachable"] is True
+    assert missing_or_probe["authenticated"] is False
+    assert "OPENROUTER_API_KEY" in str(missing_or_probe["error"])
 
 
 def test_dynamic_model_override_supports_any_provider_and_local_ollama() -> None:
@@ -220,3 +231,146 @@ def test_dynamic_model_override_supports_any_provider_and_local_ollama() -> None
     assert "openai" in presets["providers"]
     assert "gemini" in presets["providers"]
     assert "ollama" in presets["providers"]
+
+
+def test_adaptive_reasoning_effort_and_thinking_extraction() -> None:
+    """Verify reasoning_effort adapts per model family (max vs xhigh vs low/high/max vs standard)."""
+    from langchain_core.messages import AIMessage
+
+    from agent_core.graph import _extract_text_and_thinking
+    from agent_core.models import normalize_reasoning_effort_for_model
+
+    # River AI DeepSeek-V4.1-Flash: none, low, high, max (no medium, no xhigh)
+    assert normalize_reasoning_effort_for_model("river_ai", "deepseek-ai/DeepSeek-V4.1-Flash", "off") == "none"
+    assert normalize_reasoning_effort_for_model("river_ai", "deepseek-ai/DeepSeek-V4.1-Flash", "medium") == "high"
+    assert normalize_reasoning_effort_for_model("river_ai", "deepseek-ai/DeepSeek-V4.1-Flash", "xhigh") == "max"
+    assert normalize_reasoning_effort_for_model("river_ai", "deepseek-ai/DeepSeek-V4.1-Flash", "max") == "max"
+
+    # OpenAI GPT-5.2: supports xhigh (maps max -> xhigh)
+    assert normalize_reasoning_effort_for_model("openai", "gpt-5.2", "max") == "xhigh"
+    assert normalize_reasoning_effort_for_model("openai", "gpt-5.2", "xhigh") == "xhigh"
+    assert normalize_reasoning_effort_for_model("openai", "gpt-5.2", "off") == "none"
+
+    # Anthropic Claude Opus 4.6: supports max (maps xhigh -> max)
+    assert normalize_reasoning_effort_for_model("anthropic", "claude-opus-4-6", "xhigh") == "max"
+    assert normalize_reasoning_effort_for_model("anthropic", "claude-opus-4-6", "max") == "max"
+    assert normalize_reasoning_effort_for_model("anthropic", "claude-opus-4-6", "off") is None
+
+    # OpenAI o3-mini: low, medium, high only
+    assert normalize_reasoning_effort_for_model("openai", "o3-mini", "xhigh") == "high"
+    assert normalize_reasoning_effort_for_model("openai", "o3-mini", "off") == "low"
+
+    # Standard non-thinking GPT-4o: never sends reasoning_effort
+    assert normalize_reasoning_effort_for_model("openai", "gpt-4o", "high") is None
+
+    # Thinking extraction strips <think> tags and pulls additional_kwargs.reasoning_content
+    msg_inline = AIMessage(content="<think>Step 1: check math</think>\n**Answer:** 42")
+    clean, trace = _extract_text_and_thinking(msg_inline)
+    assert clean == "**Answer:** 42"
+    assert trace == "Step 1: check math"
+
+    msg_kw = AIMessage(
+        content="Final answer",
+        additional_kwargs={"reasoning_content": "Internal chain of thought"},
+    )
+    clean2, trace2 = _extract_text_and_thinking(msg_kw)
+    assert clean2 == "Final answer"
+    assert trace2 == "Internal chain of thought"
+
+
+def test_nvidia_provider_resolution_and_api_key_isolation() -> None:
+    """Verify NVIDIA NIM provider config, Nemotron thinking modes, and clean API key isolation."""
+    from agent_core.models import (
+        _parse_models_payload,
+        get_provider_presets,
+        normalize_reasoning_effort_for_model,
+        resolve_model_spec_with_override,
+    )
+
+    # NVIDIA NIM preset & alias resolution
+    env = {
+        "PRIMARY_API_KEY": "sk-old-custom-key-should-not-leak",
+        "RIVER_AI_API": "sk-river-real-key",
+        "NVIDIA_API_KEY": "nvapi-test-nvidia-key-1234",
+    }
+    nv_spec = resolve_model_spec_with_override(
+        "primary",
+        override={
+            "provider": "nvidia",
+            "model": "nvidia/llama-3.3-nemotron-super-49b-v1",
+        },
+        env=env,
+    )
+    assert nv_spec.provider == "nvidia"
+    assert nv_spec.base_url == "https://integrate.api.nvidia.com/v1"
+    assert nv_spec.api_key == "nvapi-test-nvidia-key-1234"
+
+    # Switching back to river_ai must use RIVER_AI_API, NOT stale PRIMARY_API_KEY
+    river_spec = resolve_model_spec_with_override(
+        "primary",
+        override={"provider": "river_ai", "model": "deepseek-ai/DeepSeek-V4.1-Flash"},
+        env=env,
+    )
+    assert river_spec.api_key == "sk-river-real-key"
+
+    # Missing provider key must NOT silently steal PRIMARY_API_KEY or RIVER_AI_API
+    openai_spec = resolve_model_spec_with_override(
+        "primary",
+        override={"provider": "openai", "model": "gpt-5.2"},
+        env=env,
+    )
+    assert openai_spec.api_key is None
+
+    # Custom provider MUST resolve PRIMARY_API_KEY cleanly from env
+    custom_spec = resolve_model_spec_with_override(
+        "primary",
+        override={
+            "provider": "custom",
+            "model": "org/my-llm",
+            "base_url": "https://my-gateway.example/v1",
+        },
+        env=env,
+    )
+    assert custom_spec.api_key == "sk-old-custom-key-should-not-leak"
+
+    # Nemotron reasoning models must NOT be blocked by the llama-3 exclusion
+    assert (
+        normalize_reasoning_effort_for_model(
+            "nvidia", "nvidia/llama-3.3-nemotron-super-49b-v1", "high"
+        )
+        == "high"
+    )
+    assert (
+        normalize_reasoning_effort_for_model(
+            "nvidia", "meta/llama-3.3-70b-instruct", "high"
+        )
+        is None
+    )
+
+    # Provider catalog parser handles OpenAI dict, Together list, Gemini models/ prefix, and filters embeddings
+    parsed = _parse_models_payload(
+        "nvidia",
+        {
+            "data": [
+                {"id": "nvidia/llama-3.3-nemotron-super-49b-v1", "owned_by": "nvidia"},
+                {"id": "nvidia/nv-embedqa-e5-v5", "owned_by": "nvidia"},
+                {"id": "deepseek-ai/deepseek-r1", "owned_by": "deepseek-ai"},
+            ]
+        },
+    )
+    ids = [m["id"] for m in parsed]
+    assert "nvidia/llama-3.3-nemotron-super-49b-v1" in ids
+    assert "deepseek-ai/deepseek-r1" in ids
+    assert "nvidia/nv-embedqa-e5-v5" not in ids
+
+    gemini_parsed = _parse_models_payload(
+        "gemini",
+        {"data": [{"id": "models/gemini-2.5-pro"}, {"id": "models/text-embedding-004"}]},
+    )
+    assert [m["id"] for m in gemini_parsed] == ["gemini-2.5-pro"]
+
+    presets = get_provider_presets()
+    assert "nvidia" in presets["providers"]
+    assert presets["providers"]["nvidia"]["base_url"] == "https://integrate.api.nvidia.com/v1"
+
+

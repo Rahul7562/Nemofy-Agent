@@ -7,6 +7,7 @@ export interface StoredAuthRecord {
   passwordSalt: string;
   passwordHash: string;
   sessionSecret: string;
+  vaultMasterSecret: string;
   updatedAt: string;
 }
 
@@ -52,13 +53,22 @@ export class AuthStore {
           typeof parsed.passwordHash === 'string' &&
           typeof parsed.sessionSecret === 'string'
         ) {
-          return {
+          const vaultMasterSecret =
+            typeof parsed.vaultMasterSecret === 'string' && parsed.vaultMasterSecret.length >= 32
+              ? parsed.vaultMasterSecret
+              : crypto.randomBytes(32).toString('hex');
+          const loaded: StoredAuthRecord = {
             username: parsed.username,
             passwordSalt: parsed.passwordSalt,
             passwordHash: parsed.passwordHash,
             sessionSecret: parsed.sessionSecret,
+            vaultMasterSecret,
             updatedAt: parsed.updatedAt || new Date().toISOString(),
           };
+          if (!parsed.vaultMasterSecret) {
+            this.save(loaded);
+          }
+          return loaded;
         }
       } catch {
         // Re-seed if corrupted
@@ -71,6 +81,7 @@ export class AuthStore {
       passwordSalt: salt,
       passwordHash: hashPassword(DEFAULT_PASSWORD, salt),
       sessionSecret: crypto.randomBytes(32).toString('hex'),
+      vaultMasterSecret: crypto.randomBytes(32).toString('hex'),
       updatedAt: new Date().toISOString(),
     };
     this.save(seeded);
@@ -91,6 +102,12 @@ export class AuthStore {
 
   getUpdatedAt(): string {
     return this.record.updatedAt;
+  }
+
+  getVaultKeyMaterial(): string {
+    const envMaster = (process.env.VAULT_MASTER_KEY || '').trim();
+    if (envMaster.length >= 16) return envMaster;
+    return this.record.vaultMasterSecret;
   }
 
   verifyCredentials(username: string, password: string): boolean {
@@ -166,6 +183,7 @@ export class AuthStore {
       passwordSalt: newSalt,
       passwordHash: hashPassword(newPassword, newSalt),
       sessionSecret: crypto.randomBytes(32).toString('hex'),
+      vaultMasterSecret: this.record.vaultMasterSecret,
       updatedAt: new Date().toISOString(),
     };
     this.save(this.record);

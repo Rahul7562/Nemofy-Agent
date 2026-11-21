@@ -41,18 +41,22 @@ from agent_core.graph import (
 )
 from agent_core.jobs import AgentJob, DynamicSkillSpec, JobManager
 from agent_core.models import (
+    LOCAL_NO_KEY_PROVIDERS,
     ModelAuthenticationError,
     ModelConfigurationError,
     ModelConnectionError,
     ModelOverride,
     ModelProviderError,
     ModelRateLimitError,
+    build_chat_model,
     get_primary_model,
     get_provider_presets,
     get_worker_model,
+    list_provider_models,
     load_model_spec,
     load_persisted_llm_config,
     probe_model_connectivity,
+    reload_env_file,
     resolve_model_spec_with_override,
     save_persisted_llm_config,
 )
@@ -101,6 +105,38 @@ class ModelProbeRequest(BaseModel):
     run_inference: bool = False
 
 
+class ModelListRequest(BaseModel):
+    provider: str = Field(..., min_length=1, max_length=64)
+    base_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=512)
+    role: Literal["primary", "worker"] = "primary"
+
+
+ALLOWED_PROFILE_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "RIVER_AI_API",
+        "NVIDIA_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GROQ_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "TOGETHER_API_KEY",
+        "FIREWORKS_API_KEY",
+        "OLLAMA_API_KEY",
+        "VLLM_API_KEY",
+        "PRIMARY_API_KEY",
+        "WORKER_API_KEY",
+    }
+)
+
+
+class ProfileSecretsRequest(BaseModel):
+    secrets: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentRunRequest(BaseModel):
     task: str = Field(..., min_length=1, max_length=32_000)
     thread_id: str | None = Field(default=None, max_length=128)
@@ -144,6 +180,9 @@ class AgentRunResponse(BaseModel):
     thread_id: str
     status: Literal["completed", "awaiting_approval", "error"]
     final_response: str
+    thinking: str | None = None
+    tool_events: list[dict[str, Any]] = Field(default_factory=list)
+    file_changes: list[dict[str, Any]] = Field(default_factory=list)
     plan: list[dict[str, Any]]
     active_skills: list[str]
     turn_count: int
@@ -183,6 +222,8 @@ def create_app(
         app.state.api_token = _get_configured_api_token(api_token)
         app.state.model_error = None
         app.state.runtime = None
+        app.state.profile_secrets = {}
+        app.state.profile_secrets_active = False
 
         resolved_sandbox = sandbox or SandboxManager()
         resolved_skills = skills or SkillRegistry()
@@ -204,7 +245,14 @@ def create_app(
                 resolved_primary = get_primary_model()
             except ModelConfigurationError as exc:
                 app.state.model_error = str(exc)
-                logger.warning("Primary model not ready at startup: %s", exc)
+                logger.warning(
+                    "Primary model API key not configured at startup (%s); booting runtime in standby mode.",
+                    exc,
+                )
+                try:
+                    resolved_primary = build_chat_model("primary", require_api_key=False)
+                except Exception as fallback_exc:  # noqa: BLE001
+                    logger.warning("Standby primary model init failed: %s", fallback_exc)
 
         if resolved_worker is None and resolved_primary is not None:
             try:
@@ -297,10 +345,25 @@ def create_app(
             ov = explicit.to_model_override()
             if ov is not None:
                 return ov
+        if (role == "primary" and primary_model is not None) or (
+            role == "worker" and (worker_model is not None or primary_model is not None)
+        ):
+            return None
         persisted = load_persisted_llm_config().get(role)
         if isinstance(persisted, dict) and persisted:
             return ModelConfigOverride.model_validate(persisted).to_model_override()
         return None
+
+    def _sync_env_with_profile_secrets() -> None:
+        reload_env_file()
+        if getattr(app.state, "profile_secrets_active", False):
+            active_secrets: dict[str, str] = getattr(app.state, "profile_secrets", {})
+            for key in ALLOWED_PROFILE_SECRET_KEYS:
+                val = active_secrets.get(key, "").strip()
+                if val:
+                    os.environ[key] = val
+                else:
+                    os.environ.pop(key, None)
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
@@ -344,8 +407,45 @@ def create_app(
     async def model_presets() -> dict[str, Any]:
         return get_provider_presets()
 
+    @app.post("/config/secrets", dependencies=[Depends(require_auth)])
+    async def sync_profile_secrets(
+        payload: ProfileSecretsRequest, request: Request
+    ) -> dict[str, Any]:
+        sanitized: dict[str, str] = {}
+        for raw_key, raw_val in payload.secrets.items():
+            key = str(raw_key).strip().upper()
+            if key not in ALLOWED_PROFILE_SECRET_KEYS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Unsupported secret key: {key}",
+                )
+            val = str(raw_val or "").strip()
+            if val:
+                sanitized[key] = val
+
+        request.app.state.profile_secrets = sanitized
+        request.app.state.profile_secrets_active = True
+        _sync_env_with_profile_secrets()
+
+        try:
+            prim_spec = load_model_spec("primary", include_persisted=True)
+            if prim_spec.api_key or prim_spec.provider in LOCAL_NO_KEY_PROVIDERS:
+                request.app.state.model_error = None
+        except ModelConfigurationError:
+            pass
+
+        return {"ok": True, "count": len(sanitized)}
+
+    @app.delete("/config/secrets", dependencies=[Depends(require_auth)])
+    async def clear_profile_secrets(request: Request) -> dict[str, Any]:
+        request.app.state.profile_secrets = {}
+        request.app.state.profile_secrets_active = True
+        _sync_env_with_profile_secrets()
+        return {"ok": True, "count": 0}
+
     @app.get("/config/llm", dependencies=[Depends(require_auth)])
     async def get_llm_config() -> dict[str, Any]:
+        _sync_env_with_profile_secrets()
         persisted = load_persisted_llm_config()
         return {
             "primary": load_model_spec("primary", include_persisted=True).safe_summary(),
@@ -355,34 +455,61 @@ def create_app(
         }
 
     @app.put("/config/llm", dependencies=[Depends(require_auth)])
-    async def update_llm_config(payload: LLMConfigUpdateRequest) -> dict[str, Any]:
+    async def update_llm_config(
+        payload: LLMConfigUpdateRequest, request: Request
+    ) -> dict[str, Any]:
+        _sync_env_with_profile_secrets()
         current = load_persisted_llm_config()
-        if payload.primary is not None:
-            prim_dict = payload.primary.model_dump(exclude_none=True, exclude={"api_key"})
-            resolve_model_spec_with_override("primary", override=prim_dict)
-            current["primary"] = prim_dict
-        if payload.worker is not None:
-            work_dict = payload.worker.model_dump(exclude_none=True, exclude={"api_key"})
-            resolve_model_spec_with_override("worker", override=work_dict)
-            current["worker"] = work_dict
+        try:
+            if payload.primary is not None:
+                prim_dict = payload.primary.model_dump(exclude_none=True, exclude={"api_key"})
+                resolve_model_spec_with_override("primary", override=prim_dict)
+                current["primary"] = prim_dict
+            if payload.worker is not None:
+                work_dict = payload.worker.model_dump(exclude_none=True, exclude={"api_key"})
+                resolve_model_spec_with_override("worker", override=work_dict)
+                current["worker"] = work_dict
+        except ModelConfigurationError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
         if payload.max_turns is not None:
             current["max_turns"] = payload.max_turns
         save_persisted_llm_config(current)
+
+        prim_spec = load_model_spec("primary", include_persisted=True)
+        work_spec = load_model_spec("worker", include_persisted=True)
+        if prim_spec.api_key or prim_spec.provider in LOCAL_NO_KEY_PROVIDERS:
+            request.app.state.model_error = None
+
         return {
             "ok": True,
-            "primary": load_model_spec("primary", include_persisted=True).safe_summary(),
-            "worker": load_model_spec("worker", include_persisted=True).safe_summary(),
+            "primary": prim_spec.safe_summary(),
+            "worker": work_spec.safe_summary(),
             "max_turns": int(current.get("max_turns") or os.getenv("MAX_TURNS", "30")),
         }
 
+    @app.post("/models/list", dependencies=[Depends(require_auth)])
+    async def list_models(payload: ModelListRequest) -> dict[str, Any]:
+        _sync_env_with_profile_secrets()
+        return await list_provider_models(
+            payload.provider,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            role=payload.role,
+        )
+
     @app.post("/models/probe", dependencies=[Depends(require_auth)])
     async def probe_model(payload: ModelProbeRequest) -> dict[str, Any]:
+        _sync_env_with_profile_secrets()
         ov = payload.override.to_model_override() if payload.override else None
-        spec = (
-            resolve_model_spec_with_override(payload.role, override=ov)
-            if ov is not None
-            else load_model_spec(payload.role, include_persisted=True)
-        )
+        try:
+            spec = (
+                resolve_model_spec_with_override(payload.role, override=ov)
+                if ov is not None
+                else load_model_spec(payload.role, include_persisted=True)
+            )
+        except ModelConfigurationError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return await probe_model_connectivity(
             payload.role,
             spec=spec,
@@ -391,6 +518,7 @@ def create_app(
 
     def _build_job_runner(runtime: AgentRuntime) -> Any:
         async def _runner(job: AgentJob) -> dict[str, Any]:
+            _sync_env_with_profile_secrets()
             req = job.request_payload
             prim_raw = req.get("primary_model")
             work_raw = req.get("worker_model")
@@ -548,6 +676,7 @@ def create_app(
             )
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
 
+        _sync_env_with_profile_secrets()
         thread_id = payload.thread_id or f"thread-{uuid.uuid4().hex[:12]}"
         prim_ov = _effective_override(payload.primary_model, "primary")
         work_ov = _effective_override(payload.worker_model, "worker")
@@ -609,6 +738,7 @@ def create_app(
         if payload.reason is not None:
             resume_body["reason"] = payload.reason
 
+        _sync_env_with_profile_secrets()
         prim_ov = _effective_override(payload.primary_model, "primary")
         work_ov = _effective_override(payload.worker_model, "worker")
         skill_dicts = (

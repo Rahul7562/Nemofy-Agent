@@ -2,8 +2,8 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Layers,
-  Loader2,
   MessageSquarePlus,
   Send,
   ShieldAlert,
@@ -11,59 +11,57 @@ import {
   Sparkles,
   Trash2,
   X,
+  Brain,
 } from 'lucide-react';
-import { type FormEvent, type KeyboardEvent, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type ActivityUserPrefs,
+  readActivityPrefs,
+  writeActivityPrefs,
+} from '../lib/activityUtils.ts';
 import {
   createThread,
   deleteThread,
   listThreads,
+  pollChatJob,
   resumeApproval,
-  sendChatMessage,
+  startChatJob,
 } from '../lib/apiClient.ts';
-import type { ChatMessage, ChatThread, PersistedLLMConfig } from '../types/agent.ts';
+import {
+  type ThinkingLevel,
+  formatThinkingBadge,
+  getThinkingProfile,
+  normalizeThinkingLevel,
+} from '../lib/thinkingModes.ts';
+import type {
+  ChatMessage,
+  ChatThread,
+  LiveAgentActivity,
+  PersistedLLMConfig,
+} from '../types/agent.ts';
+import { AgentActivityPanel } from './AgentActivityPanel.tsx';
+import { MarkdownMessage } from './MarkdownMessage.tsx';
 
 interface ChatViewProps {
   llmConfig: PersistedLLMConfig | null;
+  onPrimaryThinkingChange?: (level: ThinkingLevel) => void;
   onOpenLLMSettings: () => void;
 }
 
-const STARTER_PROMPTS = [
-  'List the files in /workspace and create a project_summary.md overview.',
-  'Write a Python script in /workspace/analyze.py that computes Fibonacci numbers and run it in the sandbox.',
-  'Create a step-by-step research plan for benchmarking local vs hosted LLMs.',
-];
-
-function renderFormattedText(content: string) {
-  const segments = content.split(/(```[\s\S]*?```)/g);
-  return segments.map((seg, idx) => {
-    if (seg.startsWith('```') && seg.endsWith('```')) {
-      const inner = seg.slice(3, -3);
-      const firstNewline = inner.indexOf('\n');
-      const lang = firstNewline > -1 ? inner.slice(0, firstNewline).trim() : '';
-      const code = firstNewline > -1 ? inner.slice(firstNewline + 1) : inner;
-      return (
-        <div
-          key={idx}
-          className="my-3 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] overflow-hidden"
-        >
-          {lang && (
-            <div className="px-3 py-1.5 border-b border-[var(--rule)] text-[11px] font-mono text-[var(--ink-faint)] uppercase">
-              {lang}
-            </div>
-          )}
-          <pre className="p-3.5 text-xs font-mono text-[var(--ink)] overflow-x-auto leading-relaxed">
-            <code>{code}</code>
-          </pre>
-        </div>
-      );
-    }
-    return (
-      <div key={idx} className="whitespace-pre-wrap break-words leading-relaxed">
-        {seg}
-      </div>
-    );
-  });
+function cleanThreadTitle(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[*_~`#>]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 56);
 }
+
+const STARTER_PROMPTS = [
+  'Compare Python, TypeScript, and Rust in a Markdown data table and include an ASCII bar chart of developer adoption.',
+  'Inspect /workspace files and summarize what is currently in my project.',
+  'Draft a clear, actionable 5-step launch checklist for a new SaaS product.',
+];
 
 function MessageMetadata({ msg }: { msg: ChatMessage }) {
   const [planOpen, setPlanOpen] = useState(false);
@@ -147,13 +145,34 @@ function MessageMetadata({ msg }: { msg: ChatMessage }) {
   );
 }
 
-export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
+export function ChatView({
+  llmConfig,
+  onPrimaryThinkingChange,
+  onOpenLLMSettings,
+}: ChatViewProps) {
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [prompt, setPrompt] = useState('');
   const [sending, setSending] = useState(false);
+  const [liveActivity, setLiveActivity] = useState<LiveAgentActivity | null>(null);
+  const [activityPrefs, setActivityPrefs] = useState<ActivityUserPrefs>(() => readActivityPrefs());
   const [error, setError] = useState<string | null>(null);
+
+  const pollCancelledRef = useRef(false);
+
+  // Adaptive Thinking Mode state (auto-adapts to active primary model capabilities)
+  const primaryProvider = llmConfig?.primary.provider || 'river_ai';
+  const primaryModel = llmConfig?.primary.model || 'deepseek-ai/DeepSeek-V4.1-Flash';
+  const thinkingProfile = useMemo(
+    () => getThinkingProfile(primaryProvider, primaryModel),
+    [primaryProvider, primaryModel],
+  );
+  const [selectedThinking, setSelectedThinking] = useState<ThinkingLevel>(() =>
+    normalizeThinkingLevel(thinkingProfile, llmConfig?.primary.reasoning_effort),
+  );
+  const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
+  const thinkingMenuRef = useRef<HTMLDivElement>(null);
 
   // HITL approval state
   const [editingApproval, setEditingApproval] = useState(false);
@@ -163,6 +182,71 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const activeThread = threads.find((t) => t.id === activeThreadId) || null;
+
+  function handleUpdateActivityPrefs(patch: Partial<ActivityUserPrefs>) {
+    setActivityPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      writeActivityPrefs(next);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    pollCancelledRef.current = false;
+    return () => {
+      pollCancelledRef.current = true;
+    };
+  }, []);
+
+  // Smooth elapsed timer ticker while Nemo is working
+  useEffect(() => {
+    if (!sending) return;
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setLiveActivity((prev) => {
+        if (!prev) return prev;
+        const localElapsed = (Date.now() - startedAt) / 1000;
+        return localElapsed > prev.elapsedSeconds
+          ? { ...prev, elapsedSeconds: localElapsed }
+          : prev;
+      });
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [sending]);
+
+  // Keep selected thinking mode synchronized & valid whenever active model or llmConfig changes
+  useEffect(() => {
+    const nextLevel = normalizeThinkingLevel(
+      thinkingProfile,
+      llmConfig?.primary.reasoning_effort ?? selectedThinking,
+    );
+    setSelectedThinking(nextLevel);
+  }, [thinkingProfile, llmConfig?.primary.reasoning_effort]);
+
+  // Close thinking mode popover on outside click or Escape
+  useEffect(() => {
+    if (!thinkingMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      if (thinkingMenuRef.current && !thinkingMenuRef.current.contains(e.target as Node)) {
+        setThinkingMenuOpen(false);
+      }
+    }
+    function handleEscape(e: globalThis.KeyboardEvent) {
+      if (e.key === 'Escape') setThinkingMenuOpen(false);
+    }
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [thinkingMenuOpen]);
+
+  function handleSelectThinking(level: ThinkingLevel) {
+    setSelectedThinking(level);
+    setThinkingMenuOpen(false);
+    onPrimaryThinkingChange?.(level);
+  }
 
   useEffect(() => {
     let mounted = true;
@@ -187,7 +271,12 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeThread?.messages.length, sending]);
+  }, [
+    activeThread?.messages.length,
+    sending,
+    liveActivity?.toolEvents.length,
+    liveActivity?.fileChanges.length,
+  ]);
 
   async function handleNewThread() {
     setError(null);
@@ -220,25 +309,27 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
     if (!clean || sending) return;
     setError(null);
     setSending(true);
+    setThinkingMenuOpen(false);
     setPrompt('');
 
+    const optimisticId = `temp-${Date.now()}`;
+    let targetId = activeThreadId;
     try {
-      let targetId = activeThreadId;
+      const derivedTitle = cleanThreadTitle(clean) || 'New Agent Session';
       if (!targetId) {
-        const created = await createThread(clean.slice(0, 56));
+        const created = await createThread(derivedTitle);
         setThreads((prev) => [created, ...prev]);
         setActiveThreadId(created.id);
         targetId = created.id;
       }
 
       // Optimistic user message display
-      const optimisticId = `temp-${Date.now()}`;
       setThreads((prev) =>
         prev.map((t) =>
           t.id === targetId
             ? {
                 ...t,
-                title: t.messages.length === 0 ? clean.slice(0, 56) : t.title,
+                title: t.messages.length === 0 ? derivedTitle : t.title,
                 messages: [
                   ...t.messages,
                   {
@@ -253,19 +344,88 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
         ),
       );
 
-      const res = await sendChatMessage(targetId, clean);
-      setThreads((prev) => {
-        const exists = prev.some((t) => t.id === res.thread.id);
-        if (exists) {
-          return prev.map((t) => (t.id === res.thread.id ? res.thread : t));
-        }
-        return [res.thread, ...prev];
+      const effectiveThinking = thinkingProfile.supported ? selectedThinking : 'off';
+      setLiveActivity({
+        jobId: 'starting',
+        status: 'running',
+        currentPhase: 'thinking',
+        lastEvent: 'Reviewing your request and choosing the best approach',
+        elapsedSeconds: 0,
+        turnCount: 1,
+        thinking: null,
+        activityFeed: [
+          {
+            id: 'init-1',
+            phase: 'thinking',
+            text: 'Reviewing your request and choosing the best approach',
+          },
+        ],
+        toolEvents: [],
+        fileChanges: [],
       });
-      setActiveThreadId(res.thread.id);
+
+      const started = await startChatJob(targetId, clean, effectiveThinking);
+
+      // Commit the persisted user message from server right away
+      setThreads((prev) => {
+        const exists = prev.some((t) => t.id === started.thread.id);
+        if (exists) {
+          return prev.map((t) => (t.id === started.thread.id ? started.thread : t));
+        }
+        return [started.thread, ...prev];
+      });
+      setActiveThreadId(started.thread.id);
+
+      if (!started.jobId) {
+        // Standalone mode or immediate error already persisted on started.thread
+        setLiveActivity(null);
+        return;
+      }
+
+      if (started.activity) {
+        setLiveActivity(started.activity);
+      }
+
+      // Live poll loop until terminal state (fast 300ms long-poll for live thinking deltas)
+      while (!pollCancelledRef.current) {
+        const polled = await pollChatJob(started.jobId, 300);
+        if (pollCancelledRef.current) break;
+
+        if (polled.activity) {
+          setLiveActivity(polled.activity);
+        }
+
+        if (polled.done) {
+          if (polled.thread) {
+            const finalThread = polled.thread;
+            setThreads((prev) => {
+              const exists = prev.some((t) => t.id === finalThread.id);
+              if (exists) {
+                return prev.map((t) => (t.id === finalThread.id ? finalThread : t));
+              }
+              return [finalThread, ...prev];
+            });
+            setActiveThreadId(finalThread.id);
+          }
+          break;
+        }
+      }
     } catch (err) {
+      // Roll back optimistic message and restore draft so the user never loses input
+      if (targetId) {
+        setThreads((prev) =>
+          prev.map((t) =>
+            t.id === targetId
+              ? { ...t, messages: t.messages.filter((m) => m.id !== optimisticId) }
+              : t,
+          ),
+        );
+      }
+      setPrompt(clean);
       setError(err instanceof Error ? err.message : 'Failed to execute task.');
     } finally {
       setSending(false);
+      setLiveActivity(null);
     }
   }
 
@@ -327,7 +487,7 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
             <div className="p-4 text-xs text-[var(--ink-faint)]">Loading sessions...</div>
           ) : threads.length === 0 ? (
             <div className="p-4 text-xs text-[var(--ink-faint)] leading-relaxed">
-              No sessions yet. Start a new chat to run tasks with the Python agent.
+              No conversations yet. Start a new chat with Nemo.
             </div>
           ) : (
             threads.map((t) => {
@@ -369,7 +529,7 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
         <div className="h-16 px-5 sm:px-6 border-b border-[var(--rule)] flex items-center justify-between gap-4 shrink-0 bg-[var(--paper)]">
           <div className="min-w-0">
             <h1 className="font-display text-base font-semibold text-[var(--ink)] truncate">
-              {activeThread?.title || 'Autonomous Agent Chat'}
+              {activeThread?.title || 'Chat with Nemo'}
             </h1>
           </div>
 
@@ -379,7 +539,7 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
                 type="button"
                 onClick={onOpenLLMSettings}
                 className="hidden sm:inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] hover:border-[var(--rule-strong)] text-xs text-[var(--ink-soft)] hover:text-[var(--ink)] transition-colors cursor-pointer"
-                title="Configure Main Agent and Sub-Agent models"
+                title="Configure Nemo and Sub-Agent LLM settings"
               >
                 <SlidersHorizontal className="w-3.5 h-3.5 text-[var(--signal)]" />
                 <span className="font-mono truncate max-w-[200px]">
@@ -404,13 +564,13 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
             <div className="max-w-2xl mx-auto mt-8 sm:mt-16">
               <div className="inline-flex items-center gap-2 text-xs font-medium text-[var(--signal)] mb-3">
                 <Sparkles className="w-4 h-4" />
-                <span>Pure-Python LangGraph Brain</span>
+                <span>Nemo · Nemofy Agent</span>
               </div>
               <h2 className="font-display text-2xl sm:text-3xl font-semibold tracking-tight text-[var(--ink)]">
-                What would you like Nemofy Agent to work on?
+                Hi, I&apos;m Nemo. How can I help today?
               </h2>
               <p className="mt-2.5 text-sm text-[var(--ink-soft)] leading-relaxed">
-                Ask the agent to inspect or generate files in <code className="font-mono text-xs">/workspace</code>, execute Python in the isolated sandbox, or delegate sub-tasks to the Sub-Agent model.
+                Your diligent, honest, and friendly AI inside Nemofy Agent — ready for quick questions, data tables, ASCII charts, research, coding, and tasks in <code className="font-mono text-xs">/workspace</code>.
               </p>
 
               <div className="mt-7 grid gap-2.5">
@@ -436,25 +596,39 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
                     className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}
                   >
                     <div
-                      className={`max-w-[88%] rounded-xl px-4 py-3 text-sm ${
+                      className={`max-w-[92%] sm:max-w-[88%] rounded-xl px-4 py-3.5 text-sm ${
                         isUser
                           ? 'bg-[var(--signal)] text-white'
                           : 'bg-[var(--paper-raised)] border border-[var(--rule)] text-[var(--ink)]'
                       }`}
                     >
                       <div
-                        className={`text-[11px] font-medium mb-1 ${
+                        className={`text-[11px] font-medium mb-1.5 ${
                           isUser ? 'text-white/75' : 'text-[var(--ink-faint)]'
                         }`}
                       >
-                        {isUser ? 'You' : 'Nemofy Agent'}
+                        {isUser ? 'You' : 'Nemo'}
                         {!isUser && msg.activeModels?.primary?.model && (
                           <span className="ml-2 font-mono text-[10px]">
-                            ({msg.activeModels.primary.model})
+                            ({msg.activeModels.primary.model}
+                            {formatThinkingBadge(msg.activeModels.primary.reasoning_effort)
+                              ? ` · ${formatThinkingBadge(msg.activeModels.primary.reasoning_effort)}`
+                              : ''}
+                            )
                           </span>
                         )}
                       </div>
-                      {renderFormattedText(msg.content)}
+                      {!isUser && (
+                        <AgentActivityPanel
+                          mode="completed"
+                          thinking={msg.thinking}
+                          toolEvents={msg.toolEvents}
+                          fileChanges={msg.fileChanges}
+                          prefs={activityPrefs}
+                          onUpdatePrefs={handleUpdateActivityPrefs}
+                        />
+                      )}
+                      <MarkdownMessage content={msg.content} isUser={isUser} />
                       {!isUser && <MessageMetadata msg={msg} />}
                     </div>
                   </div>
@@ -540,12 +714,14 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
                 </div>
               )}
 
-              {sending && (
+              {sending && liveActivity && (
                 <div className="flex justify-start">
-                  <div className="inline-flex items-center gap-2.5 rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] px-4 py-3 text-sm text-[var(--ink-soft)]">
-                    <Loader2 className="w-4 h-4 animate-spin text-[var(--signal)]" />
-                    <span>Running Python agent graph...</span>
-                  </div>
+                  <AgentActivityPanel
+                    mode="live"
+                    activity={liveActivity}
+                    prefs={activityPrefs}
+                    onUpdatePrefs={handleUpdateActivityPrefs}
+                  />
                 </div>
               )}
 
@@ -568,10 +744,10 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
 
             <form
               onSubmit={handleFormSubmit}
-              className="flex items-end gap-2.5 rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] p-2 focus-within:border-[var(--signal)] focus-within:ring-2 focus-within:ring-[var(--signal)]/15 transition-all"
+              className="flex items-end gap-2 rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] p-2 focus-within:border-[var(--signal)] focus-within:ring-2 focus-within:ring-[var(--signal)]/15 transition-all"
             >
               <label htmlFor="chat-composer" className="sr-only">
-                Message Nemofy Agent
+                Message Nemo
               </label>
               <textarea
                 id="chat-composer"
@@ -579,10 +755,120 @@ export function ChatView({ llmConfig, onOpenLLMSettings }: ChatViewProps) {
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 onKeyDown={handleTextareaKeyDown}
-                placeholder="Ask Nemofy Agent to research, write code, or manage /workspace files..."
+                placeholder="Message Nemo — ask anything, build tables, charts, or code..."
                 disabled={sending}
-                className="flex-1 resize-none bg-transparent px-2.5 py-2 text-sm text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none max-h-40"
+                className="flex-1 min-w-0 resize-none bg-transparent px-2.5 py-2 text-sm leading-5 text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none max-h-40"
               />
+
+              {/* Adaptive Model Thinking Mode Selector (just left of Send) */}
+              <div ref={thinkingMenuRef} className="relative shrink-0">
+                <button
+                  type="button"
+                  disabled={sending}
+                  onClick={() => setThinkingMenuOpen((v) => !v)}
+                  aria-haspopup="listbox"
+                  aria-expanded={thinkingMenuOpen}
+                  aria-label={`Thinking mode: ${
+                    thinkingProfile.options.find((o) => o.value === selectedThinking)?.label ||
+                    'Standard'
+                  } (${thinkingProfile.familyLabel})`}
+                  title={`Thinking mode for ${primaryModel} (${thinkingProfile.familyLabel})`}
+                  className={`h-9 px-2.5 inline-flex items-center gap-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer disabled:opacity-50 ${
+                    !thinkingProfile.supported
+                      ? 'border-[var(--rule)] bg-[var(--paper-sunk)] text-[var(--ink-faint)] hover:text-[var(--ink-soft)]'
+                      : selectedThinking !== 'off'
+                        ? 'border-[var(--signal)]/45 bg-[var(--blush)] text-[var(--signal)] hover:border-[var(--signal)]'
+                        : 'border-[var(--rule)] bg-[var(--paper-sunk)] text-[var(--ink-soft)] hover:border-[var(--rule-strong)] hover:text-[var(--ink)]'
+                  }`}
+                >
+                  <Brain className="w-3.5 h-3.5 shrink-0" />
+                  <span className="max-w-[76px] truncate">
+                    {thinkingProfile.options.find((o) => o.value === selectedThinking)?.shortLabel ||
+                      'Standard'}
+                  </span>
+                  {thinkingMenuOpen ? (
+                    <ChevronDown className="w-3 h-3 opacity-70 shrink-0" />
+                  ) : (
+                    <ChevronUp className="w-3 h-3 opacity-70 shrink-0" />
+                  )}
+                </button>
+
+                {thinkingMenuOpen && (
+                  <div
+                    role="listbox"
+                    aria-label="Select model thinking mode"
+                    className="absolute bottom-full right-0 mb-2 w-64 rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] shadow-lg overflow-hidden z-30"
+                  >
+                    <div className="px-3 py-2 border-b border-[var(--rule)] bg-[var(--paper-sunk)]">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold text-[var(--ink)]">
+                          Thinking Mode
+                        </span>
+                        <span className="text-[10px] font-mono text-[var(--signal)] truncate">
+                          {thinkingProfile.familyLabel}
+                        </span>
+                      </div>
+                      <div className="text-[10px] font-mono text-[var(--ink-faint)] truncate mt-0.5">
+                        {primaryModel}
+                      </div>
+                    </div>
+
+                    {thinkingProfile.supported ? (
+                      <div className="p-1.5 space-y-0.5 max-h-[420px] overflow-y-auto">
+                        {thinkingProfile.options.map((opt) => {
+                          const isSelected = selectedThinking === opt.value;
+                          return (
+                            <button
+                              key={opt.value}
+                              type="button"
+                              role="option"
+                              aria-selected={isSelected}
+                              onClick={() => handleSelectThinking(opt.value)}
+                              className={`w-full px-2.5 py-1.5 rounded-lg text-left flex items-start justify-between gap-2 transition-colors cursor-pointer ${
+                                isSelected
+                                  ? 'bg-[var(--blush)] text-[var(--signal)]'
+                                  : 'text-[var(--ink)] hover:bg-[var(--paper-sunk)]'
+                              }`}
+                            >
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold leading-tight">
+                                  {opt.label}
+                                </div>
+                                <div
+                                  className={`text-[11px] leading-snug mt-0.5 ${
+                                    isSelected ? 'text-[var(--signal)]/80' : 'text-[var(--ink-faint)]'
+                                  }`}
+                                >
+                                  {opt.description}
+                                </div>
+                              </div>
+                              {isSelected && <Check className="w-3.5 h-3.5 shrink-0 mt-0.5" />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="p-3 space-y-2.5 text-xs text-[var(--ink-soft)]">
+                        <p className="leading-relaxed">
+                          <span className="font-mono text-[var(--ink)]">{primaryModel}</span> is a
+                          standard chat model and does not support configurable thinking levels.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setThinkingMenuOpen(false);
+                            onOpenLLMSettings();
+                          }}
+                          className="w-full py-1.5 px-2.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] text-[var(--ink)] text-xs font-medium transition-colors cursor-pointer"
+                        >
+                          Switch model in Settings
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <button
                 type="submit"
                 disabled={sending || !prompt.trim()}

@@ -81,6 +81,11 @@ class AgentJob:
     mcp_tools: list[str] = field(default_factory=list)
     dynamic_skills: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    thinking_segments: list[str] = field(default_factory=list)
+    live_thinking_buffer: str = ""
+    activity_feed: list[dict[str, Any]] = field(default_factory=list)
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
+    file_changes: list[dict[str, Any]] = field(default_factory=list)
     _update_event: asyncio.Event = field(default_factory=asyncio.Event)
     _runner_task: asyncio.Task[None] | None = None
     _watchdog_task: asyncio.Task[None] | None = None
@@ -107,8 +112,62 @@ class AgentJob:
                 self.steps_completed = max(self.steps_completed, int(event["steps_completed"]))
             except (TypeError, ValueError):
                 pass
+
+        # Live streaming thinking chunks arrive incrementally while the LLM is generating
+        thinking_delta = event.get("thinking_delta")
+        if isinstance(thinking_delta, str) and thinking_delta:
+            self.live_thinking_buffer += thinking_delta
+
+        # Finalized turn thinking replaces the live buffer for that turn cleanly
+        thinking_text = event.get("thinking")
+        if isinstance(thinking_text, str) and thinking_text.strip():
+            clean_thought = thinking_text.strip()
+            self.live_thinking_buffer = ""
+            if not self.thinking_segments or self.thinking_segments[-1] != clean_thought:
+                self.thinking_segments.append(clean_thought)
+        elif phase in ("plan_llm_done", "act_tool_start", "observe") and self.live_thinking_buffer.strip():
+            committed = self.live_thinking_buffer.strip()
+            self.live_thinking_buffer = ""
+            if not self.thinking_segments or self.thinking_segments[-1] != committed:
+                self.thinking_segments.append(committed)
+
+        tool_event = event.get("tool_event")
+        if isinstance(tool_event, dict) and tool_event.get("tool"):
+            ev_id = str(tool_event.get("id") or f"tool-{len(self.tool_events) + 1}")
+            existing = next((t for t in self.tool_events if t.get("id") == ev_id), None)
+            if existing is not None:
+                existing.update({k: v for k, v in tool_event.items() if v is not None})
+            else:
+                self.tool_events.append({"id": ev_id, **tool_event})
+
+        changes = event.get("file_changes")
+        if isinstance(changes, list) and changes:
+            for item in changes:
+                if isinstance(item, dict) and item.get("path"):
+                    self.file_changes.append(dict(item))
+
         detail = str(event.get("detail") or event.get("tool") or phase).strip()
         self.last_event = detail[:240]
+
+        # Record meaningful non-duplicate human-readable step narration in activity_feed
+        activity_note = event.get("activity_note")
+        note_text = (
+            str(activity_note).strip()
+            if isinstance(activity_note, str) and activity_note.strip()
+            else (detail if not thinking_delta and phase not in ("starting", "staged") else "")
+        )
+        if note_text:
+            last_text = self.activity_feed[-1]["text"] if self.activity_feed else None
+            if note_text != last_text:
+                self.activity_feed.append(
+                    {
+                        "id": f"act-{len(self.activity_feed) + 1}",
+                        "phase": phase,
+                        "text": note_text[:240],
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
+                )
+
         self.signal_update()
 
     def to_status_payload(self) -> dict[str, Any]:
@@ -119,6 +178,23 @@ class AgentJob:
             if self.status in ("running", "staged")
             else 0.0
         )
+        thinking_parts = list(self.thinking_segments)
+        if self.live_thinking_buffer.strip():
+            thinking_parts.append(self.live_thinking_buffer.strip())
+        merged_thinking = "\n\n".join(thinking_parts).strip() or None
+        if not merged_thinking and isinstance(self.result, dict):
+            res_think = self.result.get("thinking")
+            if isinstance(res_think, str) and res_think.strip():
+                merged_thinking = res_think.strip()
+
+        merged_tools = list(self.tool_events)
+        if not merged_tools and isinstance(self.result, dict) and isinstance(self.result.get("tool_events"), list):
+            merged_tools = list(self.result["tool_events"])
+
+        merged_files = list(self.file_changes)
+        if not merged_files and isinstance(self.result, dict) and isinstance(self.result.get("file_changes"), list):
+            merged_files = list(self.result["file_changes"])
+
         return {
             "job_id": self.job_id,
             "thread_id": self.thread_id,
@@ -137,6 +213,10 @@ class AgentJob:
             "mcp_tools": list(self.mcp_tools),
             "dynamic_skills": list(self.dynamic_skills),
             "warnings": list(self.warnings),
+            "thinking": merged_thinking,
+            "activity_feed": list(self.activity_feed),
+            "tool_events": merged_tools,
+            "file_changes": merged_files,
             "error": self.error,
             "result": self.result,
         }

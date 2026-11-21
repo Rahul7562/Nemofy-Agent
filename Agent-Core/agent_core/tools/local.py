@@ -127,7 +127,12 @@ def build_local_tools(
 
     @tool("bash_exec")
     async def bash_exec(command: str, timeout: int | None = None) -> str:
-        """Execute a shell or Python command inside the isolated /workspace sandbox."""
+        """Execute a shell or Python command inside the isolated /workspace sandbox.
+
+        Args:
+            command: Shell command to run with working directory /workspace (e.g. `python3 script.py`).
+            timeout: Optional timeout in seconds (defaults to sandbox limit).
+        """
         session_id = current_session_id.get()
         try:
             res = await sandbox.exec_command(command, session_id=session_id, timeout=timeout)
@@ -136,17 +141,40 @@ def build_local_tools(
             return f"ERROR: {exc}"
 
     @tool("read_file")
-    def read_file(path: str) -> str:
-        """Read a UTF-8 text file strictly inside /workspace."""
+    def read_file(
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
+        """Read a UTF-8 text file inside /workspace, optionally sliced by 1-indexed line numbers.
+
+        Args:
+            path: File path inside /workspace (e.g. '/workspace/app.py' or 'app.py').
+            start_line: Optional 1-indexed starting line number.
+            end_line: Optional 1-indexed ending line number (inclusive).
+        """
         session_id = current_session_id.get()
         try:
-            return sandbox.read_file(path, session_id=session_id)
+            return sandbox.read_file(
+                path,
+                session_id=session_id,
+                start_line=start_line,
+                end_line=end_line,
+            )
         except (SandboxSecurityError, FileNotFoundError, IsADirectoryError, ValueError) as exc:
             return f"ERROR: {exc}"
 
     @tool("write_file")
     def write_file(path: str, content: str) -> str:
-        """Create or overwrite a file strictly inside /workspace."""
+        """Create or overwrite a file strictly inside /workspace.
+
+        For very large files (>200 lines), prefer writing modular files or building in chunks
+        with write_file + edit_file so tool-call JSON stays compact and never truncates.
+
+        Args:
+            path: Target file path inside /workspace (e.g. '/workspace/main.py').
+            content: Full UTF-8 text content to write.
+        """
         session_id = current_session_id.get()
         try:
             return sandbox.write_file(path, content, session_id=session_id)
@@ -155,7 +183,13 @@ def build_local_tools(
 
     @tool("edit_file")
     def edit_file(path: str, old_text: str, new_text: str) -> str:
-        """Replace a unique matching snippet inside an existing file in /workspace."""
+        """Replace a unique matching snippet inside an existing file in /workspace.
+
+        Args:
+            path: Existing file path inside /workspace.
+            old_text: Exact unique substring to replace.
+            new_text: Replacement text.
+        """
         session_id = current_session_id.get()
         try:
             return sandbox.edit_file(path, old_text, new_text, session_id=session_id)
@@ -164,7 +198,11 @@ def build_local_tools(
 
     @tool("list_dir")
     def list_dir(path: str = "/workspace") -> str:
-        """List files and subdirectories inside /workspace."""
+        """List files and subdirectories inside /workspace.
+
+        Args:
+            path: Directory path inside /workspace (defaults to '/workspace').
+        """
         session_id = current_session_id.get()
         try:
             entries = sandbox.list_dir(path, session_id=session_id)
@@ -176,7 +214,11 @@ def build_local_tools(
 
     @tool("web_fetch")
     async def web_fetch(url: str) -> str:
-        """Fetch a webpage and extract clean Markdown text."""
+        """Fetch a webpage and extract clean Markdown text.
+
+        Args:
+            url: Public http:// or https:// URL to fetch.
+        """
         try:
             return await fetch_webpage_markdown(
                 url,

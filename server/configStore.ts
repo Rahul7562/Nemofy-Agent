@@ -40,6 +40,24 @@ export interface MCPServerItem {
   timeout_seconds: number;
 }
 
+export interface ToolEventRecord {
+  id: string;
+  tool: string;
+  args_summary?: string;
+  status: 'running' | 'ok' | 'error' | 'rejected';
+  output_summary?: string;
+  started_at?: string;
+  finished_at?: string | null;
+}
+
+export interface FileChangeRecord {
+  kind: 'file' | 'dir';
+  action: 'created' | 'modified' | 'deleted';
+  path: string;
+  tool?: string;
+  timestamp?: string;
+}
+
 export interface ChatMessageRecord {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -55,9 +73,12 @@ export interface ChatMessageRecord {
   activeSkills?: string[];
   subagentReports?: Array<Record<string, unknown>>;
   activeModels?: {
-    primary?: { provider?: string; model?: string };
-    worker?: { provider?: string; model?: string };
+    primary?: { provider?: string; model?: string; reasoning_effort?: string | null };
+    worker?: { provider?: string; model?: string; reasoning_effort?: string | null };
   };
+  thinking?: string | null;
+  toolEvents?: ToolEventRecord[];
+  fileChanges?: FileChangeRecord[];
   pendingApproval?: Record<string, unknown> | null;
   status?: string;
 }
@@ -75,6 +96,7 @@ const PROVIDER_DEFAULTS: Record<string, { baseUrl: string; envVars: string[]; re
   river_ai: { baseUrl: 'https://api.river.ai/v1', envVars: ['RIVER_AI_API'], requiresKey: true },
   openai: { baseUrl: 'https://api.openai.com/v1', envVars: ['OPENAI_API_KEY'], requiresKey: true },
   openrouter: { baseUrl: 'https://openrouter.ai/api/v1', envVars: ['OPENROUTER_API_KEY'], requiresKey: true },
+  nvidia: { baseUrl: 'https://integrate.api.nvidia.com/v1', envVars: ['NVIDIA_API_KEY'], requiresKey: true },
   gemini: {
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     envVars: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
@@ -87,7 +109,101 @@ const PROVIDER_DEFAULTS: Record<string, { baseUrl: string; envVars: string[]; re
   fireworks: { baseUrl: 'https://api.fireworks.ai/inference/v1', envVars: ['FIREWORKS_API_KEY'], requiresKey: true },
   ollama: { baseUrl: 'http://127.0.0.1:11434/v1', envVars: ['OLLAMA_API_KEY'], requiresKey: false },
   vllm: { baseUrl: 'http://127.0.0.1:8000/v1', envVars: ['VLLM_API_KEY'], requiresKey: false },
+  custom: { baseUrl: '', envVars: ['PRIMARY_API_KEY', 'WORKER_API_KEY'], requiresKey: true },
 };
+
+const PROVIDER_ALIASES: Record<string, string> = {
+  river: 'river_ai',
+  google: 'gemini',
+  nvidia_nim: 'nvidia',
+  nim: 'nvidia',
+  local: 'ollama',
+};
+
+export function normalizeProviderId(provider?: string | null): string {
+  const clean = (provider || '').trim().toLowerCase();
+  if (!clean) return 'river_ai';
+  return PROVIDER_ALIASES[clean] || clean;
+}
+
+function normalizeRoleConfig(raw: Partial<RoleLLMConfig> | undefined, fallback: RoleLLMConfig): RoleLLMConfig {
+  const provider = normalizeProviderId(raw?.provider || fallback.provider);
+  const presetBase = PROVIDER_DEFAULTS[provider]?.baseUrl || '';
+  const rawBase = typeof raw?.base_url === 'string' ? raw.base_url.trim().replace(/\/+$/, '') : '';
+  const base_url = rawBase || presetBase || fallback.base_url;
+  const model = typeof raw?.model === 'string' && raw.model.trim() ? raw.model.trim() : fallback.model;
+  const rawTemp = Number(raw?.temperature);
+  const temperature = Number.isFinite(rawTemp) && rawTemp >= 0 && rawTemp <= 2 ? rawTemp : fallback.temperature;
+  const rawTokens = Number(raw?.max_tokens);
+  const max_tokens =
+    Number.isFinite(rawTokens) && rawTokens >= 64 && rawTokens <= 128000
+      ? Math.round(rawTokens)
+      : fallback.max_tokens;
+  const reasoning_effort =
+    typeof raw?.reasoning_effort === 'string' && raw.reasoning_effort.trim()
+      ? raw.reasoning_effort.trim().toLowerCase()
+      : fallback.reasoning_effort;
+
+  return {
+    provider,
+    model,
+    base_url,
+    temperature,
+    max_tokens,
+    reasoning_effort,
+  };
+}
+
+export function maskEnvSecret(value?: string | null): string | null {
+  const clean = (value || '').trim();
+  if (!clean) return null;
+  if (clean.length <= 8) return '****';
+  return `${clean.slice(0, 4)}...${clean.slice(-4)}`;
+}
+
+function formatEnvValue(raw: string): string {
+  const clean = raw.replace(/\r?\n/g, '').trim();
+  if (!clean) return '';
+  if (/[\s#'"`$\\]/.test(clean)) {
+    return `"${clean.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  }
+  return clean;
+}
+
+export function upsertEnvContent(existingContent: string, updates: Record<string, string>): string {
+  const remaining = new Map<string, string>();
+  for (const [k, v] of Object.entries(updates)) {
+    const cleanKey = k.trim();
+    if (!/^[A-Z][A-Z0-9_]*$/.test(cleanKey)) continue;
+    remaining.set(cleanKey, v);
+  }
+
+  const lines = existingContent ? existingContent.split(/\r?\n/) : [];
+  const nextLines: string[] = [];
+
+  for (const line of lines) {
+    const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=/);
+    if (match && remaining.has(match[1])) {
+      const key = match[1];
+      const nextVal = remaining.get(key) || '';
+      remaining.delete(key);
+      nextLines.push(`${key}=${formatEnvValue(nextVal)}`);
+    } else {
+      nextLines.push(line);
+    }
+  }
+
+  // Remove trailing blank lines before appending new keys cleanly
+  while (nextLines.length > 0 && nextLines[nextLines.length - 1] === '') {
+    nextLines.pop();
+  }
+
+  for (const [key, val] of remaining.entries()) {
+    nextLines.push(`${key}=${formatEnvValue(val)}`);
+  }
+
+  return nextLines.join('\n') + '\n';
+}
 
 export class WorkspaceAndConfigStore {
   readonly rootDir: string;
@@ -96,6 +212,7 @@ export class WorkspaceAndConfigStore {
   readonly mcpConfigPath: string;
   readonly llmConfigPath: string;
   readonly threadsPath: string;
+  readonly envFilePath: string;
 
   constructor(rootDir?: string) {
     this.rootDir = path.resolve(rootDir || process.cwd());
@@ -104,6 +221,7 @@ export class WorkspaceAndConfigStore {
     this.mcpConfigPath = path.resolve(process.env.MCP_CONFIG_PATH || path.join(this.rootDir, 'MCPs', 'servers.json'));
     this.llmConfigPath = path.resolve(process.env.LLM_CONFIG_PATH || path.join(this.rootDir, 'data', 'llm_config.json'));
     this.threadsPath = path.resolve(path.join(this.rootDir, 'data', 'threads.json'));
+    this.envFilePath = path.resolve(path.join(this.rootDir, '.env'));
 
     fs.mkdirSync(this.workspaceDir, { recursive: true });
     fs.mkdirSync(this.skillsDir, { recursive: true });
@@ -203,24 +321,121 @@ export class WorkspaceAndConfigStore {
   // ---------------------------------------------------------------------------
   // LLM Config (Main Agent & Sub-Agent)
   // ---------------------------------------------------------------------------
-  getProviderAvailability(): Record<string, { base_url: string; env_keys: string[]; api_key_configured: boolean; requires_api_key: boolean }> {
-    const out: Record<string, { base_url: string; env_keys: string[]; api_key_configured: boolean; requires_api_key: boolean }> = {};
+  syncEnvFromFile(): void {
+    if (!fs.existsSync(this.envFilePath)) return;
+    try {
+      const content = fs.readFileSync(this.envFilePath, 'utf-8');
+      for (const rawLine of content.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eqIdx = line.indexOf('=');
+        if (eqIdx <= 0) continue;
+        const key = line.slice(0, eqIdx).trim();
+        if (!/^[A-Z][A-Z0-9_]*$/.test(key)) continue;
+        let val = line.slice(eqIdx + 1).trim();
+        if (
+          (val.startsWith('"') && val.endsWith('"')) ||
+          (val.startsWith("'") && val.endsWith("'"))
+        ) {
+          val = val.slice(1, -1);
+        }
+        if (val) {
+          process.env[key] = val;
+        }
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+
+  getProviderAvailability(
+    profileSecrets?: Record<string, string>,
+  ): Record<
+    string,
+    {
+      base_url: string;
+      env_keys: string[];
+      primary_env_var: string;
+      api_key_configured: boolean;
+      masked_key: string | null;
+      requires_api_key: boolean;
+      storage?: 'profile_vault' | 'env';
+    }
+  > {
+    if (!profileSecrets) {
+      this.syncEnvFromFile();
+    }
+    const sourceEnv: Record<string, string | undefined> = profileSecrets || process.env;
+    const storage: 'profile_vault' | 'env' = profileSecrets ? 'profile_vault' : 'env';
+    const out: Record<
+      string,
+      {
+        base_url: string;
+        env_keys: string[];
+        primary_env_var: string;
+        api_key_configured: boolean;
+        masked_key: string | null;
+        requires_api_key: boolean;
+        storage?: 'profile_vault' | 'env';
+      }
+    > = {};
     for (const [key, info] of Object.entries(PROVIDER_DEFAULTS)) {
-      const configured =
-        !info.requiresKey || info.envVars.some((ev) => Boolean((process.env[ev] || '').trim()));
+      let foundValue = '';
+      for (const ev of info.envVars) {
+        const val = (sourceEnv[ev] || '').trim();
+        if (val) {
+          foundValue = val;
+          break;
+        }
+      }
+      const configured = !info.requiresKey || Boolean(foundValue);
       out[key] = {
         base_url: info.baseUrl,
         env_keys: info.envVars,
+        primary_env_var: info.envVars[0] || 'PRIMARY_API_KEY',
         api_key_configured: configured,
+        masked_key: maskEnvSecret(foundValue),
         requires_api_key: info.requiresKey,
+        storage,
       };
     }
     return out;
   }
 
+  getEnvVarForProvider(provider: string, role: 'primary' | 'worker'): string {
+    const normalized = normalizeProviderId(provider);
+    if (normalized === 'custom') {
+      return role === 'worker' ? 'WORKER_API_KEY' : 'PRIMARY_API_KEY';
+    }
+    return PROVIDER_DEFAULTS[normalized]?.envVars[0] || (role === 'worker' ? 'WORKER_API_KEY' : 'PRIMARY_API_KEY');
+  }
+
+  saveEnvUpdates(updates: Record<string, string>): string[] {
+    const cleanUpdates: Record<string, string> = {};
+    for (const [k, v] of Object.entries(updates)) {
+      const cleanKey = k.trim();
+      const cleanVal = (v || '').trim();
+      if (!/^[A-Z][A-Z0-9_]*$/.test(cleanKey) || !cleanVal) continue;
+      cleanUpdates[cleanKey] = cleanVal;
+    }
+    const keys = Object.keys(cleanUpdates);
+    if (keys.length === 0) return [];
+
+    const existing = fs.existsSync(this.envFilePath)
+      ? fs.readFileSync(this.envFilePath, 'utf-8')
+      : '';
+    const nextContent = upsertEnvContent(existing, cleanUpdates);
+    fs.writeFileSync(this.envFilePath, nextContent, { encoding: 'utf-8', mode: 0o600 });
+
+    for (const [k, v] of Object.entries(cleanUpdates)) {
+      process.env[k] = v;
+    }
+    return keys;
+  }
+
   getLLMConfig(): PersistedLLMConfig {
-    const defaultPrimaryProvider = (process.env.PRIMARY_PROVIDER || 'river_ai').toLowerCase();
-    const defaultWorkerProvider = (process.env.WORKER_PROVIDER || defaultPrimaryProvider).toLowerCase();
+    const defaultPrimaryProvider = normalizeProviderId(process.env.PRIMARY_PROVIDER || 'river_ai');
+    const defaultWorkerProvider = normalizeProviderId(process.env.WORKER_PROVIDER || defaultPrimaryProvider);
     const defaults: PersistedLLMConfig = {
       primary: {
         provider: defaultPrimaryProvider,
@@ -230,7 +445,7 @@ export class WorkspaceAndConfigStore {
           PROVIDER_DEFAULTS[defaultPrimaryProvider]?.baseUrl ||
           'https://api.river.ai/v1',
         temperature: Number(process.env.PRIMARY_TEMPERATURE || '0.2'),
-        max_tokens: Number(process.env.PRIMARY_MAX_TOKENS || '4096'),
+        max_tokens: Number(process.env.PRIMARY_MAX_TOKENS || '16384'),
         reasoning_effort: process.env.PRIMARY_REASONING_EFFORT || 'off',
       },
       worker: {
@@ -241,7 +456,7 @@ export class WorkspaceAndConfigStore {
           PROVIDER_DEFAULTS[defaultWorkerProvider]?.baseUrl ||
           'https://api.river.ai/v1',
         temperature: Number(process.env.WORKER_TEMPERATURE || '0.1'),
-        max_tokens: Number(process.env.WORKER_MAX_TOKENS || '2048'),
+        max_tokens: Number(process.env.WORKER_MAX_TOKENS || '8192'),
         reasoning_effort: process.env.WORKER_REASONING_EFFORT || 'off',
       },
       max_turns: Number(process.env.MAX_TURNS || '30'),
@@ -254,9 +469,12 @@ export class WorkspaceAndConfigStore {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.llmConfigPath, 'utf-8')) as Partial<PersistedLLMConfig>;
       return {
-        primary: { ...defaults.primary, ...(parsed.primary || {}) },
-        worker: { ...defaults.worker, ...(parsed.worker || {}) },
-        max_turns: typeof parsed.max_turns === 'number' ? parsed.max_turns : defaults.max_turns,
+        primary: normalizeRoleConfig(parsed.primary, defaults.primary),
+        worker: normalizeRoleConfig(parsed.worker, defaults.worker),
+        max_turns:
+          typeof parsed.max_turns === 'number' && Number.isFinite(parsed.max_turns)
+            ? Math.max(1, Math.min(100, Math.round(parsed.max_turns)))
+            : defaults.max_turns,
       };
     } catch {
       return defaults;
@@ -266,10 +484,10 @@ export class WorkspaceAndConfigStore {
   saveLLMConfig(next: Partial<PersistedLLMConfig>): PersistedLLMConfig {
     const current = this.getLLMConfig();
     const merged: PersistedLLMConfig = {
-      primary: { ...current.primary, ...(next.primary || {}) },
-      worker: { ...current.worker, ...(next.worker || {}) },
+      primary: normalizeRoleConfig(next.primary, current.primary),
+      worker: normalizeRoleConfig(next.worker, current.worker),
       max_turns:
-        typeof next.max_turns === 'number'
+        typeof next.max_turns === 'number' && Number.isFinite(next.max_turns)
           ? Math.max(1, Math.min(100, Math.round(next.max_turns)))
           : current.max_turns,
     };

@@ -125,7 +125,7 @@ def classify_tool_call(
     is_mcp_tool: bool = False,
 ) -> ToolClassification:
     """Centrally classify any tool call as SAFE or SENSITIVE."""
-    args = arguments or {}
+    args = normalize_tool_arguments(tool_name, arguments or {})
     normalized = tool_name.strip().lower()
 
     if normalized == "bash_exec":
@@ -188,6 +188,45 @@ def classify_tool_call(
     )
 
 
+_BUILTIN_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "bash_exec": {"cmd": "command", "script": "command"},
+    "read_file": {"file_path": "path", "filepath": "path", "filename": "path"},
+    "write_file": {"file_path": "path", "filepath": "path", "filename": "path", "text": "content"},
+    "edit_file": {
+        "file_path": "path",
+        "filepath": "path",
+        "filename": "path",
+        "old_str": "old_text",
+        "new_str": "new_text",
+        "old_string": "old_text",
+        "new_string": "new_text",
+    },
+    "list_dir": {"dir_path": "path", "directory": "path", "folder": "path"},
+    "load_skill": {"skill": "name", "skill_name": "name"},
+}
+
+
+def normalize_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
+    """Normalize JSON-string args or common LLM parameter aliases for built-in tools."""
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                arguments = parsed
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(arguments, dict):
+        return {}
+    aliases = _BUILTIN_ARG_ALIASES.get(tool_name.strip().lower())
+    if not aliases:
+        return dict(arguments)
+    normalized = dict(arguments)
+    for alias, canonical in aliases.items():
+        if alias in normalized and canonical not in normalized:
+            normalized[canonical] = normalized.pop(alias)
+    return normalized
+
+
 def validate_tool_arguments(
     tool_obj: BaseTool | None,
     arguments: Any,
@@ -198,13 +237,14 @@ def validate_tool_arguments(
     if tool_obj is None:
         return dict(arguments), None
 
+    normalized_args = normalize_tool_arguments(tool_obj.name, arguments)
     args_schema = getattr(tool_obj, "args_schema", None)
     if args_schema is None:
-        return dict(arguments), None
+        return normalized_args, None
 
     if hasattr(args_schema, "model_validate"):
         try:
-            validated = args_schema.model_validate(arguments)
+            validated = args_schema.model_validate(normalized_args)
             return validated.model_dump(), None
         except ValidationError as exc:
             return None, f"Invalid arguments for '{tool_obj.name}': {exc}"
@@ -212,19 +252,19 @@ def validate_tool_arguments(
         required_fields = args_schema.get("required", [])
         properties = args_schema.get("properties", {})
         if isinstance(required_fields, list):
-            missing = [f for f in required_fields if f not in arguments]
+            missing = [f for f in required_fields if f not in normalized_args]
             if missing:
                 return (
                     None,
                     f"Missing required arguments for '{tool_obj.name}': {', '.join(missing)}",
                 )
         if isinstance(properties, dict) and args_schema.get("additionalProperties") is False:
-            extra = [k for k in arguments if k not in properties]
+            extra = [k for k in normalized_args if k not in properties]
             if extra:
                 return None, f"Unexpected arguments for '{tool_obj.name}': {', '.join(extra)}"
-        return dict(arguments), None
+        return normalized_args, None
 
-    return dict(arguments), None
+    return normalized_args, None
 
 
 def _parse_human_response(raw_response: Any) -> tuple[str, dict[str, Any] | None, str]:

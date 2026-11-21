@@ -257,3 +257,64 @@ async def test_web_fetch_clean_markdown_and_ssrf_protection() -> None:
     # Loopback SSRF rejected by default
     with pytest.raises(SandboxSecurityError):
         await fetch_webpage_markdown("http://127.0.0.1:5678/healthz")
+
+
+@pytest.mark.asyncio
+async def test_local_sandbox_node_venv_path_rewrite_and_env_scrubbing(
+    tmp_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Node/V8 does not OOM under sandbox limits, venv Python stays on PATH, and /workspace rewriting is boundary-safe."""
+    import shutil
+    from agent_core.sandbox import rewrite_workspace_paths_in_command
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret-test-999")
+    monkeypatch.setenv("VAULT_MASTER_KEY", "master-secret-test-999")
+
+    cfg = SandboxConfig(workspace_dir=tmp_workspace, backend="local_isolated", timeout_seconds=10)
+    mgr = SandboxManager(cfg)
+
+    # 1. Node.js (V8) runs without RLIMIT_AS CodeRange OOM crash if installed
+    if shutil.which("node"):
+        node_res = await mgr.exec_command("node -e 'console.log(21 * 2)'")
+        assert node_res.exit_code == 0, f"node failed: {node_res.stderr}"
+        assert node_res.stdout.strip() == "42"
+
+    # 2. Active virtualenv Python (with pytest installed) stays on PATH under non-login bash -c
+    py_res = await mgr.exec_command("python3 -c 'import pytest; print(pytest.__version__)'")
+    assert py_res.exit_code == 0, f"venv python failed: {py_res.stderr}"
+    assert py_res.stdout.strip()
+
+    # 3. Boundary-aware /workspace rewriting never corrupts URLs, /workspaces, or already-resolved paths
+    ws_str = str(tmp_workspace.resolve())
+    assert rewrite_workspace_paths_in_command("ls /workspace/app.py", tmp_workspace) == f"ls {ws_str}/app.py"
+    assert (
+        rewrite_workspace_paths_in_command(f"cat {ws_str}/app.py", tmp_workspace)
+        == f"cat {ws_str}/app.py"
+    )
+    assert (
+        rewrite_workspace_paths_in_command("curl https://example.com/workspace/v1", tmp_workspace)
+        == "curl https://example.com/workspace/v1"
+    )
+    assert rewrite_workspace_paths_in_command("echo /workspaces/demo", tmp_workspace) == "echo /workspaces/demo"
+
+    # 4. Already-resolved host path inside workspace is accepted by resolve_workspace_path
+    mgr.write_file("/workspace/lines.txt", "line1\nline2\nline3\nline4\n")
+    assert mgr.read_file(f"{ws_str}/lines.txt", start_line=2, end_line=3) == "line2\nline3\n"
+
+    # 5. Internal .logs/ is hidden at workspace root by default
+    entries = mgr.list_dir("/workspace")
+    assert "lines.txt" in entries
+    assert ".logs/" not in entries
+
+    # 6. Sensitive provider & vault secrets are stripped from subprocess env, and ../.env is blocked
+    env_res = await mgr.exec_command("env")
+    assert "NVIDIA_API_KEY" not in env_res.stdout
+    assert "VAULT_MASTER_KEY" not in env_res.stdout
+    with pytest.raises(SandboxSecurityError):
+        await mgr.exec_command("cat ../.env")
+    # Non-secret .env.example filename should not false-positive
+    ex_res = await mgr.exec_command("echo .env.example")
+    assert ex_res.exit_code == 0
+    assert ".env.example" in ex_res.stdout
+

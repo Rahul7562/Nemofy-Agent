@@ -6,7 +6,7 @@ import { LoginGate } from './components/LoginGate.tsx';
 import { NemofyLogo } from './components/NemofyLogo.tsx';
 import { SettingsView } from './components/SettingsView.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
-import { checkAuthSession, fetchLLMSettings, logoutSession } from './lib/apiClient.ts';
+import { checkAuthSession, fetchLLMSettings, logoutSession, saveLLMSettings } from './lib/apiClient.ts';
 import type { NavSection, PersistedLLMConfig, SettingsTab, ThemeMode } from './types/agent.ts';
 
 function getInitialTheme(): ThemeMode {
@@ -82,6 +82,24 @@ export function App() {
     setActiveSection('chat');
   }
 
+  async function handlePrimaryThinkingChange(nextEffort: string) {
+    if (!llmConfig) return;
+    const updated: PersistedLLMConfig = {
+      ...llmConfig,
+      primary: {
+        ...llmConfig.primary,
+        reasoning_effort: nextEffort,
+      },
+    };
+    setLlmConfig(updated);
+    try {
+      const saved = await saveLLMSettings(updated);
+      setLlmConfig(saved.config);
+    } catch {
+      // Keep local optimistic selection; sendChatMessage still sends explicit reasoningEffort
+    }
+  }
+
   if (!authChecked) {
     return (
       <div className="h-screen flex items-center justify-center bg-[var(--paper)] text-[var(--ink-soft)]">
@@ -105,10 +123,6 @@ export function App() {
       />
     );
   }
-
-  const primaryModelLabel = llmConfig
-    ? `${llmConfig.primary.model.split('/').pop() || llmConfig.primary.model}`
-    : undefined;
 
   return (
     <div className="h-screen flex flex-col lg:flex-row bg-[var(--paper)] text-[var(--ink)] overflow-hidden">
@@ -142,7 +156,6 @@ export function App() {
         onLogout={() => void handleLogout()}
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
-        primaryModelLabel={primaryModelLabel}
       />
 
       {/* Active Workspace View */}
@@ -150,6 +163,7 @@ export function App() {
         {activeSection === 'chat' && (
           <ChatView
             llmConfig={llmConfig}
+            onPrimaryThinkingChange={(lvl) => void handlePrimaryThinkingChange(lvl)}
             onOpenLLMSettings={() => {
               setSettingsTab('llm');
               setActiveSection('settings');

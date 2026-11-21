@@ -19,7 +19,6 @@ interface SidebarProps {
   onLogout: () => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
-  primaryModelLabel?: string;
 }
 
 const NAV_ITEMS: Array<{
@@ -31,13 +30,13 @@ const NAV_ITEMS: Array<{
   {
     id: 'chat',
     label: 'Chat',
-    description: 'Autonomous agent console',
+    description: 'Chat with Nemo',
     icon: MessageSquare,
   },
   {
     id: 'filesystem',
     label: 'Filesystem',
-    description: 'Sandbox /workspace files',
+    description: 'Workspace /workspace files',
     icon: FolderTree,
   },
   {
@@ -57,7 +56,6 @@ export function Sidebar({
   onLogout,
   mobileOpen,
   onCloseMobile,
-  primaryModelLabel,
 }: SidebarProps) {
   const sidebarContent = (
     <div className="flex flex-col h-full bg-[var(--paper-sunk)] border-r border-[var(--rule)] w-[260px] shrink-0">
@@ -69,11 +67,6 @@ export function Sidebar({
             <div className="font-display font-semibold text-[15px] tracking-tight text-[var(--ink)] truncate">
               Nemofy Agent
             </div>
-            {primaryModelLabel && (
-              <div className="text-[11px] font-mono text-[var(--ink-faint)] truncate">
-                {primaryModelLabel}
-              </div>
-            )}
           </div>
         </div>
         <button

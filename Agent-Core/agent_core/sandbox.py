@@ -9,6 +9,7 @@ import re
 import resource
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -21,8 +22,19 @@ SENSITIVE_ENV_PREFIXES = (
     "RIVER_AI",
     "OPENAI_",
     "OPENROUTER_",
+    "NVIDIA_",
     "ANTHROPIC_",
     "GEMINI_",
+    "DEEPSEEK_",
+    "GROQ_",
+    "TOGETHER_",
+    "FIREWORKS_",
+    "MISTRAL_",
+    "XAI_",
+    "PERPLEXITY_",
+    "VAULT_",
+    "PRIMARY_API",
+    "WORKER_API",
     "AGENT_API_TOKEN",
     "AWS_",
     "GCP_",
@@ -33,8 +45,18 @@ _LOCAL_ESCAPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"/var/run/docker\.sock", re.IGNORECASE),
     re.compile(r"/etc/(?:shadow|passwd|sudoers)", re.IGNORECASE),
     re.compile(r"/proc/\d+/(?:environ|mem|root)", re.IGNORECASE),
-    re.compile(r"(?:^|[\s;|&`\"'])\.?\.env(?:\b|$)", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`\"'/])\.env(?=$|[\s;|&`\"'])", re.IGNORECASE),
 )
+
+_WORKSPACE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_./:-])/workspace(?=/|[\s\"'`;|&<>)]|$)"
+)
+
+
+def rewrite_workspace_paths_in_command(command: str, workspace_root: Path) -> str:
+    """Rewrite standalone /workspace path tokens to the host workspace path without mangling URLs or already-resolved paths."""
+    ws_str = str(workspace_root.resolve())
+    return _WORKSPACE_TOKEN_RE.sub(lambda _m: ws_str, command)
 
 
 class SandboxSecurityError(PermissionError):
@@ -121,18 +143,21 @@ def resolve_workspace_path(
     """Resolve and strictly confine a requested path inside ``workspace_root``."""
     ws_real = workspace_root.resolve()
     ws_real.mkdir(parents=True, exist_ok=True)
+    ws_prefix = str(ws_real)
 
     if "\x00" in requested_path:
         raise SandboxSecurityError("Null byte detected in path.")
 
     raw = requested_path.strip()
-    if not raw or raw in (".", "./", "/workspace", "/workspace/"):
+    if not raw or raw in (".", "./", "/workspace", "/workspace/", ws_prefix, ws_prefix + "/"):
         if allow_root:
             return ws_real
         raise SandboxSecurityError("A specific file path inside /workspace is required.")
 
     if raw.startswith("/workspace/"):
         rel_str = raw[len("/workspace/") :]
+    elif raw.startswith(ws_prefix + "/"):
+        rel_str = raw[len(ws_prefix) + 1 :]
     elif raw.startswith("/"):
         raise SandboxSecurityError(f"Access denied: absolute path {raw!r} is outside /workspace.")
     else:
@@ -191,15 +216,31 @@ def _parse_memory_bytes(spec: str) -> int:
 
 
 def _sanitized_sandbox_env(workspace_root: Path) -> dict[str, str]:
-    """Return a minimal subprocess environment stripped of host secrets."""
+    """Return a minimal subprocess environment stripped of host secrets while keeping active Python venv on PATH."""
     safe: dict[str, str] = {}
     for k, v in os.environ.items():
         upper = k.upper()
         if any(upper.startswith(prefix) for prefix in SENSITIVE_ENV_PREFIXES):
             continue
-        if any(tok in upper for tok in ("SECRET", "TOKEN", "PASSWORD", "API_KEY")):
+        if any(
+            tok in upper
+            for tok in ("SECRET", "TOKEN", "PASSWORD", "API_KEY", "MASTER_KEY", "PRIVATE_KEY")
+        ):
             continue
         safe[k] = v
+
+    # Ensure the active Python interpreter's bin dir (e.g. .venv/bin) is first on PATH.
+    # Avoid .resolve() on sys.executable because venv binaries symlink to /usr/bin/python3.
+    py_bin = os.path.abspath(os.path.dirname(sys.executable))
+    existing_path = safe.get("PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    path_parts = [p for p in existing_path.split(os.pathsep) if p]
+    if py_bin not in path_parts:
+        safe["PATH"] = os.pathsep.join([py_bin, *path_parts])
+    else:
+        safe["PATH"] = existing_path
+    if sys.prefix != sys.base_prefix:
+        safe["VIRTUAL_ENV"] = os.path.abspath(sys.prefix)
+
     safe["HOME"] = str(workspace_root)
     safe["WORKSPACE"] = str(workspace_root)
     safe["PWD"] = str(workspace_root)
@@ -449,19 +490,23 @@ class SandboxManager:
                 resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
             except (ValueError, OSError):
                 pass
+            # Use RLIMIT_DATA (heap/data segment) instead of RLIMIT_AS (virtual address space)
+            # because V8/Node.js, Go, OpenBLAS, and modern runtimes reserve multi-GB virtual
+            # address ranges at startup even while using minimal physical RAM.
             try:
-                soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+                _soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
                 target = max(mem_bytes, 512 * 1024 * 1024)
                 if hard == resource.RLIM_INFINITY or target <= hard:
-                    resource.setrlimit(resource.RLIMIT_AS, (target, hard))
+                    resource.setrlimit(resource.RLIMIT_DATA, (target, hard))
             except (ValueError, OSError):
                 pass
 
-        rewritten_cmd = command.replace("/workspace", str(ws))
+        rewritten_cmd = rewrite_workspace_paths_in_command(command, ws)
 
+        # Use non-login `bash -c` so /etc/profile does not overwrite our curated PATH (.venv/bin).
         proc = await asyncio.create_subprocess_exec(
             "bash",
-            "-lc",
+            "-c",
             rewritten_cmd,
             cwd=str(ws),
             env=env,
@@ -500,14 +545,30 @@ class SandboxManager:
                 session_id=session_id,
             )
 
-    def read_file(self, path: str, *, session_id: str = "default") -> str:
+    def read_file(
+        self,
+        path: str,
+        *,
+        session_id: str = "default",
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         ws = self.get_session_workspace(session_id)
         resolved = resolve_workspace_path(path, ws)
         if not resolved.exists():
             raise FileNotFoundError(f"File not found: {path}")
         if resolved.is_dir():
             raise IsADirectoryError(f"Path is a directory, not a file: {path}")
-        return resolved.read_text(encoding="utf-8", errors="replace")
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+        if start_line is None and end_line is None:
+            return text
+        lines = text.splitlines(keepends=True)
+        total = len(lines)
+        s = max(1, int(start_line)) if start_line is not None else 1
+        e = min(total, int(end_line)) if end_line is not None else total
+        if s > total:
+            return ""
+        return "".join(lines[s - 1 : e])
 
     def write_file(self, path: str, content: str, *, session_id: str = "default") -> str:
         ws = self.get_session_workspace(session_id)
@@ -545,15 +606,24 @@ class SandboxManager:
         vpath = to_virtual_workspace_path(resolved, ws)
         return f"Updated {vpath} (replaced 1 occurrence)."
 
-    def list_dir(self, path: str = "/workspace", *, session_id: str = "default") -> list[str]:
+    def list_dir(
+        self,
+        path: str = "/workspace",
+        *,
+        session_id: str = "default",
+        include_internal: bool = False,
+    ) -> list[str]:
         ws = self.get_session_workspace(session_id)
         resolved = resolve_workspace_path(path, ws, allow_root=True)
         if not resolved.exists():
             raise FileNotFoundError(f"Directory not found: {path}")
         if not resolved.is_dir():
             raise NotADirectoryError(f"Path is not a directory: {path}")
+        is_ws_root = resolved == ws.resolve()
         entries: list[str] = []
         for entry in sorted(resolved.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
+            if is_ws_root and not include_internal and entry.name == ".logs":
+                continue
             suffix = "/" if entry.is_dir() else ""
             entries.append(f"{entry.name}{suffix}")
         return entries

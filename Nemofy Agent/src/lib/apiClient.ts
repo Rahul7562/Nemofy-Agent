@@ -3,9 +3,12 @@ import type {
   AuthSession,
   ChatMessage,
   ChatThread,
+  LiveAgentActivity,
   MCPServerItem,
   PersistedLLMConfig,
+  ProfileVaultSummary,
   ProviderAvailability,
+  ProviderModelsResponse,
   SkillDocument,
   WorkspaceNode,
 } from '../types/agent.ts';
@@ -14,7 +17,7 @@ import {
   DEFAULT_STANDALONE_CREDENTIAL_DIGEST,
   hashStandaloneCredential,
 } from './authValidation.ts';
-import { LLM_PROVIDER_PRESETS } from './llmPresets.ts';
+import { LLM_PROVIDER_PRESETS, getProviderPreset } from './llmPresets.ts';
 
 const SESSION_TOKEN_KEY = 'nemofy_session_token';
 const STANDALONE_DIGEST_KEY = 'nemofy_standalone_digest';
@@ -27,6 +30,7 @@ const STANDALONE_SKILLS_KEY = 'nemofy_standalone_skills';
 const STANDALONE_MCPS_KEY = 'nemofy_standalone_mcps';
 
 let detectedStandaloneMode = false;
+let inMemorySessionToken: string | null = null;
 
 export function getRemoteBackendUrl(): string {
   const fromStorage =
@@ -55,15 +59,12 @@ export function isStandaloneMode(): boolean {
 }
 
 function getSessionToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  return window.sessionStorage.getItem(SESSION_TOKEN_KEY);
+  return inMemorySessionToken;
 }
 
 function setSessionToken(token: string | null): void {
-  if (typeof window === 'undefined') return;
-  if (token) {
-    window.sessionStorage.setItem(SESSION_TOKEN_KEY, token);
-  } else {
+  inMemorySessionToken = token || null;
+  if (typeof window !== 'undefined') {
     window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
   }
 }
@@ -80,6 +81,9 @@ async function apiFetch<T>(
   const headers = new Headers(options.headers || {});
   if (options.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
+  }
+  if (!headers.has('X-Requested-With')) {
+    headers.set('X-Requested-With', 'NemofyAgent');
   }
   const token = getSessionToken();
   if (token && !headers.has('Authorization')) {
@@ -311,6 +315,7 @@ export async function deleteThread(threadId: string): Promise<void> {
 export async function sendChatMessage(
   threadId: string,
   message: string,
+  reasoningEffort?: string,
 ): Promise<{ thread: ChatThread; message: ChatMessage; error?: string }> {
   if (detectedStandaloneMode) {
     const now = new Date().toISOString();
@@ -336,7 +341,7 @@ export async function sendChatMessage(
       id: `msg-${Date.now()}-a`,
       role: 'assistant',
       content:
-        'This frontend is currently running in static mode without a connected Agent-Core API server. Open Settings > Appearance & Connection to configure your hosted Agent-Core backend URL.',
+        'This frontend is currently running in static mode without a connected Agent-Core API server. Open Settings > Appearance & Runtime to configure your hosted Agent-Core backend URL.',
       timestamp: new Date().toISOString(),
       status: 'error',
     };
@@ -350,11 +355,72 @@ export async function sendChatMessage(
     '/api/chat/send',
     {
       method: 'POST',
-      body: JSON.stringify({ threadId, message }),
+      body: JSON.stringify({ threadId, message, reasoningEffort }),
     },
   );
   if (!res.ok) {
     throw new Error((res.data as { error?: string }).error || 'Failed to send prompt to Agent-Core.');
+  }
+  return res.data;
+}
+
+export async function startChatJob(
+  threadId: string,
+  message: string,
+  reasoningEffort?: string,
+): Promise<{
+  jobId: string | null;
+  thread: ChatThread;
+  activity?: LiveAgentActivity;
+  message?: ChatMessage;
+  error?: string;
+}> {
+  if (detectedStandaloneMode) {
+    const fallback = await sendChatMessage(threadId, message, reasoningEffort);
+    return {
+      jobId: null,
+      thread: fallback.thread,
+      message: fallback.message,
+      error: fallback.error,
+    };
+  }
+
+  const res = await apiFetch<{
+    jobId: string | null;
+    thread: ChatThread;
+    activity?: LiveAgentActivity;
+    message?: ChatMessage;
+    error?: string;
+  }>('/api/chat/jobs/start', {
+    method: 'POST',
+    body: JSON.stringify({ threadId, message, reasoningEffort }),
+  });
+
+  if (!res.ok) {
+    throw new Error((res.data as { error?: string }).error || 'Failed to start agent task.');
+  }
+  return res.data;
+}
+
+export async function pollChatJob(
+  jobId: string,
+  waitMs = 650,
+): Promise<{
+  done: boolean;
+  activity: LiveAgentActivity;
+  thread?: ChatThread | null;
+  message?: ChatMessage;
+}> {
+  const res = await apiFetch<{
+    done: boolean;
+    activity: LiveAgentActivity;
+    thread?: ChatThread | null;
+    message?: ChatMessage;
+    error?: string;
+  }>(`/api/chat/jobs/${encodeURIComponent(jobId)}?wait_ms=${waitMs}`);
+
+  if (!res.ok) {
+    throw new Error(res.data.error || 'Failed to poll agent progress.');
   }
   return res.data;
 }
@@ -465,6 +531,7 @@ export async function deleteWorkspaceEntry(targetPath: string): Promise<void> {
 export async function fetchLLMSettings(): Promise<{
   config: PersistedLLMConfig;
   providers: Record<string, ProviderAvailability>;
+  vault?: ProfileVaultSummary;
 }> {
   if (detectedStandaloneMode) {
     const providers: Record<string, ProviderAvailability> = {};
@@ -472,18 +539,27 @@ export async function fetchLLMSettings(): Promise<{
       providers[p.id] = {
         base_url: p.baseUrl,
         env_keys: p.envVars,
+        primary_env_var: p.envVars[0] || 'PRIMARY_API_KEY',
         api_key_configured: !p.requiresApiKey,
+        masked_key: null,
         requires_api_key: p.requiresApiKey,
       };
     }
     return {
       config: readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig()),
       providers,
+      vault: {
+        username: DEFAULT_ADMIN_USERNAME,
+        encrypted: false,
+        algorithm: 'standalone',
+        entries: [],
+      },
     };
   }
   const res = await apiFetch<{
     config: PersistedLLMConfig;
     providers: Record<string, ProviderAvailability>;
+    vault?: ProfileVaultSummary;
   }>('/api/settings/llm');
   if (!res.ok) throw new Error('Unable to load LLM settings.');
   return res.data;
@@ -491,7 +567,14 @@ export async function fetchLLMSettings(): Promise<{
 
 export async function saveLLMSettings(
   config: PersistedLLMConfig,
-): Promise<{ config: PersistedLLMConfig; providers: Record<string, ProviderAvailability> }> {
+  apiKeys?: { primary?: string; worker?: string },
+): Promise<{
+  config: PersistedLLMConfig;
+  providers: Record<string, ProviderAvailability>;
+  savedEnvKeys?: string[];
+  vault?: ProfileVaultSummary;
+  syncWarning?: string | null;
+}> {
   if (detectedStandaloneMode) {
     writeLocalJson(STANDALONE_LLM_KEY, config);
     return fetchLLMSettings();
@@ -499,18 +582,125 @@ export async function saveLLMSettings(
   const res = await apiFetch<{
     config: PersistedLLMConfig;
     providers: Record<string, ProviderAvailability>;
+    savedEnvKeys?: string[];
+    vault?: ProfileVaultSummary;
+    syncWarning?: string | null;
     error?: string;
   }>('/api/settings/llm', {
     method: 'PUT',
-    body: JSON.stringify(config),
+    body: JSON.stringify({
+      ...config,
+      api_keys: apiKeys,
+    }),
   });
   if (!res.ok) throw new Error(res.data.error || 'Unable to save LLM settings.');
+  return res.data;
+}
+
+export async function saveProfileVaultKey(params: {
+  provider?: string;
+  env_var?: string;
+  api_key: string;
+}): Promise<{
+  ok: boolean;
+  savedKey: string;
+  vault: ProfileVaultSummary;
+  providers: Record<string, ProviderAvailability>;
+}> {
+  if (detectedStandaloneMode) {
+    throw new Error('Encrypted profile key vault requires a connected Nemofy Agent server.');
+  }
+  const res = await apiFetch<{
+    ok: boolean;
+    savedKey: string;
+    vault: ProfileVaultSummary;
+    providers: Record<string, ProviderAvailability>;
+    error?: string;
+  }>('/api/settings/vault', {
+    method: 'PUT',
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) throw new Error(res.data.error || 'Unable to save API key to profile vault.');
+  return res.data;
+}
+
+export async function deleteProfileVaultKey(envVar: string): Promise<{
+  ok: boolean;
+  deleted: boolean;
+  vault: ProfileVaultSummary;
+  providers: Record<string, ProviderAvailability>;
+}> {
+  if (detectedStandaloneMode) {
+    throw new Error('Encrypted profile key vault requires a connected Nemofy Agent server.');
+  }
+  const res = await apiFetch<{
+    ok: boolean;
+    deleted: boolean;
+    vault: ProfileVaultSummary;
+    providers: Record<string, ProviderAvailability>;
+    error?: string;
+  }>(`/api/settings/vault/${encodeURIComponent(envVar)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(res.data.error || 'Unable to remove API key from profile vault.');
+  return res.data;
+}
+
+export async function fetchProviderModels(params: {
+  provider: string;
+  base_url?: string;
+  api_key?: string;
+  role?: 'primary' | 'worker';
+}): Promise<ProviderModelsResponse> {
+  if (detectedStandaloneMode) {
+    const preset = getProviderPreset(params.provider);
+    const models = (preset?.defaultModels || []).map((id) => ({
+      id,
+      is_free: id.toLowerCase().endsWith(':free'),
+      source: 'preset' as const,
+    }));
+    return {
+      ok: true,
+      provider: params.provider,
+      base_url: params.base_url || preset?.baseUrl || '',
+      source: 'preset',
+      models,
+      count: models.length,
+      error: null,
+    };
+  }
+
+  const res = await apiFetch<ProviderModelsResponse>('/api/settings/models', {
+    method: 'POST',
+    body: JSON.stringify({
+      provider: params.provider,
+      base_url: params.base_url?.trim() || undefined,
+      api_key: params.api_key?.trim() || undefined,
+      role: params.role || 'primary',
+    }),
+  });
+
+  if (!res.ok || !res.data || !Array.isArray(res.data.models)) {
+    return {
+      ok: false,
+      provider: params.provider,
+      base_url: params.base_url || '',
+      source: 'error',
+      models: [],
+      count: 0,
+      error:
+        (res.data as { error?: string } | undefined)?.error ||
+        'Unable to query live models from this provider.',
+    };
+  }
+
   return res.data;
 }
 
 export async function probeLLMModel(
   role: 'primary' | 'worker',
   override: PersistedLLMConfig['primary'],
+  apiKey?: string,
 ): Promise<Record<string, unknown>> {
   if (detectedStandaloneMode) {
     return {
@@ -520,7 +710,7 @@ export async function probeLLMModel(
   }
   const res = await apiFetch<Record<string, unknown>>('/api/settings/probe', {
     method: 'POST',
-    body: JSON.stringify({ role, override }),
+    body: JSON.stringify({ role, override, apiKey }),
   });
   return res.data;
 }

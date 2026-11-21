@@ -14,9 +14,33 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-from agent_core.guardrails import execute_tool_with_guardrails
+from agent_core.guardrails import execute_tool_with_guardrails, normalize_tool_arguments
 from agent_core.jobs import emit_progress
 from agent_core.state import compact_tool_output
+
+import re
+
+_WORKER_THINK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.IGNORECASE)
+
+
+def _extract_worker_text(msg: Any) -> str:
+    raw = getattr(msg, "content", "")
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = str(item.get("type") or "").lower()
+                if t in ("thinking", "reasoning"):
+                    continue
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        text = "\n".join(parts)
+    else:
+        text = str(raw or "")
+    return _WORKER_THINK_RE.sub("", text).strip()
+
 
 logger = logging.getLogger(__name__)
 
@@ -162,14 +186,76 @@ async def run_isolated_subagent(
         else worker_model
     )
 
+    async def _invoke_worker_resilient(prompt_msgs: list[BaseMessage]) -> AIMessage:
+        try:
+            res = await bound_model.ainvoke(prompt_msgs)
+        except GraphInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            err_lower = str(exc).lower()
+            extra_body = getattr(worker_model, "extra_body", None)
+            if (
+                isinstance(extra_body, dict)
+                and "reasoning_effort" in extra_body
+                and ("reasoning" in err_lower or "400" in err_lower or "invalid_request" in err_lower)
+                and hasattr(worker_model, "model_copy")
+            ):
+                stripped = {k: v for k, v in extra_body.items() if k != "reasoning_effort"}
+                fb = worker_model.model_copy(update={"extra_body": stripped or None})
+                fb_bound = (
+                    fb.bind_tools(list(permitted_tools.values()))
+                    if permitted_tools and hasattr(fb, "bind_tools")
+                    else fb
+                )
+                res = await fb_bound.ainvoke(prompt_msgs)
+            else:
+                raise
+        return res if isinstance(res, AIMessage) else AIMessage(content=str(getattr(res, "content", "") or ""))
+
     async def worker_reason(state: WorkerState) -> dict[str, Any]:
         next_turn = state["turn_count"] + 1
         emit_progress(
             "subagent_reason",
             detail=f"Sub-agent '{normalized_role}' reasoning (worker turn {next_turn})",
         )
-        response = await bound_model.ainvoke(state["messages"])
-        content_text = str(getattr(response, "content", "") or "")
+        response = await _invoke_worker_resilient(state["messages"])
+        content_text = _extract_worker_text(response)
+        tcs = list(getattr(response, "tool_calls", None) or [])
+        inv_tcs = list(getattr(response, "invalid_tool_calls", None) or [])
+        finish_reason = str(
+            (getattr(response, "response_metadata", None) or {}).get("finish_reason") or ""
+        ).lower()
+
+        if not tcs and (inv_tcs or not content_text):
+            nudge = (
+                "Your previous output truncated or produced invalid tool JSON. "
+                "Keep reasoning concise and emit either a smaller valid tool call or your final JSON report now."
+                if (finish_reason == "length" or inv_tcs)
+                else "Your previous output was empty. Please call the next tool or return your final JSON report now."
+            )
+            try:
+                response = await _invoke_worker_resilient(
+                    [*state["messages"], HumanMessage(content=nudge)]
+                )
+                content_text = _extract_worker_text(response)
+            except GraphInterrupt:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Strip stale additional_kwargs.tool_calls if no valid tool_calls exist
+        if not getattr(response, "tool_calls", None):
+            extra = dict(getattr(response, "additional_kwargs", None) or {})
+            if "tool_calls" in extra or "function_call" in extra:
+                extra.pop("tool_calls", None)
+                extra.pop("function_call", None)
+                response = AIMessage(
+                    content=response.content,
+                    additional_kwargs=extra,
+                    response_metadata=dict(getattr(response, "response_metadata", None) or {}),
+                    tool_calls=[],
+                )
+
         emit_progress(
             "subagent_reason_done",
             detail=f"Sub-agent '{normalized_role}' turn {next_turn} complete",
@@ -187,8 +273,8 @@ async def run_isolated_subagent(
         used = list(state["tools_used"])
 
         for tc in tool_calls:
-            tc_name = str(tc.get("name", ""))
-            tc_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            tc_name = str(tc.get("name", "")).strip()
+            tc_args = normalize_tool_arguments(tc_name, tc.get("args"))
             tc_id = str(tc.get("id", f"worker-tc-{len(tool_messages)}"))
 
             if tc_name not in permitted_tools:
@@ -211,12 +297,18 @@ async def run_isolated_subagent(
                 tool=tc_name,
                 detail=f"Sub-agent '{normalized_role}' running tool '{tc_name}'",
             )
-            raw_result, _audit = await execute_tool_with_guardrails(
-                tool_obj,
-                tc_args,
-                is_mcp_tool=(tc_name in mcp_names),
-                source=f"subagent:{normalized_role}",
-            )
+            try:
+                raw_result, _audit = await execute_tool_with_guardrails(
+                    tool_obj,
+                    tc_args,
+                    is_mcp_tool=(tc_name in mcp_names),
+                    source=f"subagent:{normalized_role}",
+                )
+            except GraphInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raw_result = f"ERROR: Tool '{tc_name}' raised {type(exc).__name__}: {exc}"
+
             emit_progress(
                 "subagent_tool_done",
                 tool=tc_name,

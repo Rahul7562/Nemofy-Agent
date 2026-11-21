@@ -1,4 +1,5 @@
-import type { PersistedLLMConfig, RoleLLMConfig } from '../types/agent.ts';
+import type { PersistedLLMConfig, ProviderModelOption, RoleLLMConfig } from '../types/agent.ts';
+import { getThinkingProfile, normalizeThinkingLevel } from './thinkingModes.ts';
 
 export interface ProviderPreset {
   id: string;
@@ -16,17 +17,32 @@ export const LLM_PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.river.ai/v1',
     defaultModels: [
       'deepseek-ai/DeepSeek-V4.1-Flash',
-      'deepseek-ai/DeepSeek-V3.2',
-      'openai/gpt-4o',
+      'GLM-5.3',
+      'moonshotai/Kimi-K3.1-Pro',
+      'Qwen/Qwen3.8-27B-FP8',
     ],
     envVars: ['RIVER_AI_API'],
+    requiresApiKey: true,
+  },
+  {
+    id: 'nvidia',
+    label: 'NVIDIA NIM',
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    defaultModels: [
+      'nvidia/nemotron-3-ultra-550b-a55b',
+      'nvidia/nemotron-3.5-super-vl-120b-a12b',
+      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+      'moonshotai/kimi-k3.1-pro',
+      'mistralai/mistral-large-4-1t-a52b',
+    ],
+    envVars: ['NVIDIA_API_KEY'],
     requiresApiKey: true,
   },
   {
     id: 'openai',
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
-    defaultModels: ['gpt-4o', 'gpt-4o-mini', 'o3-mini', 'gpt-4.1'],
+    defaultModels: ['gpt-5.2', 'o3-mini', 'gpt-4o', 'gpt-4.1'],
     envVars: ['OPENAI_API_KEY'],
     requiresApiKey: true,
   },
@@ -34,7 +50,7 @@ export const LLM_PROVIDER_PRESETS: ProviderPreset[] = [
     id: 'anthropic',
     label: 'Anthropic (OpenAI-Compat)',
     baseUrl: 'https://api.anthropic.com/v1',
-    defaultModels: ['claude-3-7-sonnet-20250219', 'claude-3-5-haiku-20241022'],
+    defaultModels: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-3-7-sonnet-20250219', 'claude-3-5-haiku-20241022'],
     envVars: ['ANTHROPIC_API_KEY'],
     requiresApiKey: true,
   },
@@ -51,9 +67,11 @@ export const LLM_PROVIDER_PRESETS: ProviderPreset[] = [
     label: 'OpenRouter',
     baseUrl: 'https://openrouter.ai/api/v1',
     defaultModels: [
-      'anthropic/claude-3.7-sonnet',
-      'openai/gpt-4o',
-      'deepseek/deepseek-chat-v3',
+      'anthropic/claude-opus-4.6',
+      'openai/gpt-5.2',
+      'deepseek/deepseek-r1',
+      'nvidia/nemotron-3-ultra-550b-a55b:free',
+      'x-ai/grok-3-mini',
     ],
     envVars: ['OPENROUTER_API_KEY'],
     requiresApiKey: true,
@@ -116,23 +134,120 @@ export const LLM_PROVIDER_PRESETS: ProviderPreset[] = [
   },
 ];
 
-export const REASONING_EFFORT_OPTIONS = ['off', 'low', 'medium', 'high'] as const;
+export const REASONING_EFFORT_OPTIONS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+const PROVIDER_ALIASES: Record<string, string> = {
+  river: 'river_ai',
+  google: 'gemini',
+  nvidia_nim: 'nvidia',
+  nim: 'nvidia',
+  local: 'ollama',
+};
+
+export function canonicalizeProviderId(providerId: string): string {
+  const clean = (providerId || '').trim().toLowerCase();
+  return PROVIDER_ALIASES[clean] || clean;
+}
 
 export function getProviderPreset(providerId: string): ProviderPreset | undefined {
-  return LLM_PROVIDER_PRESETS.find((p) => p.id === providerId.toLowerCase());
+  const canonical = canonicalizeProviderId(providerId);
+  return LLM_PROVIDER_PRESETS.find((p) => p.id === canonical);
 }
 
 export function applyProviderPreset(current: RoleLLMConfig, nextProviderId: string): RoleLLMConfig {
-  const preset = getProviderPreset(nextProviderId);
+  const canonicalNext = canonicalizeProviderId(nextProviderId);
+  const preset = getProviderPreset(canonicalNext);
   if (!preset) {
-    return { ...current, provider: nextProviderId };
+    return { ...current, provider: canonicalNext };
   }
+
+  const isSameProvider = canonicalizeProviderId(current.provider) === preset.id;
+  const knownPresetUrls = new Set(LLM_PROVIDER_PRESETS.map((p) => p.baseUrl).filter(Boolean));
+  const nextBaseUrl =
+    preset.id === 'custom'
+      ? knownPresetUrls.has(current.base_url.trim().replace(/\/+$/, ''))
+        ? ''
+        : current.base_url
+      : preset.baseUrl;
+
+  const nextModel = isSameProvider
+    ? current.model || preset.defaultModels[0] || ''
+    : preset.defaultModels[0] || '';
+
+  const profile = getThinkingProfile(preset.id, nextModel);
   return {
     ...current,
     provider: preset.id,
-    base_url: preset.baseUrl || current.base_url,
-    model: preset.defaultModels[0] || current.model,
+    base_url: nextBaseUrl,
+    model: nextModel,
+    reasoning_effort: normalizeThinkingLevel(profile, current.reasoning_effort),
   };
+}
+
+export function mergeProviderModels(
+  liveModels: ProviderModelOption[],
+  presetDefaultIds: string[],
+  currentModel?: string,
+): ProviderModelOption[] {
+  const seen = new Set<string>();
+  const out: ProviderModelOption[] = [];
+
+  for (const item of liveModels) {
+    const id = (item.id || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ ...item, id, source: item.source || 'live' });
+  }
+
+  // If live models were returned, keep them as the primary source and only append missing presets at the end if empty
+  if (out.length === 0) {
+    for (const id of presetDefaultIds) {
+      const clean = id.trim();
+      if (!clean || seen.has(clean)) continue;
+      seen.add(clean);
+      out.push({
+        id: clean,
+        is_free: clean.toLowerCase().endsWith(':free'),
+        source: 'preset',
+      });
+    }
+  }
+
+  const cur = (currentModel || '').trim();
+  if (cur && !seen.has(cur)) {
+    out.unshift({
+      id: cur,
+      is_free: cur.toLowerCase().endsWith(':free'),
+      source: 'custom',
+    });
+  }
+
+  return out;
+}
+
+export function filterProviderModels(
+  models: ProviderModelOption[],
+  query: string,
+): ProviderModelOption[] {
+  const clean = (query || '').trim().toLowerCase();
+  if (!clean) return models;
+  const tokens = clean.split(/\s+/).filter(Boolean);
+  return models.filter((m) => {
+    const haystack = `${m.id} ${m.name || ''} ${m.owned_by || ''} ${m.is_free ? 'free' : ''}`.toLowerCase();
+    return tokens.every((tok) => haystack.includes(tok));
+  });
+}
+
+export function formatContextLength(tokens?: number | null): string | null {
+  if (!tokens || !Number.isFinite(tokens) || tokens <= 0) return null;
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M ctx`;
+  }
+  if (tokens >= 1000) {
+    return `${Math.round(tokens / 1000)}k ctx`;
+  }
+  return `${tokens} ctx`;
 }
 
 export function validateLLMConfig(config: PersistedLLMConfig): { valid: boolean; error?: string } {

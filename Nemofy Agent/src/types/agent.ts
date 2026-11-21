@@ -7,6 +7,7 @@ export interface AuthSession {
   username?: string;
   updatedAt?: string;
   mode?: 'server' | 'standalone';
+  vaultKeysLoaded?: number;
 }
 
 export interface PlanStep {
@@ -25,6 +26,44 @@ export interface PendingApproval {
   [key: string]: unknown;
 }
 
+export interface ToolEventItem {
+  id: string;
+  tool: string;
+  args_summary?: string;
+  status: 'running' | 'ok' | 'error' | 'rejected';
+  output_summary?: string;
+  started_at?: string;
+  finished_at?: string | null;
+}
+
+export interface FileChangeItem {
+  kind: 'file' | 'dir';
+  action: 'created' | 'modified' | 'deleted';
+  path: string;
+  tool?: string;
+  timestamp?: string;
+}
+
+export interface ActivityFeedItem {
+  id: string;
+  phase: string;
+  text: string;
+  timestamp?: string;
+}
+
+export interface LiveAgentActivity {
+  jobId: string;
+  status: string;
+  currentPhase: string;
+  lastEvent: string;
+  elapsedSeconds: number;
+  turnCount: number;
+  thinking: string | null;
+  activityFeed?: ActivityFeedItem[];
+  toolEvents: ToolEventItem[];
+  fileChanges: FileChangeItem[];
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -34,9 +73,12 @@ export interface ChatMessage {
   activeSkills?: string[];
   subagentReports?: Array<Record<string, unknown>>;
   activeModels?: {
-    primary?: { provider?: string; model?: string };
-    worker?: { provider?: string; model?: string };
+    primary?: { provider?: string; model?: string; reasoning_effort?: string | null };
+    worker?: { provider?: string; model?: string; reasoning_effort?: string | null };
   };
+  thinking?: string | null;
+  toolEvents?: ToolEventItem[];
+  fileChanges?: FileChangeItem[];
   pendingApproval?: PendingApproval | null;
   status?: string;
 }
@@ -77,8 +119,46 @@ export interface PersistedLLMConfig {
 export interface ProviderAvailability {
   base_url: string;
   env_keys: string[];
+  primary_env_var: string;
   api_key_configured: boolean;
+  masked_key?: string | null;
   requires_api_key: boolean;
+  storage?: 'profile_vault' | 'env';
+}
+
+export interface ProfileVaultEntry {
+  env_var: string;
+  provider: string;
+  provider_label: string;
+  masked_key: string;
+  updated_at: string;
+}
+
+export interface ProfileVaultSummary {
+  username: string;
+  encrypted: boolean;
+  algorithm: string;
+  entries: ProfileVaultEntry[];
+}
+
+export interface ProviderModelOption {
+  id: string;
+  name?: string | null;
+  owned_by?: string | null;
+  context_length?: number | null;
+  is_free?: boolean;
+  source?: 'live' | 'preset' | 'custom';
+}
+
+export interface ProviderModelsResponse {
+  ok: boolean;
+  provider: string;
+  base_url: string;
+  api_key_configured?: boolean;
+  source: 'live' | 'preset' | 'error';
+  models: ProviderModelOption[];
+  count: number;
+  error?: string | null;
 }
 
 export interface SkillDocument {
@@ -104,6 +184,10 @@ export interface AgentHealthResponse {
     primary_model?: string;
     worker_model?: string;
     sandbox_backend?: string;
+    sandbox?: {
+      backend?: string;
+      workspace_dir?: string;
+    };
     skills_loaded?: string[];
     mcp?: Record<string, unknown>;
   } | null;
