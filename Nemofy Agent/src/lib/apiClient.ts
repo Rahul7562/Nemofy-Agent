@@ -368,6 +368,7 @@ export async function startChatJob(
   threadId: string,
   message: string,
   reasoningEffort?: string,
+  signal?: AbortSignal,
 ): Promise<{
   jobId: string | null;
   thread: ChatThread;
@@ -394,6 +395,7 @@ export async function startChatJob(
   }>('/api/chat/jobs/start', {
     method: 'POST',
     body: JSON.stringify({ threadId, message, reasoningEffort }),
+    signal,
   });
 
   if (!res.ok) {
@@ -405,6 +407,7 @@ export async function startChatJob(
 export async function pollChatJob(
   jobId: string,
   waitMs = 650,
+  signal?: AbortSignal,
 ): Promise<{
   done: boolean;
   activity: LiveAgentActivity;
@@ -417,10 +420,36 @@ export async function pollChatJob(
     thread?: ChatThread | null;
     message?: ChatMessage;
     error?: string;
-  }>(`/api/chat/jobs/${encodeURIComponent(jobId)}?wait_ms=${waitMs}`);
+  }>(`/api/chat/jobs/${encodeURIComponent(jobId)}?wait_ms=${waitMs}`, { signal });
 
   if (!res.ok) {
     throw new Error(res.data.error || 'Failed to poll agent progress.');
+  }
+  return res.data;
+}
+
+export async function cancelChatJob(
+  jobId: string,
+): Promise<{
+  ok: boolean;
+  activity?: LiveAgentActivity;
+  thread?: ChatThread | null;
+  message?: ChatMessage;
+}> {
+  if (detectedStandaloneMode) {
+    return { ok: true };
+  }
+  const res = await apiFetch<{
+    ok: boolean;
+    activity?: LiveAgentActivity;
+    thread?: ChatThread | null;
+    message?: ChatMessage;
+    error?: string;
+  }>(`/api/chat/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    return { ok: false };
   }
   return res.data;
 }

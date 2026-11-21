@@ -672,9 +672,11 @@ async function startServer(): Promise<void> {
         String(resultObj.final_response || '').trim() ||
         (activity.status === 'awaiting_approval'
           ? 'Execution paused for your approval before running a sensitive tool action.'
-          : errText
-            ? `Agent-Core could not complete this run: ${errText}`
-            : 'Task completed.');
+          : activity.status === 'cancelled'
+            ? 'Stopped by user.'
+            : errText
+              ? `Agent-Core could not complete this run: ${errText}`
+              : 'Task completed.');
 
       const assistantMsg: ChatMessageRecord = {
         id: `msg-${crypto.randomBytes(6).toString('hex')}`,
@@ -707,6 +709,54 @@ async function startServer(): Promise<void> {
     }
 
     res.json({ done: true, activity, thread: thread || null });
+  });
+
+  app.post('/api/chat/jobs/:jobId/cancel', requireSession, async (req, res) => {
+    const jobId = req.params.jobId;
+    const cancelResp = await callAgentCore(`/agent/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+      timeoutMs: 10_000,
+    });
+
+    const data = cancelResp.data || {};
+    const activity = extractActivityFromJobPayload(jobId, {
+      ...data,
+      status: data.status || 'cancelled',
+      current_phase: data.current_phase || 'cancelled',
+      last_event: data.last_event || 'Stopped by user.',
+    });
+
+    const jobMeta = activeChatJobs.get(jobId);
+    const targetThreadId = jobMeta?.threadId || String(data.thread_id || '');
+    const threads = store.listThreads();
+    const thread = threads.find((t) => t.id === targetThreadId);
+
+    if (jobMeta && !jobMeta.finalized && thread) {
+      jobMeta.finalized = true;
+      const replyNow = new Date().toISOString();
+      const assistantMsg: ChatMessageRecord = {
+        id: `msg-${crypto.randomBytes(6).toString('hex')}`,
+        role: 'assistant',
+        content: 'Stopped by user.',
+        timestamp: replyNow,
+        plan: [],
+        activeSkills: [],
+        subagentReports: [],
+        thinking: activity.thinking,
+        toolEvents: activity.toolEvents,
+        fileChanges: activity.fileChanges,
+        pendingApproval: null,
+        status: 'cancelled',
+      };
+      thread.messages.push(assistantMsg);
+      thread.pendingApproval = null;
+      thread.updatedAt = replyNow;
+      store.saveThreads(threads);
+      res.json({ ok: true, activity, thread, message: assistantMsg });
+      return;
+    }
+
+    res.json({ ok: true, activity, thread: thread || null });
   });
 
   app.post('/api/chat/resume', requireSession, async (req, res) => {

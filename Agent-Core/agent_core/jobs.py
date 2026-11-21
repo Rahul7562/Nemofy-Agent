@@ -321,7 +321,9 @@ class JobManager:
             except asyncio.CancelledError:
                 if job.status == "running":
                     job.status = "cancelled"
-                    job.error = "Job was cancelled."
+                    job.error = "Stopped by user."
+                    job.current_phase = "cancelled"
+                    job.last_event = "Stopped by user."
                     job.completed_at_mono = time.monotonic()
                 job.signal_update()
             except Exception as exc:  # noqa: BLE001
@@ -392,6 +394,8 @@ class JobManager:
             return True
         job.status = "cancelled"
         job.error = reason
+        job.current_phase = "cancelled"
+        job.last_event = reason[:240]
         job.completed_at_mono = time.monotonic()
         job.signal_update()
         if job._runner_task is not None and not job._runner_task.done():

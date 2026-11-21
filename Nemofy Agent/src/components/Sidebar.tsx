@@ -80,7 +80,7 @@ export function Sidebar({
       </div>
 
       {/* Primary Workspace Navigation */}
-      <nav aria-label="Primary" className="flex-1 p-3 space-y-1 overflow-y-auto">
+      <nav aria-label="Primary" className="flex-1 p-3 space-y-1 overflow-y-auto scrollbar-none">
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
           const active = activeSection === item.id;

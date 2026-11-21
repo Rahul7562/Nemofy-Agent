@@ -25,6 +25,7 @@ import {
   formatPhaseLabel,
   summarizeActivity,
 } from '../lib/activityUtils.ts';
+import { resolveScrollPinState } from '../lib/scrollUtils.ts';
 import type { FileChangeItem, LiveAgentActivity, ToolEventItem } from '../types/agent.ts';
 
 interface LiveActivityPanelProps {
@@ -149,6 +150,9 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
   const isLive = props.mode === 'live';
   const [completedExpanded, setCompletedExpanded] = useState(false);
   const thinkingScrollRef = useRef<HTMLDivElement>(null);
+  const isThinkingPinnedRef = useRef(true);
+  const lastThinkingScrollTopRef = useRef(0);
+  const liveJobId = isLive ? props.activity.jobId : null;
 
   const thinking = isLive ? props.activity.thinking : props.thinking;
   const activityFeed = isLive ? props.activity.activityFeed || [] : [];
@@ -157,12 +161,38 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
 
   const summary = summarizeActivity({ thinking, toolEvents, fileChanges });
 
-  // Keep live streamed thinking gently pinned to the latest reasoning lines
+  // Reset thinking scroll pin only when a brand-new live job begins
   useEffect(() => {
-    if (isLive && thinking && thinkingScrollRef.current) {
-      thinkingScrollRef.current.scrollTop = thinkingScrollRef.current.scrollHeight;
+    if (isLive) {
+      isThinkingPinnedRef.current = true;
+      lastThinkingScrollTopRef.current = 0;
+    }
+  }, [isLive, liveJobId]);
+
+  // Only follow streamed thinking while the user remains at the bottom
+  useEffect(() => {
+    const el = thinkingScrollRef.current;
+    if (isLive && thinking && el && isThinkingPinnedRef.current) {
+      el.scrollTop = el.scrollHeight;
+      lastThinkingScrollTopRef.current = el.scrollTop;
     }
   }, [isLive, thinking]);
+
+  function handleThinkingScroll() {
+    const el = thinkingScrollRef.current;
+    if (!el) return;
+    isThinkingPinnedRef.current = resolveScrollPinState(
+      {
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      },
+      lastThinkingScrollTopRef.current,
+      isThinkingPinnedRef.current,
+      24,
+    );
+    lastThinkingScrollTopRef.current = el.scrollTop;
+  }
 
   if (!isLive && !summary.hasAnyActivity) {
     return null;
@@ -325,8 +355,14 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                   {thinking && (
                     <div
                       ref={thinkingScrollRef}
+                      onScroll={handleThinkingScroll}
+                      onWheel={(e) => {
+                        if (e.deltaY < 0) {
+                          isThinkingPinnedRef.current = false;
+                        }
+                      }}
                       data-testid={isLive ? 'live-thinking-text' : 'completed-thinking-text'}
-                      className="text-xs text-[var(--ink-soft)] whitespace-pre-wrap leading-relaxed max-h-52 overflow-y-auto font-mono"
+                      className="text-xs text-[var(--ink-soft)] whitespace-pre-wrap leading-relaxed max-h-52 overflow-y-auto scrollbar-none font-mono"
                     >
                       {thinking}
                       {isActivelyThinking && (
@@ -406,7 +442,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                 )}
               </button>
               {props.prefs.showToolsSection && (
-                <ul className="px-3.5 pb-2 max-h-52 overflow-y-auto">
+                <ul className="px-3.5 pb-2 max-h-52 overflow-y-auto scrollbar-none">
                   {toolEvents.map((ev) => (
                     <ToolEventRow key={ev.id} item={ev} />
                   ))}
@@ -437,7 +473,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                 )}
               </button>
               {props.prefs.showFilesSection && (
-                <ul className="px-3.5 pb-2 max-h-52 overflow-y-auto divide-y divide-[var(--rule)]/50">
+                <ul className="px-3.5 pb-2 max-h-52 overflow-y-auto scrollbar-none divide-y divide-[var(--rule)]/50">
                   {fileChanges.map((ch, idx) => (
                     <FileChangeRow key={`${ch.kind}-${ch.action}-${ch.path}-${idx}`} item={ch} />
                   ))}

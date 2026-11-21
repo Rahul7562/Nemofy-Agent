@@ -46,6 +46,7 @@
   body,
   #root {
     height: 100%;
+    overflow: hidden;
     background-color: var(--paper);
     color: var(--ink);
     font-family: var(--font-body);
@@ -66,4 +67,13 @@
   .font-mono {
     font-family: var(--font-mono);
   }
+}
+
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
 }

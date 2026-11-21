@@ -698,7 +698,7 @@ export function SettingsView({
   }
 
   return (
-    <div className="h-full overflow-y-auto bg-[var(--paper)]">
+    <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-none bg-[var(--paper)]">
       <div className="max-w-5xl mx-auto px-5 sm:px-8 py-6 sm:py-8 space-y-6">
         {/* Header */}
         <div>
@@ -1180,7 +1180,7 @@ export function SettingsView({
                       rows={8}
                       value={skillDraftContent}
                       onChange={(e) => setSkillDraftContent(e.target.value)}
-                      className="w-full p-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                      className="w-full p-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)] scrollbar-none"
                     />
                   </div>
                   <div className="flex items-center justify-between gap-3">

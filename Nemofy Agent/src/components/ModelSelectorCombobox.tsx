@@ -315,7 +315,7 @@ export function ModelSelectorCombobox({
           </div>
 
           {/* Model Options List */}
-          <div className="max-h-64 overflow-y-auto divide-y divide-[var(--rule)]/50">
+          <div className="max-h-64 overflow-y-auto scrollbar-none divide-y divide-[var(--rule)]/50">
             {visibleOptions.length > 0 ? (
               visibleOptions.map((item, idx) => {
                 const isSelected = item.id === value;

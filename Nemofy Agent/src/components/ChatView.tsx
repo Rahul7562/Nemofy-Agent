@@ -9,17 +9,27 @@ import {
   ShieldAlert,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Trash2,
   X,
   Brain,
 } from 'lucide-react';
-import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type FormEvent,
+  type KeyboardEvent,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   type ActivityUserPrefs,
   readActivityPrefs,
   writeActivityPrefs,
 } from '../lib/activityUtils.ts';
 import {
+  cancelChatJob,
   createThread,
   deleteThread,
   listThreads,
@@ -27,6 +37,7 @@ import {
   resumeApproval,
   startChatJob,
 } from '../lib/apiClient.ts';
+import { computeAutoGrowHeight, resolveScrollPinState } from '../lib/scrollUtils.ts';
 import {
   type ThinkingLevel,
   formatThinkingBadge,
@@ -155,11 +166,15 @@ export function ChatView({
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [prompt, setPrompt] = useState('');
   const [sending, setSending] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [liveActivity, setLiveActivity] = useState<LiveAgentActivity | null>(null);
   const [activityPrefs, setActivityPrefs] = useState<ActivityUserPrefs>(() => readActivityPrefs());
   const [error, setError] = useState<string | null>(null);
 
   const pollCancelledRef = useRef(false);
+  const stopRequestedRef = useRef(false);
+  const activeJobIdRef = useRef<string | null>(null);
+  const activeAbortRef = useRef<AbortController | null>(null);
 
   // Adaptive Thinking Mode state (auto-adapts to active primary model capabilities)
   const primaryProvider = llmConfig?.primary.provider || 'river_ai';
@@ -179,7 +194,10 @@ export function ChatView({
   const [editedArgsJson, setEditedArgsJson] = useState('');
   const [resuming, setResuming] = useState(false);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const isPinnedToBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const activeThread = threads.find((t) => t.id === activeThreadId) || null;
 
@@ -195,6 +213,7 @@ export function ChatView({
     pollCancelledRef.current = false;
     return () => {
       pollCancelledRef.current = true;
+      activeAbortRef.current?.abort();
     };
   }, []);
 
@@ -269,8 +288,49 @@ export function ChatView({
     };
   }, []);
 
+  // Auto-expand chat composer vertically as the user types multi-sentence prompts
+  useLayoutEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const { heightPx, isCapped } = computeAutoGrowHeight(el.scrollHeight, 36, 220);
+    el.style.height = `${heightPx}px`;
+    el.style.overflowY = isCapped ? 'auto' : 'hidden';
+  }, [prompt]);
+
+  function scrollMessagesToBottom() {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
+  }
+
+  function handleMessagesScroll() {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    isPinnedToBottomRef.current = resolveScrollPinState(
+      {
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      },
+      lastScrollTopRef.current,
+      isPinnedToBottomRef.current,
+      48,
+    );
+    lastScrollTopRef.current = el.scrollTop;
+  }
+
+  // Re-pin cleanly when switching threads
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    isPinnedToBottomRef.current = true;
+    requestAnimationFrame(() => scrollMessagesToBottom());
+  }, [activeThreadId]);
+
+  // Follow new messages or activity ONLY when the user has not scrolled up
+  useEffect(() => {
+    if (!isPinnedToBottomRef.current) return;
+    scrollMessagesToBottom();
   }, [
     activeThread?.messages.length,
     sending,
@@ -304,16 +364,54 @@ export function ChatView({
     }
   }
 
+  async function handleStopGeneration() {
+    if (!sending || stopping) return;
+    stopRequestedRef.current = true;
+    setStopping(true);
+    activeAbortRef.current?.abort();
+
+    const jobId = activeJobIdRef.current;
+    if (jobId) {
+      try {
+        const res = await cancelChatJob(jobId);
+        if (res.thread) {
+          const stoppedThread = res.thread;
+          setThreads((prev) => {
+            const exists = prev.some((t) => t.id === stoppedThread.id);
+            if (exists) {
+              return prev.map((t) => (t.id === stoppedThread.id ? stoppedThread : t));
+            }
+            return [stoppedThread, ...prev];
+          });
+          setActiveThreadId(stoppedThread.id);
+        }
+      } catch {
+        // Ignore network errors while cancelling; UI still stops cleanly
+      }
+    }
+  }
+
   async function submitPrompt(textToSend: string) {
     const clean = textToSend.trim();
     if (!clean || sending) return;
     setError(null);
     setSending(true);
+    setStopping(false);
     setThinkingMenuOpen(false);
     setPrompt('');
 
+    stopRequestedRef.current = false;
+    activeJobIdRef.current = null;
+    const controller = new AbortController();
+    activeAbortRef.current = controller;
+
+    // User explicitly sent a new message: scroll once to show it
+    isPinnedToBottomRef.current = true;
+
     const optimisticId = `temp-${Date.now()}`;
     let targetId = activeThreadId;
+    let committedOnServer = false;
+
     try {
       const derivedTitle = cleanThreadTitle(clean) || 'New Agent Session';
       if (!targetId) {
@@ -364,7 +462,8 @@ export function ChatView({
         fileChanges: [],
       });
 
-      const started = await startChatJob(targetId, clean, effectiveThinking);
+      const started = await startChatJob(targetId, clean, effectiveThinking, controller.signal);
+      committedOnServer = true;
 
       // Commit the persisted user message from server right away
       setThreads((prev) => {
@@ -382,14 +481,25 @@ export function ChatView({
         return;
       }
 
+      activeJobIdRef.current = started.jobId;
+
+      if (stopRequestedRef.current) {
+        const stopped = await cancelChatJob(started.jobId);
+        if (stopped.thread) {
+          const stoppedThread = stopped.thread;
+          setThreads((prev) => prev.map((t) => (t.id === stoppedThread.id ? stoppedThread : t)));
+        }
+        return;
+      }
+
       if (started.activity) {
         setLiveActivity(started.activity);
       }
 
       // Live poll loop until terminal state (fast 300ms long-poll for live thinking deltas)
-      while (!pollCancelledRef.current) {
-        const polled = await pollChatJob(started.jobId, 300);
-        if (pollCancelledRef.current) break;
+      while (!pollCancelledRef.current && !stopRequestedRef.current) {
+        const polled = await pollChatJob(started.jobId, 300, controller.signal);
+        if (pollCancelledRef.current || stopRequestedRef.current) break;
 
         if (polled.activity) {
           setLiveActivity(polled.activity);
@@ -411,8 +521,28 @@ export function ChatView({
         }
       }
     } catch (err) {
+      const isAbort =
+        stopRequestedRef.current ||
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
+
+      if (isAbort) {
+        // User intentionally stopped the run — do not display an error banner
+        if (!committedOnServer && targetId) {
+          setThreads((prev) =>
+            prev.map((t) =>
+              t.id === targetId
+                ? { ...t, messages: t.messages.filter((m) => m.id !== optimisticId) }
+                : t,
+            ),
+          );
+          setPrompt(clean);
+        }
+        return;
+      }
+
       // Roll back optimistic message and restore draft so the user never loses input
-      if (targetId) {
+      if (!committedOnServer && targetId) {
         setThreads((prev) =>
           prev.map((t) =>
             t.id === targetId
@@ -420,11 +550,15 @@ export function ChatView({
               : t,
           ),
         );
+        setPrompt(clean);
       }
-      setPrompt(clean);
       setError(err instanceof Error ? err.message : 'Failed to execute task.');
     } finally {
+      activeJobIdRef.current = null;
+      activeAbortRef.current = null;
+      stopRequestedRef.current = false;
       setSending(false);
+      setStopping(false);
       setLiveActivity(null);
     }
   }
@@ -482,7 +616,7 @@ export function ChatView({
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+        <div className="flex-1 overflow-y-auto scrollbar-none p-2 space-y-1">
           {loadingThreads ? (
             <div className="p-4 text-xs text-[var(--ink-faint)]">Loading sessions...</div>
           ) : threads.length === 0 ? (
@@ -559,7 +693,16 @@ export function ChatView({
         </div>
 
         {/* Messages Scroll Pane */}
-        <div className="flex-1 overflow-y-auto px-5 sm:px-8 py-6">
+        <div
+          ref={messagesScrollRef}
+          onScroll={handleMessagesScroll}
+          onWheel={(e) => {
+            if (e.deltaY < 0) {
+              isPinnedToBottomRef.current = false;
+            }
+          }}
+          className="flex-1 overflow-y-auto scrollbar-none px-5 sm:px-8 py-6"
+        >
           {!activeThread || activeThread.messages.length === 0 ? (
             <div className="max-w-2xl mx-auto mt-8 sm:mt-16">
               <div className="inline-flex items-center gap-2 text-xs font-medium text-[var(--signal)] mb-3">
@@ -724,8 +867,6 @@ export function ChatView({
                   />
                 </div>
               )}
-
-              <div ref={messagesEndRef} />
             </div>
           )}
         </div>
@@ -750,6 +891,7 @@ export function ChatView({
                 Message Nemo
               </label>
               <textarea
+                ref={composerRef}
                 id="chat-composer"
                 rows={1}
                 value={prompt}
@@ -757,7 +899,7 @@ export function ChatView({
                 onKeyDown={handleTextareaKeyDown}
                 placeholder="Message Nemo — ask anything, build tables, charts, or code..."
                 disabled={sending}
-                className="flex-1 min-w-0 resize-none bg-transparent px-2.5 py-2 text-sm leading-5 text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none max-h-40"
+                className="flex-1 min-w-0 resize-none bg-transparent px-2.5 py-2 text-sm leading-5 text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none min-h-[36px] max-h-[220px] overflow-hidden scrollbar-none"
               />
 
               {/* Adaptive Model Thinking Mode Selector (just left of Send) */}
@@ -814,7 +956,7 @@ export function ChatView({
                     </div>
 
                     {thinkingProfile.supported ? (
-                      <div className="p-1.5 space-y-0.5 max-h-[420px] overflow-y-auto">
+                      <div className="p-1.5 space-y-0.5 max-h-[420px] overflow-y-auto scrollbar-none">
                         {thinkingProfile.options.map((opt) => {
                           const isSelected = selectedThinking === opt.value;
                           return (
@@ -869,15 +1011,29 @@ export function ChatView({
                 )}
               </div>
 
-              <button
-                type="submit"
-                disabled={sending || !prompt.trim()}
-                aria-label="Send message"
-                className="h-9 px-3.5 inline-flex items-center gap-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-45 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>Send</span>
-              </button>
+              {sending ? (
+                <button
+                  type="button"
+                  onClick={() => void handleStopGeneration()}
+                  disabled={stopping}
+                  aria-label="Stop generation"
+                  title="Stop running agent"
+                  className="h-9 px-3.5 inline-flex items-center gap-1.5 rounded-lg bg-[var(--flare)] hover:opacity-90 disabled:opacity-60 text-white text-xs font-semibold transition-opacity cursor-pointer shrink-0"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  <span>{stopping ? 'Stopping...' : 'Stop'}</span>
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!prompt.trim()}
+                  aria-label="Send message"
+                  className="h-9 px-3.5 inline-flex items-center gap-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-45 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Send</span>
+                </button>
+              )}
             </form>
           </div>
         </div>
