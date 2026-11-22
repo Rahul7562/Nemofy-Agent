@@ -19,7 +19,9 @@ from pydantic import BaseModel, Field
 
 PlanStepStatus = Literal["pending", "in_progress", "completed", "failed", "skipped"]
 
-DEFAULT_MAX_TURNS = int(os.getenv("MAX_TURNS", "30"))
+MIN_MAX_TURNS = 1
+MAX_MAX_TURNS = 180
+DEFAULT_MAX_TURNS = max(MIN_MAX_TURNS, min(MAX_MAX_TURNS, int(os.getenv("MAX_TURNS", "30"))))
 DEFAULT_MAX_TOOL_RETRIES = int(os.getenv("MAX_TOOL_RETRIES", "2"))
 DEFAULT_COMPACTION_THRESHOLD = int(os.getenv("CONTEXT_COMPACTION_THRESHOLD", "4000"))
 
@@ -145,6 +147,7 @@ def make_initial_state(
     max_turns: int | None = None,
 ) -> AgentState:
     """Create a well-typed initial AgentState for a new turn or session."""
+    effective_max_turns = DEFAULT_MAX_TURNS if max_turns is None else max(MIN_MAX_TURNS, min(MAX_MAX_TURNS, int(max_turns)))
     return AgentState(
         messages=user_messages,
         plan=[],
@@ -152,7 +155,7 @@ def make_initial_state(
         turn_count=0,
         pending_approval=None,
         thread_id=thread_id,
-        max_turns=DEFAULT_MAX_TURNS if max_turns is None else max_turns,
+        max_turns=effective_max_turns,
         current_step_id=None,
         reflection="",
         next_action="continue",

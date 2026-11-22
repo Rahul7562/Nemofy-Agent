@@ -70,11 +70,16 @@ interface EncryptedVaultEnvelope {
   updatedAt: string;
 }
 
-const USERNAME_PATTERN = /^[a-z0-9_-]{1,32}$/i;
+const USERNAME_PATTERN = /^[a-z0-9._-]{1,32}$/i;
 
 function normalizeUsername(username: string): string {
   const clean = (username || '').trim().toLowerCase();
-  if (!USERNAME_PATTERN.test(clean)) {
+  if (
+    !USERNAME_PATTERN.test(clean) ||
+    clean.includes('..') ||
+    clean.startsWith('.') ||
+    clean.endsWith('.')
+  ) {
     throw new Error('Invalid profile username.');
   }
   return clean;

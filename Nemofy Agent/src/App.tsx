@@ -1,16 +1,24 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChatView } from './components/ChatView.tsx';
 import { LoginGate } from './components/LoginGate.tsx';
 import { NemofyLogo } from './components/NemofyLogo.tsx';
 import { SettingsModal } from './components/SettingsModal.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { WorkspaceDrawer } from './components/WorkspaceDrawer.tsx';
+import { useAgentExecution } from './hooks/useAgentExecution.ts';
 import { useChatThreads } from './hooks/useChatThreads.ts';
-import { checkAuthSession, fetchLLMSettings, logoutSession, saveLLMSettings } from './lib/apiClient.ts';
+import {
+  checkAuthSession,
+  fetchLLMSettings,
+  logoutSession,
+  saveLLMSettings,
+  updateAccessMode,
+} from './lib/apiClient.ts';
 import { resolveModelLimits } from './lib/contextUtils.ts';
 import { canonicalizeProviderId } from './lib/llmPresets.ts';
 import { getThinkingProfile, normalizeThinkingLevel } from './lib/thinkingModes.ts';
 import type {
+  ExecutionAccessMode,
   PersistedLLMConfig,
   ProviderModelOption,
   SettingsTab,
@@ -33,6 +41,10 @@ function getInitialSidebarCollapsed(): boolean {
   }
 }
 
+function normalizeAccessMode(raw: unknown): ExecutionAccessMode {
+  return raw === 'full_access' ? 'full_access' : 'default';
+}
+
 export function App() {
   const [theme, setTheme] = useState<ThemeMode>(getInitialTheme);
   const [authChecked, setAuthChecked] = useState(false);
@@ -51,6 +63,7 @@ export function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('llm');
 
   const [llmConfig, setLlmConfig] = useState<PersistedLLMConfig | null>(null);
+  const [accessMode, setAccessMode] = useState<ExecutionAccessMode>('default');
 
   const {
     threads,
@@ -64,6 +77,29 @@ export function App() {
     upsertThread,
     updateThreadById,
   } = useChatThreads(authenticated);
+
+  const handleWorkspaceFilesChanged = useCallback(() => {
+    setWorkspaceRefreshKey((k) => k + 1);
+  }, []);
+
+  const {
+    runningThreadIds,
+    getThreadRun,
+    getThreadDraft,
+    setThreadPrompt,
+    attachFilesToThread,
+    removeAttachmentFromThread,
+    sendMessage,
+    submitApprovalDecision,
+    stopThread,
+    cancelAndClearThread,
+  } = useAgentExecution({
+    authenticated,
+    onCreateThread: createNewThread,
+    onUpsertThread: upsertThread,
+    onUpdateThreadById: updateThreadById,
+    onWorkspaceFilesChanged: handleWorkspaceFilesChanged,
+  });
 
   useEffect(() => {
     const root = document.documentElement;
@@ -108,7 +144,10 @@ export function App() {
     (async () => {
       try {
         const res = await fetchLLMSettings();
-        if (mounted) setLlmConfig(res.config);
+        if (mounted) {
+          setLlmConfig(res.config);
+          setAccessMode(normalizeAccessMode(res.config.access_mode));
+        }
       } catch {
         // non-blocking
       }
@@ -133,17 +172,19 @@ export function App() {
     setWorkspaceRefreshKey((k) => k + 1);
   }, []);
 
-  const handleWorkspaceFilesChanged = useCallback(() => {
-    setWorkspaceRefreshKey((k) => k + 1);
-  }, []);
-
   async function handleLogout() {
     await logoutSession();
     setAuthenticated(false);
     setLlmConfig(null);
+    setAccessMode('default');
     setSettingsModalOpen(false);
     setWorkspaceDrawerOpen(false);
     setMobileSidebarOpen(false);
+  }
+
+  async function handleDeleteThread(id: string) {
+    await cancelAndClearThread(id);
+    await removeThread(id);
   }
 
   async function handlePrimaryThinkingChange(nextEffort: string) {
@@ -154,6 +195,7 @@ export function App() {
         ...llmConfig.primary,
         reasoning_effort: nextEffort,
       },
+      access_mode: accessMode,
     };
     setLlmConfig(updated);
     try {
@@ -164,39 +206,66 @@ export function App() {
     }
   }
 
-  async function handleQuickSwitchPrimaryModel(nextModel: string, option?: ProviderModelOption) {
+  async function handleChangeAccessMode(nextMode: ExecutionAccessMode) {
+    const normalized = normalizeAccessMode(nextMode);
+    setAccessMode(normalized);
+    setLlmConfig((prev) => (prev ? { ...prev, access_mode: normalized } : prev));
+    try {
+      const res = await updateAccessMode(normalized);
+      const confirmed = normalizeAccessMode(res.access_mode);
+      setAccessMode(confirmed);
+      setLlmConfig((prev) => (prev ? { ...prev, access_mode: confirmed } : prev));
+    } catch {
+      // Keep optimistic selection; also passed explicitly on every run/resume request
+    }
+  }
+
+  const quickSwitchSeqRef = useRef(0);
+
+  async function handleQuickSwitchPrimaryModel(
+    nextModel: string,
+    option?: ProviderModelOption,
+    options?: { persist?: boolean },
+  ) {
     if (!llmConfig) return;
+    const shouldPersist = options?.persist !== false;
+    const seq = ++quickSwitchSeqRef.current;
     const canonicalProvider = canonicalizeProviderId(llmConfig.primary.provider);
     const trimmed = nextModel.trim();
+    const isSameModel = trimmed.toLowerCase() === llmConfig.primary.model.trim().toLowerCase();
     const nextProfile = getThinkingProfile(canonicalProvider, nextModel);
 
     const explicitCtx =
       typeof option?.context_length === 'number' && option.context_length > 0
         ? Math.round(option.context_length)
-        : undefined;
+        : null;
     const explicitOut =
       typeof option?.max_output_tokens === 'number' && option.max_output_tokens > 0
         ? Math.round(option.max_output_tokens)
-        : undefined;
+        : null;
 
     const resolved = trimmed
       ? resolveModelLimits(canonicalProvider, trimmed, explicitCtx, explicitOut)
       : null;
 
-    const nextMaxTokens = option
-      ? resolved?.maxOutputTokens ?? llmConfig.primary.max_tokens
-      : resolved && resolved.maxOutputTokensSource === 'model_registry'
-        ? resolved.maxOutputTokens
-        : llmConfig.primary.max_tokens;
+    let nextMaxTokens = llmConfig.primary.max_tokens;
+    if (resolved && typeof resolved.maxOutputTokens === 'number') {
+      if (!isSameModel || nextMaxTokens <= 0) {
+        nextMaxTokens = resolved.maxOutputTokens;
+      } else if (nextMaxTokens > resolved.maxOutputTokens) {
+        nextMaxTokens = resolved.maxOutputTokens;
+      }
+    }
 
     const updated: PersistedLLMConfig = {
       ...llmConfig,
+      access_mode: accessMode,
       primary: {
         ...llmConfig.primary,
         provider: canonicalProvider,
         model: nextModel,
-        context_window: explicitCtx,
-        max_output_tokens: explicitOut,
+        context_window: resolved ? resolved.contextWindow : null,
+        max_output_tokens: resolved ? resolved.maxOutputTokens : null,
         max_tokens: nextMaxTokens,
         reasoning_effort: normalizeThinkingLevel(nextProfile, llmConfig.primary.reasoning_effort),
       },
@@ -204,11 +273,13 @@ export function App() {
 
     setLlmConfig(updated);
 
-    // Only persist to server when a concrete non-empty model ID is chosen
-    if (!trimmed) return;
+    // Only persist to server when explicitly committing a non-empty model ID (not mid-keystroke)
+    if (!shouldPersist || !trimmed) return;
     try {
       const saved = await saveLLMSettings(updated);
-      setLlmConfig(saved.config);
+      if (quickSwitchSeqRef.current === seq) {
+        setLlmConfig(saved.config);
+      }
     } catch {
       // Non-blocking; user can still save or inspect errors in Settings modal
     }
@@ -240,16 +311,20 @@ export function App() {
     );
   }
 
+  const activeThreadRun = getThreadRun(activeThreadId);
+  const activeThreadDraft = getThreadDraft(activeThreadId);
+
   return (
     <div className="h-screen flex bg-[var(--paper)] text-[var(--ink)] overflow-hidden">
       {/* Unified Single Collapsible Left Sidebar */}
       <Sidebar
         threads={threads}
         activeThreadId={activeThreadId}
+        runningThreadIds={runningThreadIds}
         loadingThreads={loadingThreads}
         onNewThread={() => void createNewThread()}
         onSelectThread={(id) => setActiveThreadId(id)}
-        onDeleteThread={(id) => void removeThread(id)}
+        onDeleteThread={(id) => void handleDeleteThread(id)}
         collapsed={sidebarCollapsed}
         onCollapse={() => setSidebarCollapsed(true)}
         onExpand={() => setSidebarCollapsed(false)}
@@ -268,12 +343,41 @@ export function App() {
           activeThread={activeThread}
           activeThreadId={activeThreadId}
           threadsError={threadsError}
+          threadRun={activeThreadRun}
+          threadDraft={activeThreadDraft}
+          onPromptChange={(value) => setThreadPrompt(activeThreadId, value)}
+          onAttachFiles={(files) => void attachFilesToThread(activeThreadId, files)}
+          onRemoveAttachment={(id) => removeAttachmentFromThread(activeThreadId, id)}
+          onSendMessage={({ prompt, reasoningEffort, hasPrimaryModel }) =>
+            void sendMessage({
+              threadId: activeThreadId,
+              prompt,
+              reasoningEffort,
+              accessMode,
+              hasPrimaryModel,
+            })
+          }
+          onStopGeneration={() => {
+            if (activeThreadId) {
+              void stopThread(activeThreadId);
+            }
+          }}
+          onApprovalDecision={({ decision, toolName, editedArgs }) => {
+            if (!activeThreadId) return;
+            void submitApprovalDecision({
+              threadId: activeThreadId,
+              decision,
+              toolName,
+              editedArgs,
+              accessMode,
+            });
+          }}
           onCreateThread={createNewThread}
-          onUpsertThread={upsertThread}
-          onUpdateThreadById={updateThreadById}
           llmConfig={llmConfig}
           onQuickSwitchPrimaryModel={(model, opt) => void handleQuickSwitchPrimaryModel(model, opt)}
           onPrimaryThinkingChange={(lvl) => void handlePrimaryThinkingChange(lvl)}
+          accessMode={accessMode}
+          onChangeAccessMode={(mode) => void handleChangeAccessMode(mode)}
           onOpenLLMSettings={() => openSettings('llm')}
           onOpenAccessoriesSettings={() => openSettings('accessories')}
           sidebarCollapsed={sidebarCollapsed}
@@ -285,7 +389,6 @@ export function App() {
             setWorkspaceRefreshKey((k) => k + 1);
           }}
           onOpenWorkspaceFile={handleOpenWorkspaceFile}
-          onWorkspaceFilesChanged={handleWorkspaceFilesChanged}
         />
 
         {/* Right-Hand Split Workspace Drawer */}
@@ -304,7 +407,14 @@ export function App() {
         theme={theme}
         onSetTheme={setTheme}
         initialTab={settingsTab}
-        onLLMConfigSaved={(next) => setLlmConfig(next)}
+        activePrimaryReasoningEffort={llmConfig?.primary.reasoning_effort}
+        activeAccessMode={accessMode}
+        onLLMConfigSaved={(next) => {
+          setLlmConfig(next);
+          if (next.access_mode) {
+            setAccessMode(normalizeAccessMode(next.access_mode));
+          }
+        }}
       />
     </div>
   );

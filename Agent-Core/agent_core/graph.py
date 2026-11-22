@@ -43,7 +43,12 @@ from agent_core.context_manager import (
     should_auto_compact,
     utc_now_iso,
 )
-from agent_core.guardrails import execute_tool_with_guardrails, normalize_tool_arguments
+from agent_core.guardrails import (
+    bind_run_access_mode,
+    current_access_mode,
+    execute_tool_with_guardrails,
+    normalize_tool_arguments,
+)
 from agent_core.jobs import (
     ProgressCallback,
     current_progress_callback,
@@ -365,10 +370,11 @@ class AgentRuntime:
     default_worker_summary: dict[str, Any] | None = None
     model_override_resolver: ModelOverrideResolver | None = None
 
-    def make_config(self, thread_id: str) -> dict[str, Any]:
+    def make_config(self, thread_id: str, max_turns: int | None = None) -> dict[str, Any]:
+        effective_turns = max_turns if max_turns is not None else self.max_turns
         return {
             "configurable": {"thread_id": thread_id},
-            "recursion_limit": max(150, self.max_turns * 6 + 30),
+            "recursion_limit": max(150, int(effective_turns) * 6 + 30),
         }
 
     async def run_task(
@@ -377,6 +383,7 @@ class AgentRuntime:
         *,
         thread_id: str,
         max_turns: int | None = None,
+        access_mode: str | None = None,
         primary_model_override: BaseChatModel
         | ModelSpec
         | ModelOverride
@@ -459,6 +466,7 @@ class AgentRuntime:
         native_media_tok = current_native_media_attachments.set(None)
         fallback_fn_tok = current_accessory_fallback_fn.set(None)
         prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
+        access_mode_tok = bind_run_access_mode(access_mode)
 
         async def _run_accessory_for_modality(
             modality: MediaModality,
@@ -631,7 +639,8 @@ class AgentRuntime:
             current_native_media_attachments.set(native_atts or None)
             current_accessory_fallback_fn.set(_run_accessory_for_modality)
 
-            config = self.make_config(thread_id)
+            effective_run_max_turns = max_turns if max_turns is not None else self.max_turns
+            config = self.make_config(thread_id, max_turns=effective_run_max_turns)
             existing = await self.graph.aget_state(config)
             has_history = bool(existing and existing.values and existing.values.get("messages"))
 
@@ -639,7 +648,7 @@ class AgentRuntime:
                 input_payload: dict[str, Any] = {
                     "messages": [HumanMessage(content=human_text)],
                     "turn_count": 0,
-                    "max_turns": max_turns if max_turns is not None else self.max_turns,
+                    "max_turns": effective_run_max_turns,
                     "next_action": "continue",
                     "final_response": "",
                     "error": None,
@@ -650,7 +659,7 @@ class AgentRuntime:
                     make_initial_state(
                         [HumanMessage(content=human_text)],
                         thread_id=thread_id,
-                        max_turns=max_turns if max_turns is not None else self.max_turns,
+                        max_turns=effective_run_max_turns,
                     )
                 )
 
@@ -666,6 +675,7 @@ class AgentRuntime:
                 result["subagent_reports"] = [*run_activity["accessory_reports"], *existing_reports]
             return result
         finally:
+            current_access_mode.reset(access_mode_tok)
             current_primary_meta.reset(prim_meta_tok)
             current_accessory_fallback_fn.reset(fallback_fn_tok)
             current_native_media_attachments.reset(native_media_tok)
@@ -698,6 +708,7 @@ class AgentRuntime:
         extra_mcp_tool_names: set[str] | None = None,
         dynamic_skills: dict[str, DynamicSkill] | list[dict[str, Any]] | None = None,
         progress_callback: ProgressCallback | None = None,
+        access_mode: str | None = None,
     ) -> dict[str, Any]:
         prim_model, prim_spec = _resolve_override_model(
             "primary", primary_model_override, resolver=self.model_override_resolver
@@ -742,6 +753,7 @@ class AgentRuntime:
         prog_tok = current_progress_callback.set(progress_callback)
         act_tok = current_run_activity.set(run_activity)
         prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
+        access_mode_tok = bind_run_access_mode(access_mode)
         try:
             decision_label = (
                 str(decision.get("decision") or "approve")
@@ -756,7 +768,13 @@ class AgentRuntime:
                     else "Rejection received — updating plan..."
                 ),
             )
-            config = self.make_config(thread_id)
+            existing_snap = await self.graph.aget_state(self.make_config(thread_id))
+            saved_max_turns = (
+                int(existing_snap.values.get("max_turns"))
+                if existing_snap and existing_snap.values and existing_snap.values.get("max_turns")
+                else self.max_turns
+            )
+            config = self.make_config(thread_id, max_turns=saved_max_turns)
             await self.graph.ainvoke(Command(resume=decision), config=config)
             result = await self.inspect_thread(thread_id)
             result["active_models"] = active_models
@@ -766,6 +784,7 @@ class AgentRuntime:
             result["file_changes"] = list(run_activity["file_changes"])
             return result
         finally:
+            current_access_mode.reset(access_mode_tok)
             current_primary_meta.reset(prim_meta_tok)
             current_run_activity.reset(act_tok)
             current_progress_callback.reset(prog_tok)
@@ -1641,10 +1660,15 @@ def build_supervisor_graph(
             tokens_saved_last_compaction=last_compaction_saved_tokens,
         )
 
-        # Auto-compact conversation strictly at >= 80% of this model's context window ONLY
+        # Auto-compact conversation strictly at >= 80% of this model's known context window ONLY
         removal_messages: list[RemoveMessage] = []
-        usage_ratio = pre_context_usage["used_tokens"] / max(1, pre_context_usage["context_window"])
-        if should_auto_compact(usage_ratio, len(messages)):
+        known_ctx_window = pre_context_usage.get("context_window")
+        usage_ratio = (
+            pre_context_usage["used_tokens"] / max(1, known_ctx_window)
+            if isinstance(known_ctx_window, int) and known_ctx_window >= 512
+            else 0.0
+        )
+        if isinstance(known_ctx_window, int) and known_ctx_window >= 512 and should_auto_compact(usage_ratio, len(messages)):
             compact_ev_id = f"compact-{compaction_count + 1}-{turn_count}"
             compact_start_ev = {
                 "id": compact_ev_id,

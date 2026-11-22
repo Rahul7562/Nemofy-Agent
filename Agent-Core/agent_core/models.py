@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import socket
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -284,9 +285,31 @@ def save_persisted_llm_config(
         if acc_clean:
             clean["accessories"] = acc_clean
     if "max_turns" in config and config["max_turns"] is not None:
-        clean["max_turns"] = int(config["max_turns"])
-    path.write_text(json.dumps(clean, indent=2) + "\n", encoding="utf-8")
+        clean["max_turns"] = max(1, min(180, int(config["max_turns"])))
+    if "access_mode" in config and config["access_mode"] is not None:
+        raw_mode = str(config["access_mode"]).strip().lower()
+        clean["access_mode"] = "full_access" if raw_mode == "full_access" else "default"
+    payload_text = json.dumps(clean, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=".llm_config.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(payload_text)
+            tmp_file.flush()
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return path
+
+
+def load_persisted_access_mode(config_path: Path | None = None) -> Literal["default", "full_access"]:
+    """Load persisted execution access mode, defaulting strictly to 'default'."""
+    persisted = load_persisted_llm_config(config_path)
+    raw = str(persisted.get("access_mode") or "").strip().lower()
+    return "full_access" if raw == "full_access" else "default"
 
 
 def load_persisted_accessories_config(config_path: Path | None = None) -> dict[str, dict[str, Any]]:
@@ -1159,7 +1182,12 @@ def build_chat_model(
     model_max_out, _ = resolve_model_max_output_tokens(
         resolved.provider, resolved.model, explicit_max_output_tokens=resolved.max_output_tokens
     )
-    effective_max_tokens = max(64, min(int(resolved.max_tokens), int(model_max_out)))
+    configured_max = max(64, int(resolved.max_tokens))
+    effective_max_tokens = (
+        max(64, min(configured_max, int(model_max_out)))
+        if isinstance(model_max_out, int) and model_max_out > 0
+        else configured_max
+    )
 
     kwargs: dict[str, Any] = {
         "model": resolved.model,

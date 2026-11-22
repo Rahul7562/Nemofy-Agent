@@ -43,6 +43,8 @@ import {
 import { validatePasswordChange } from '../lib/authValidation.ts';
 import {
   LLM_PROVIDER_PRESETS,
+  MAX_MAX_TURNS,
+  MIN_MAX_TURNS,
   applyProviderPreset,
   canonicalizeProviderId,
   detectModelInputModalities,
@@ -51,14 +53,20 @@ import {
   normalizeAccessoriesConfig,
   validateLLMConfig,
 } from '../lib/llmPresets.ts';
-import { formatTokenCount, resolveModelLimits } from '../lib/contextUtils.ts';
+import {
+  formatTokenCount,
+  matchLiveModelOption,
+  resolveModelLimits,
+} from '../lib/contextUtils.ts';
 import { getThinkingProfile, normalizeThinkingLevel } from '../lib/thinkingModes.ts';
 import { ModelSelectorCombobox } from './ModelSelectorCombobox.tsx';
 import type {
   AccessoryLLMConfig,
   AgentHealthResponse,
+  ExecutionAccessMode,
   MCPServerItem,
   MediaModality,
+  ModelResolutionResult,
   ModelRoleKey,
   PersistedLLMConfig,
   ProfileVaultSummary,
@@ -76,6 +84,8 @@ interface SettingsViewProps {
   onLLMConfigSaved: (config: PersistedLLMConfig) => void;
   initialTab?: SettingsTab;
   embedded?: boolean;
+  activePrimaryReasoningEffort?: string;
+  activeAccessMode?: ExecutionAccessMode;
 }
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; icon: typeof Cpu }> = [
@@ -155,8 +165,6 @@ function RoleConfigCard({
   const preset = getProviderPreset(canonicalProvider);
   const selectValue = preset ? preset.id : 'custom';
   const avail = providers[canonicalProvider] || providers[selectValue];
-  const thinkingProfile = getThinkingProfile(canonicalProvider, config.model);
-  const effectiveThinking = normalizeThinkingLevel(thinkingProfile, config.reasoning_effort);
   const envVarName =
     selectValue === 'custom'
       ? roleKey === 'worker'
@@ -171,15 +179,17 @@ function RoleConfigCard({
     const trimmed = nextModel.trim();
     const resolved = trimmed ? resolveModelLimits(canonicalProvider, trimmed) : null;
     const autoMaxTokens =
-      resolved && resolved.maxOutputTokensSource === 'model_registry'
+      resolved &&
+      resolved.maxOutputTokensSource === 'model_registry' &&
+      typeof resolved.maxOutputTokens === 'number'
         ? resolved.maxOutputTokens
         : config.max_tokens;
     onChange({
       ...config,
       provider: canonicalProvider,
       model: nextModel,
-      context_window: undefined,
-      max_output_tokens: undefined,
+      context_window: resolved?.contextWindow ?? null,
+      max_output_tokens: resolved?.maxOutputTokens ?? null,
       max_tokens: autoMaxTokens,
       reasoning_effort: normalizeThinkingLevel(nextProfile, config.reasoning_effort),
     });
@@ -190,45 +200,87 @@ function RoleConfigCard({
     const explicitCtx =
       typeof option.context_length === 'number' && option.context_length > 0
         ? Math.round(option.context_length)
-        : undefined;
+        : null;
     const explicitOut =
       typeof option.max_output_tokens === 'number' && option.max_output_tokens > 0
         ? Math.round(option.max_output_tokens)
-        : undefined;
+        : null;
     const resolved = resolveModelLimits(canonicalProvider, option.id, explicitCtx, explicitOut);
     onChange({
       ...config,
       provider: canonicalProvider,
       model: option.id,
-      context_window: explicitCtx,
-      max_output_tokens: explicitOut,
-      max_tokens: resolved.maxOutputTokens,
+      context_window: resolved.contextWindow,
+      max_output_tokens: resolved.maxOutputTokens,
+      max_tokens: resolved.maxOutputTokens ?? config.max_tokens,
       reasoning_effort: normalizeThinkingLevel(nextProfile, config.reasoning_effort),
+    });
+  }
+
+  function handleModelResolved(resolution: ModelResolutionResult) {
+    // Only apply resolution if it still corresponds to the currently entered model
+    if (resolution.model.trim().toLowerCase() !== config.model.trim().toLowerCase()) {
+      return;
+    }
+    const nextCtx =
+      typeof resolution.context_window === 'number' && resolution.context_window > 0
+        ? Math.round(resolution.context_window)
+        : null;
+    const nextOut =
+      typeof resolution.max_output_tokens === 'number' && resolution.max_output_tokens > 0
+        ? Math.round(resolution.max_output_tokens)
+        : null;
+    // Preserve custom user-configured lower max_tokens; only clamp down when exceeding model ceiling
+    const nextMaxTokens =
+      nextOut && (config.max_tokens <= 0 || config.max_tokens > nextOut)
+        ? nextOut
+        : config.max_tokens;
+
+    if (
+      nextCtx === (config.context_window ?? null) &&
+      nextOut === (config.max_output_tokens ?? null) &&
+      nextMaxTokens === config.max_tokens
+    ) {
+      return;
+    }
+
+    onChange({
+      ...config,
+      context_window: nextCtx,
+      max_output_tokens: nextOut,
+      max_tokens: nextMaxTokens,
     });
   }
 
   function handleCatalogLoaded(models: ProviderModelOption[]) {
     const currentId = config.model.trim();
     if (!currentId || models.length === 0) return;
-    const matched =
-      models.find((m) => m.id === currentId) ||
-      models.find((m) => m.id.toLowerCase() === currentId.toLowerCase());
+    const matched = matchLiveModelOption(currentId, models);
     if (!matched) return;
     const nextCtx =
       typeof matched.context_length === 'number' && matched.context_length > 0
         ? Math.round(matched.context_length)
-        : config.context_window;
+        : (config.context_window ?? null);
     const nextOut =
       typeof matched.max_output_tokens === 'number' && matched.max_output_tokens > 0
         ? Math.round(matched.max_output_tokens)
-        : config.max_output_tokens;
-    if (nextCtx === config.context_window && nextOut === config.max_output_tokens) {
+        : (config.max_output_tokens ?? null);
+    const nextMaxTokens =
+      nextOut && (config.max_tokens <= 0 || config.max_tokens > nextOut)
+        ? nextOut
+        : config.max_tokens;
+    if (
+      nextCtx === (config.context_window ?? null) &&
+      nextOut === (config.max_output_tokens ?? null) &&
+      nextMaxTokens === config.max_tokens
+    ) {
       return;
     }
     onChange({
       ...config,
       context_window: nextCtx,
       max_output_tokens: nextOut,
+      max_tokens: nextMaxTokens,
     });
   }
 
@@ -338,9 +390,21 @@ function RoleConfigCard({
             Model
           </label>
           {resolvedLimits && (
-            <span className="font-mono text-[11px] tabular-nums text-[var(--ink-faint)]">
-              {formatTokenCount(resolvedLimits.contextWindow)} total · {formatTokenCount(resolvedLimits.maxOutputTokens)} out
-              {roleKey === 'primary' ? ' · 80% auto-compact' : ''}
+            <span
+              data-testid={`${roleKey}-model-limits`}
+              className="font-mono text-[11px] tabular-nums text-[var(--ink-faint)]"
+            >
+              {resolvedLimits.contextWindow !== null ? (
+                <>
+                  {formatTokenCount(resolvedLimits.contextWindow)} total
+                  {resolvedLimits.maxOutputTokens !== null
+                    ? ` · ${formatTokenCount(resolvedLimits.maxOutputTokens)} out`
+                    : ''}
+                  {roleKey === 'primary' ? ' · 80% auto-compact' : ''}
+                </>
+              ) : (
+                'Context window unknown'
+              )}
             </span>
           )}
         </div>
@@ -354,6 +418,7 @@ function RoleConfigCard({
           onChange={handleModelChange}
           onSelectOption={handleSelectModelOption}
           onCatalogLoaded={handleCatalogLoaded}
+          onModelResolved={handleModelResolved}
         />
       </div>
 
@@ -425,8 +490,8 @@ function RoleConfigCard({
         />
       </div>
 
-      {/* Numeric & Reasoning Controls */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {/* Numeric Controls (Thinking Mode lives exclusively in the Chat Bar) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label
             htmlFor={`${roleKey}-temp`}
@@ -493,43 +558,24 @@ function RoleConfigCard({
           {resolvedLimits && (
             <div className="mt-1 flex items-center justify-between gap-1.5 text-[10px] text-[var(--ink-faint)]">
               <span className="font-mono tabular-nums truncate">
-                Max: {formatTokenCount(resolvedLimits.maxOutputTokens)}
+                {resolvedLimits.maxOutputTokens !== null
+                  ? `Max: ${formatTokenCount(resolvedLimits.maxOutputTokens)}`
+                  : 'Max output: unknown'}
               </span>
-              {config.max_tokens !== resolvedLimits.maxOutputTokens && (
-                <button
-                  type="button"
-                  onClick={() => onChange({ ...config, max_tokens: resolvedLimits.maxOutputTokens })}
-                  className="text-[var(--signal)] hover:underline cursor-pointer shrink-0 font-medium"
-                >
-                  Use full
-                </button>
-              )}
+              {resolvedLimits.maxOutputTokens !== null &&
+                config.max_tokens !== resolvedLimits.maxOutputTokens && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onChange({ ...config, max_tokens: resolvedLimits.maxOutputTokens! })
+                    }
+                    className="text-[var(--signal)] hover:underline cursor-pointer shrink-0 font-medium"
+                  >
+                    Use full
+                  </button>
+                )}
             </div>
           )}
-        </div>
-        <div>
-          <label
-            htmlFor={`${roleKey}-reasoning`}
-            className="block text-xs font-medium text-[var(--ink)] mb-1.5"
-          >
-            Thinking Mode
-          </label>
-          <select
-            id={`${roleKey}-reasoning`}
-            value={effectiveThinking}
-            disabled={!thinkingProfile.supported}
-            onChange={(e) => onChange({ ...config, reasoning_effort: e.target.value })}
-            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] disabled:opacity-60 focus:outline-none focus:border-[var(--signal)]"
-          >
-            {thinkingProfile.options.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-          <p className="mt-1 text-[10px] text-[var(--ink-faint)] truncate" title={thinkingProfile.familyLabel}>
-            {thinkingProfile.familyLabel}
-          </p>
         </div>
       </div>
 
@@ -554,11 +600,15 @@ export function SettingsView({
   onLLMConfigSaved,
   initialTab = 'llm',
   embedded = false,
+  activePrimaryReasoningEffort,
+  activeAccessMode,
 }: SettingsViewProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
 
   // LLM Config & Profile API Key Vault State
   const [llmConfig, setLlmConfig] = useState<PersistedLLMConfig | null>(null);
+  const [maxTurnsDraft, setMaxTurnsDraft] = useState<string>('25');
+  const [maxTurnsError, setMaxTurnsError] = useState<string | null>(null);
   const [llmLoadError, setLlmLoadError] = useState<string | null>(null);
   const [providers, setProviders] = useState<Record<string, ProviderAvailability>>({});
   const [vault, setVault] = useState<ProfileVaultSummary | null>(null);
@@ -632,6 +682,8 @@ export function SettingsView({
 
     if (llmResult.status === 'fulfilled') {
       setLlmConfig(llmResult.value.config);
+      setMaxTurnsDraft(String(llmResult.value.config.max_turns));
+      setMaxTurnsError(null);
       setProviders(llmResult.value.providers);
       if (llmResult.value.vault) {
         setVault(llmResult.value.vault);
@@ -666,13 +718,66 @@ export function SettingsView({
     void loadAllSettings();
   }, []);
 
+  function parseMaxTurnsDraft(raw: string): { valid: boolean; value?: number; error?: string } {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return {
+        valid: false,
+        error: `Max execution turns must be an integer between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+      };
+    }
+    if (!/^-?\d+$/.test(trimmed)) {
+      return {
+        valid: false,
+        error: `Max execution turns must be a whole number between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+      };
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isInteger(parsed) || parsed < MIN_MAX_TURNS || parsed > MAX_MAX_TURNS) {
+      return {
+        valid: false,
+        error: `Max execution turns must be between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+      };
+    }
+    return { valid: true, value: parsed };
+  }
+
   async function handleSaveLLM(e: FormEvent, source: 'llm' | 'accessories' = 'llm') {
     e.preventDefault();
     if (!llmConfig) return;
     const setStatus = source === 'accessories' ? setAccessoriesMessage : setLlmMessage;
     setStatus(null);
+
+    let effectiveMaxTurns = llmConfig.max_turns;
+    if (source === 'llm') {
+      const turnsCheck = parseMaxTurnsDraft(maxTurnsDraft);
+      if (!turnsCheck.valid || turnsCheck.value === undefined) {
+        const msg =
+          turnsCheck.error ||
+          `Max execution turns must be between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`;
+        setMaxTurnsError(msg);
+        setStatus({ type: 'error', text: msg });
+        return;
+      }
+      setMaxTurnsError(null);
+      effectiveMaxTurns = turnsCheck.value;
+    }
+
+    // Preserve active chat-bar thinking level and access mode so saving Settings never clobbers them
+    const primaryProfile = getThinkingProfile(llmConfig.primary.provider, llmConfig.primary.model);
+    const preservedThinking = normalizeThinkingLevel(
+      primaryProfile,
+      activePrimaryReasoningEffort ?? llmConfig.primary.reasoning_effort,
+    );
+
     const normalizedConfig: PersistedLLMConfig = {
       ...llmConfig,
+      primary: {
+        ...llmConfig.primary,
+        reasoning_effort: preservedThinking,
+      },
+      max_turns: effectiveMaxTurns,
+      access_mode: activeAccessMode ?? llmConfig.access_mode ?? 'default',
       accessories: normalizeAccessoriesConfig(llmConfig.accessories),
     };
     const check = validateLLMConfig(normalizedConfig, source);
@@ -695,6 +800,8 @@ export function SettingsView({
         Object.keys(apiKeysPayload).length > 0 ? apiKeysPayload : undefined,
       );
       setLlmConfig(saved.config);
+      setMaxTurnsDraft(String(saved.config.max_turns));
+      setMaxTurnsError(null);
       setProviders(saved.providers);
       if (saved.vault) {
         setVault(saved.vault);
@@ -1093,40 +1200,61 @@ export function SettingsView({
                 </div>
 
                 <div className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div className="flex items-center gap-4">
-                    <div>
-                      <label
-                        htmlFor="max-turns-input"
-                        className="block text-xs font-medium text-[var(--ink)]"
-                      >
-                        Max Execution Turns
-                      </label>
-                      <p className="text-[11px] text-[var(--ink-faint)]">
-                        Upper bound on autonomous tool loops per request (1–100).
-                      </p>
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-4">
+                      <div>
+                        <label
+                          htmlFor="max-turns-input"
+                          className="block text-xs font-medium text-[var(--ink)]"
+                        >
+                          Max Execution Turns
+                        </label>
+                        <p className="text-[11px] text-[var(--ink-faint)]">
+                          Upper bound on autonomous tool loops per request ({MIN_MAX_TURNS}–{MAX_MAX_TURNS}).
+                        </p>
+                      </div>
+                      <input
+                        id="max-turns-input"
+                        data-testid="max-turns-input"
+                        type="text"
+                        inputMode="numeric"
+                        aria-invalid={Boolean(maxTurnsError)}
+                        aria-describedby={maxTurnsError ? 'max-turns-error' : undefined}
+                        value={maxTurnsDraft}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          setMaxTurnsDraft(raw);
+                          const check = parseMaxTurnsDraft(raw);
+                          if (check.valid && check.value !== undefined) {
+                            setMaxTurnsError(null);
+                            setLlmConfig({ ...llmConfig, max_turns: check.value });
+                          } else {
+                            setMaxTurnsError(check.error || null);
+                          }
+                        }}
+                        className={`w-24 h-10 px-3 rounded-lg border bg-[var(--paper)] font-mono text-sm text-[var(--ink)] focus:outline-none ${
+                          maxTurnsError
+                            ? 'border-[var(--flare)] focus:border-[var(--flare)]'
+                            : 'border-[var(--rule-strong)] focus:border-[var(--signal)]'
+                        }`}
+                      />
                     </div>
-                    <input
-                      id="max-turns-input"
-                      type="number"
-                      min={1}
-                      max={100}
-                      value={llmConfig.max_turns || ''}
-                      onChange={(e) => {
-                        const raw = e.target.value;
-                        if (!raw.trim()) return;
-                        const num = Number(raw);
-                        if (Number.isFinite(num)) {
-                          setLlmConfig({ ...llmConfig, max_turns: Math.round(num) });
-                        }
-                      }}
-                      className="w-24 h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
-                    />
+                    {maxTurnsError && (
+                      <p
+                        id="max-turns-error"
+                        data-testid="max-turns-error"
+                        role="alert"
+                        className="text-xs text-[var(--flare)]"
+                      >
+                        {maxTurnsError}
+                      </p>
+                    )}
                   </div>
 
                   <button
                     type="submit"
                     disabled={llmSaving}
-                    className="h-10 px-5 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer"
+                    className="h-10 px-5 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer shrink-0"
                   >
                     <Save className="w-4 h-4" />
                     <span>{llmSaving ? 'Saving...' : 'Save LLM Config'}</span>

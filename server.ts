@@ -8,11 +8,14 @@ import { AuthStore, parseCookieHeader } from './server/authStore.ts';
 import { AgentCoreProcessManager } from './server/agentProcessManager.ts';
 import {
   WorkspaceAndConfigStore,
+  normalizeAccessMode,
+  validateMaxTurns,
   type AccessoryLLMConfig,
   type ChatAttachmentRecord,
   type ChatMessageRecord,
   type ChatThreadRecord,
   type ContextUsageSnapshot,
+  type ExecutionAccessMode,
   type FileChangeRecord,
   type MediaModality,
   type ToolEventRecord,
@@ -20,8 +23,9 @@ import {
 import {
   listProviderModelsDirect,
   probeProviderModelDirect,
-  resolveModelMetadataFromCatalog,
+  resolveModelMetadataUnified,
 } from './server/providerCatalog.ts';
+import { ChatJobOrchestrator } from './server/jobOrchestrator.ts';
 import {
   ALLOWED_PROFILE_SECRET_KEYS,
   ProfileSecretVaultStore,
@@ -107,33 +111,51 @@ function getAgentApiToken(): string {
   return authStore.getAgentApiToken();
 }
 
-async function enrichRoleLimits<T extends { provider: string; model: string; context_window?: number | null; max_output_tokens?: number | null }>(
+async function enrichRoleLimits<
+  T extends {
+    provider: string;
+    model: string;
+    base_url?: string;
+    context_window?: number | null;
+    max_output_tokens?: number | null;
+  },
+>(
   roleCfg: T,
+  options: {
+    env?: Record<string, string | undefined>;
+    allowLiveFetch?: boolean;
+    role?: 'primary' | 'worker';
+  } = {},
 ): Promise<T> {
   if (!roleCfg.model || !roleCfg.model.trim()) return roleCfg;
   if (roleCfg.context_window && roleCfg.max_output_tokens) return roleCfg;
-  const meta = await resolveModelMetadataFromCatalog({
+  const meta = await resolveModelMetadataUnified({
     provider: roleCfg.provider,
     model: roleCfg.model,
+    base_url: roleCfg.base_url,
+    role: options.role,
+    env: options.env,
     explicitContextWindow: roleCfg.context_window,
     explicitMaxOutputTokens: roleCfg.max_output_tokens,
+    allowLiveFetch: options.allowLiveFetch ?? false,
   });
   return {
     ...roleCfg,
-    ...(meta.context_window ? { context_window: meta.context_window } : {}),
-    ...(meta.max_output_tokens ? { max_output_tokens: meta.max_output_tokens } : {}),
+    context_window: meta.context_window,
+    max_output_tokens: meta.max_output_tokens,
   };
 }
 
 async function enrichLLMConfigLimits(
   cfg: ReturnType<typeof store.getLLMConfig>,
+  options: { env?: Record<string, string | undefined>; allowLiveFetch?: boolean } = {},
 ): Promise<ReturnType<typeof store.getLLMConfig>> {
   const [primary, worker, image, video, audio] = await Promise.all([
-    enrichRoleLimits(cfg.primary),
-    enrichRoleLimits(cfg.worker),
-    enrichRoleLimits(cfg.accessories.image),
-    enrichRoleLimits(cfg.accessories.video),
-    enrichRoleLimits(cfg.accessories.audio),
+    enrichRoleLimits(cfg.primary, { ...options, role: 'primary' }),
+    enrichRoleLimits(cfg.worker, { ...options, role: 'worker' }),
+    enrichRoleLimits(cfg.accessories.image, { ...options, role: 'worker' }),
+    enrichRoleLimits(cfg.accessories.video, { ...options, role: 'worker' }),
+    enrichRoleLimits(cfg.accessories.audio, { ...options, role: 'worker' }),
   ]);
   return {
     ...cfg,
@@ -280,6 +302,12 @@ async function startServer(): Promise<void> {
   app.disable('x-powered-by');
   app.use(express.json({ limit: '5mb' }));
 
+  const jobOrchestrator = new ChatJobOrchestrator({
+    store,
+    callAgentCore,
+    pollIntervalMs: 650,
+  });
+
   // ---------------------------------------------------------------------------
   // Public Auth Endpoints
   // ---------------------------------------------------------------------------
@@ -425,8 +453,10 @@ async function startServer(): Promise<void> {
     res.status(201).json({ thread });
   });
 
-  app.delete('/api/threads/:id', requireSession, (req, res) => {
+  app.delete('/api/threads/:id', requireSession, async (req, res) => {
     const id = req.params.id;
+    jobOrchestrator.markThreadDeleted(id);
+    await jobOrchestrator.cancelThreadJob(id);
     const threads = store.listThreads().filter((t) => t.id !== id);
     store.saveThreads(threads);
     res.json({ ok: true });
@@ -546,10 +576,11 @@ async function startServer(): Promise<void> {
   };
 
   app.post('/api/chat/send', requireSession, async (req, res) => {
-    const { threadId, message, reasoningEffort, attachments } = (req.body || {}) as {
+    const { threadId, message, reasoningEffort, accessMode, attachments } = (req.body || {}) as {
       threadId?: string;
       message?: string;
       reasoningEffort?: string;
+      accessMode?: ExecutionAccessMode;
       attachments?: ChatAttachmentRecord[];
     };
     const { publicAttachments, agentAttachments } = normalizeIncomingAttachments(attachments);
@@ -564,7 +595,9 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    let llmCfg = await enrichLLMConfigLimits(store.getLLMConfig());
+    const username = getSessionUsername(res);
+    const profileSecrets = loadProfileSecrets(username);
+    let llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
     if (!llmCfg.primary.model.trim()) {
       res.status(400).json({
         error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
@@ -607,14 +640,23 @@ async function startServer(): Promise<void> {
         ? reasoningEffort.trim().toLowerCase()
         : llmCfg.primary.reasoning_effort;
 
-    if (requestedEffort && requestedEffort !== llmCfg.primary.reasoning_effort) {
+    const effectiveAccessMode =
+      accessMode === 'default' || accessMode === 'full_access'
+        ? accessMode
+        : llmCfg.access_mode;
+
+    if (
+      (requestedEffort && requestedEffort !== llmCfg.primary.reasoning_effort) ||
+      effectiveAccessMode !== llmCfg.access_mode
+    ) {
       llmCfg = store.saveLLMConfig({
         primary: { ...llmCfg.primary, reasoning_effort: requestedEffort },
+        access_mode: effectiveAccessMode,
       });
     }
 
     const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
-    await syncProfileSecretsToCore(getSessionUsername(res), true);
+    await syncProfileSecretsToCore(username, true);
 
     const agentResp = await callAgentCore('/agent/run', {
       method: 'POST',
@@ -622,6 +664,7 @@ async function startServer(): Promise<void> {
         task: text,
         thread_id: resolvedThreadId,
         max_turns: llmCfg.max_turns,
+        access_mode: effectiveAccessMode,
         primary_model: {
           provider: llmCfg.primary.provider,
           model: llmCfg.primary.model,
@@ -661,18 +704,9 @@ async function startServer(): Promise<void> {
         status: 'error',
       };
       const updatedThread = store.updateThreads((freshThreads) => {
-        let target = freshThreads.find((t) => t.id === resolvedThreadId);
-        if (!target) {
-          target = {
-            id: resolvedThreadId,
-            title: derivedTitle,
-            createdAt: now,
-            updatedAt: replyNow,
-            messages: [userMsg],
-            pendingApproval: null,
-          };
-          freshThreads.unshift(target);
-        }
+        const target = freshThreads.find((t) => t.id === resolvedThreadId);
+        // Do NOT resurrect a thread deleted while awaiting Agent-Core
+        if (!target) return null;
         target.messages.push(assistantMsg);
         target.updatedAt = replyNow;
         return target;
@@ -709,18 +743,9 @@ async function startServer(): Promise<void> {
     };
 
     const updatedThread = store.updateThreads((freshThreads) => {
-      let target = freshThreads.find((t) => t.id === resolvedThreadId);
-      if (!target) {
-        target = {
-          id: resolvedThreadId,
-          title: derivedTitle,
-          createdAt: now,
-          updatedAt: replyNow,
-          messages: [userMsg],
-          pendingApproval: null,
-        };
-        freshThreads.unshift(target);
-      }
+      const target = freshThreads.find((t) => t.id === resolvedThreadId);
+      // Do NOT resurrect a thread deleted while awaiting Agent-Core
+      if (!target) return null;
       target.messages.push(assistantMsg);
       target.pendingApproval = pendingApproval;
       if (data.context_usage && typeof data.context_usage === 'object') {
@@ -732,79 +757,19 @@ async function startServer(): Promise<void> {
     res.json({ thread: updatedThread, message: assistantMsg });
   });
 
-  // Live async chat jobs (enables real-time thinking, tool calls, and workspace file/dir changes)
-  const activeChatJobs = new Map<string, { threadId: string; finalized: boolean; createdAt: number }>();
-
-  const pruneChatJobs = () => {
-    const cutoff = Date.now() - 30 * 60 * 1000;
-    for (const [jid, meta] of activeChatJobs.entries()) {
-      if (meta.finalized && meta.createdAt < cutoff) {
-        activeChatJobs.delete(jid);
-      }
-    }
-  };
-
-  const extractActivityFromJobPayload = (jobId: string, data: Record<string, unknown>) => {
-    const resultObj =
-      data.result && typeof data.result === 'object'
-        ? (data.result as Record<string, unknown>)
-        : null;
-    const rawThinking =
-      typeof data.thinking === 'string' && data.thinking.trim()
-        ? data.thinking.trim()
-        : typeof resultObj?.thinking === 'string' && resultObj.thinking.trim()
-          ? resultObj.thinking.trim()
-          : null;
-    const toolEvents = Array.isArray(data.tool_events)
-      ? (data.tool_events as ToolEventRecord[])
-      : Array.isArray(resultObj?.tool_events)
-        ? (resultObj.tool_events as ToolEventRecord[])
-        : [];
-    const fileChanges = Array.isArray(data.file_changes)
-      ? (data.file_changes as FileChangeRecord[])
-      : Array.isArray(resultObj?.file_changes)
-        ? (resultObj.file_changes as FileChangeRecord[])
-        : [];
-    const activityFeed = Array.isArray(data.activity_feed)
-      ? (data.activity_feed as Array<{ id: string; phase: string; text: string; timestamp?: string }>)
-      : [];
-    const contextUsage =
-      data.context_usage && typeof data.context_usage === 'object'
-        ? (data.context_usage as ContextUsageSnapshot)
-        : resultObj?.context_usage && typeof resultObj.context_usage === 'object'
-          ? (resultObj.context_usage as ContextUsageSnapshot)
-          : null;
-    const activeTasks = Array.isArray(data.active_tasks)
-      ? (data.active_tasks as Array<{
-          id: string;
-          kind: string;
-          label: string;
-          elapsed_seconds: number;
-          expected_seconds?: number;
-        }>)
-      : [];
-    return {
-      jobId,
-      status: String(data.status || 'running'),
-      currentPhase: String(data.current_phase || 'thinking'),
-      lastEvent: String(data.last_event || 'Nemo is working...'),
-      elapsedSeconds: typeof data.elapsed_seconds === 'number' ? data.elapsed_seconds : 0,
-      turnCount: typeof data.turn_count === 'number' ? data.turn_count : 0,
-      thinking: rawThinking,
-      activityFeed,
-      toolEvents,
-      fileChanges,
-      contextUsage,
-      activeTasks,
-    };
-  };
+  // Live async chat jobs backed by server-side ChatJobOrchestrator
+  // Jobs continue running and persist results even if the browser navigates away, switches threads, or reloads.
+  app.get('/api/chat/jobs/active', requireSession, (_req, res) => {
+    res.json({ jobs: jobOrchestrator.getActiveJobs() });
+  });
 
   app.post('/api/chat/jobs/start', requireSession, async (req, res) => {
-    pruneChatJobs();
-    const { threadId, message, reasoningEffort, attachments } = (req.body || {}) as {
+    jobOrchestrator.pruneOldJobs();
+    const { threadId, message, reasoningEffort, accessMode, attachments } = (req.body || {}) as {
       threadId?: string;
       message?: string;
       reasoningEffort?: string;
+      accessMode?: ExecutionAccessMode;
       attachments?: ChatAttachmentRecord[];
     };
     const { publicAttachments, agentAttachments } = normalizeIncomingAttachments(attachments);
@@ -819,137 +784,201 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    let llmCfg = await enrichLLMConfigLimits(store.getLLMConfig());
-    if (!llmCfg.primary.model.trim()) {
-      res.status(400).json({
-        error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
-      });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const derivedTitle = cleanThreadTitle(text) || 'New Agent Session';
-    const userMsg: ChatMessageRecord = {
-      id: `msg-${crypto.randomBytes(6).toString('hex')}`,
-      role: 'user',
-      content: text,
-      timestamp: now,
-      ...(publicAttachments.length > 0 ? { attachments: publicAttachments } : {}),
-    };
-
-    const thread = store.updateThreads((threads) => {
-      let target = threads.find((t) => t.id === threadId);
-      if (!target) {
-        target = {
-          id: threadId || `thread-${crypto.randomBytes(5).toString('hex')}`,
-          title: derivedTitle,
-          createdAt: now,
-          updatedAt: now,
-          messages: [],
-          pendingApproval: null,
-        };
-        threads.unshift(target);
-      } else if (target.messages.length === 0) {
-        target.title = derivedTitle;
+    let lockedThreadId = threadId ? String(threadId) : '';
+    if (lockedThreadId) {
+      if (!jobOrchestrator.tryAcquireThreadLaunch(lockedThreadId)) {
+        const existingActive = jobOrchestrator.getActiveJobForThread(lockedThreadId);
+        res.status(409).json({
+          error: 'An agent task is already running in this session.',
+          ...(existingActive ? { activeJob: existingActive } : {}),
+        });
+        return;
       }
-      target.messages.push(userMsg);
-      target.updatedAt = now;
-      return target;
-    });
-
-    const requestedEffort =
-      typeof reasoningEffort === 'string' && reasoningEffort.trim()
-        ? reasoningEffort.trim().toLowerCase()
-        : llmCfg.primary.reasoning_effort;
-
-    if (requestedEffort && requestedEffort !== llmCfg.primary.reasoning_effort) {
-      llmCfg = store.saveLLMConfig({
-        primary: { ...llmCfg.primary, reasoning_effort: requestedEffort },
-      });
     }
 
-    const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
-    await syncProfileSecretsToCore(getSessionUsername(res), true);
+    try {
+      const username = getSessionUsername(res);
+      const profileSecrets = loadProfileSecrets(username);
+      let llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
+      if (!llmCfg.primary.model.trim()) {
+        res.status(400).json({
+          error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
+        });
+        return;
+      }
 
-    const agentResp = await callAgentCore('/agent/jobs/run', {
-      method: 'POST',
-      timeoutMs: 15_000,
-      body: {
-        task: text,
-        thread_id: thread.id,
-        max_turns: llmCfg.max_turns,
-        primary_model: {
-          provider: llmCfg.primary.provider,
-          model: llmCfg.primary.model,
-          base_url: llmCfg.primary.base_url,
-          temperature: llmCfg.primary.temperature,
-          max_tokens: llmCfg.primary.max_tokens,
-          reasoning_effort: requestedEffort,
-          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
-          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
-        },
-        worker_model: {
-          provider: llmCfg.worker.provider,
-          model: llmCfg.worker.model,
-          base_url: llmCfg.worker.base_url,
-          temperature: llmCfg.worker.temperature,
-          max_tokens: llmCfg.worker.max_tokens,
-          reasoning_effort: llmCfg.worker.reasoning_effort,
-          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
-          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
-        },
-        accessory_models: llmCfg.accessories,
-        attachments: agentAttachments.length > 0 ? agentAttachments : undefined,
-        mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
-      },
-    });
+      if (lockedThreadId && jobOrchestrator.isThreadDeleted(lockedThreadId)) {
+        res.status(404).json({ error: 'Thread was deleted before execution started.' });
+        return;
+      }
 
-    if (!agentResp.ok || !agentResp.data.job_id) {
-      const replyNow = new Date().toISOString();
-      const errDetail = String(
-        agentResp.data.detail || agentResp.data.error || `Agent-Core returned HTTP ${agentResp.status}`,
-      );
-      const assistantMsg: ChatMessageRecord = {
+      const now = new Date().toISOString();
+      const derivedTitle = cleanThreadTitle(text) || 'New Agent Session';
+      const userMsg: ChatMessageRecord = {
         id: `msg-${crypto.randomBytes(6).toString('hex')}`,
-        role: 'assistant',
-        content: `Agent-Core could not complete this run: ${errDetail}`,
-        timestamp: replyNow,
-        status: 'error',
+        role: 'user',
+        content: text,
+        timestamp: now,
+        ...(publicAttachments.length > 0 ? { attachments: publicAttachments } : {}),
       };
-      const updatedThread = store.updateThreads((freshThreads) => {
-        let target = freshThreads.find((t) => t.id === thread.id);
+
+      const thread = store.updateThreads((threads) => {
+        let target = threads.find((t) => t.id === threadId);
         if (!target) {
+          if (threadId && jobOrchestrator.isThreadDeleted(threadId)) {
+            return null;
+          }
           target = {
-            id: thread.id,
+            id: threadId || `thread-${crypto.randomBytes(5).toString('hex')}`,
             title: derivedTitle,
             createdAt: now,
-            updatedAt: replyNow,
-            messages: [userMsg],
+            updatedAt: now,
+            messages: [],
             pendingApproval: null,
           };
-          freshThreads.unshift(target);
+          threads.unshift(target);
+        } else if (target.messages.length === 0) {
+          target.title = derivedTitle;
         }
-        target.messages.push(assistantMsg);
-        target.updatedAt = replyNow;
+        target.messages.push(userMsg);
+        target.updatedAt = now;
         return target;
       });
-      res.status(200).json({
-        jobId: null,
-        status: 'error',
-        thread: updatedThread,
-        message: assistantMsg,
-        error: errDetail,
-      });
-      return;
-    }
 
-    const jobId = String(agentResp.data.job_id);
-    activeChatJobs.set(jobId, { threadId: thread.id, finalized: false, createdAt: Date.now() });
-    res.status(202).json({
-      jobId,
-      thread,
-      activity: extractActivityFromJobPayload(jobId, agentResp.data),
-    });
+      if (!thread) {
+        res.status(404).json({ error: 'Thread was deleted before execution started.' });
+        return;
+      }
+
+      if (!lockedThreadId) {
+        lockedThreadId = thread.id;
+        jobOrchestrator.tryAcquireThreadLaunch(lockedThreadId);
+      }
+
+      const requestedEffort =
+        typeof reasoningEffort === 'string' && reasoningEffort.trim()
+          ? reasoningEffort.trim().toLowerCase()
+          : llmCfg.primary.reasoning_effort;
+
+      const effectiveAccessMode =
+        accessMode === 'default' || accessMode === 'full_access'
+          ? accessMode
+          : llmCfg.access_mode;
+
+      if (
+        (requestedEffort && requestedEffort !== llmCfg.primary.reasoning_effort) ||
+        effectiveAccessMode !== llmCfg.access_mode
+      ) {
+        llmCfg = store.saveLLMConfig({
+          primary: { ...llmCfg.primary, reasoning_effort: requestedEffort },
+          access_mode: effectiveAccessMode,
+        });
+      }
+
+      const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
+      await syncProfileSecretsToCore(username, true);
+
+      if (
+        jobOrchestrator.isThreadDeleted(thread.id) ||
+        !store.listThreads().some((t) => t.id === thread.id)
+      ) {
+        res.status(404).json({ error: 'Thread was deleted before execution started.' });
+        return;
+      }
+
+      const agentResp = await callAgentCore('/agent/jobs/run', {
+        method: 'POST',
+        timeoutMs: 15_000,
+        body: {
+          task: text,
+          thread_id: thread.id,
+          max_turns: llmCfg.max_turns,
+          access_mode: effectiveAccessMode,
+          primary_model: {
+            provider: llmCfg.primary.provider,
+            model: llmCfg.primary.model,
+            base_url: llmCfg.primary.base_url,
+            temperature: llmCfg.primary.temperature,
+            max_tokens: llmCfg.primary.max_tokens,
+            reasoning_effort: requestedEffort,
+            ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
+            ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
+          },
+          worker_model: {
+            provider: llmCfg.worker.provider,
+            model: llmCfg.worker.model,
+            base_url: llmCfg.worker.base_url,
+            temperature: llmCfg.worker.temperature,
+            max_tokens: llmCfg.worker.max_tokens,
+            reasoning_effort: llmCfg.worker.reasoning_effort,
+            ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
+            ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
+          },
+          accessory_models: llmCfg.accessories,
+          attachments: agentAttachments.length > 0 ? agentAttachments : undefined,
+          mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
+        },
+      });
+
+      if (!agentResp.ok || !agentResp.data.job_id) {
+        const replyNow = new Date().toISOString();
+        const errDetail = String(
+          agentResp.data.detail || agentResp.data.error || `Agent-Core returned HTTP ${agentResp.status}`,
+        );
+        const assistantMsg: ChatMessageRecord = {
+          id: `msg-${crypto.randomBytes(6).toString('hex')}`,
+          role: 'assistant',
+          content: `Agent-Core could not complete this run: ${errDetail}`,
+          timestamp: replyNow,
+          status: 'error',
+        };
+        const updatedThread = store.updateThreads((freshThreads) => {
+          const target = freshThreads.find((t) => t.id === thread.id);
+          // Do NOT resurrect a thread that was deleted while starting the job
+          if (!target) return null;
+          target.messages.push(assistantMsg);
+          target.updatedAt = replyNow;
+          return target;
+        });
+        res.status(200).json({
+          jobId: null,
+          status: 'error',
+          thread: updatedThread,
+          message: assistantMsg,
+          error: errDetail,
+        });
+        return;
+      }
+
+      const jobId = String(agentResp.data.job_id);
+      if (
+        jobOrchestrator.isThreadDeleted(thread.id) ||
+        !store.listThreads().some((t) => t.id === thread.id)
+      ) {
+        // Thread was deleted while Agent-Core was starting the job; cancel immediately to avoid an orphan
+        void callAgentCore(`/agent/jobs/${encodeURIComponent(jobId)}/cancel`, {
+          method: 'POST',
+          timeoutMs: 5_000,
+        }).catch(() => undefined);
+        res.status(404).json({ error: 'Thread was deleted while starting execution.' });
+        return;
+      }
+
+      const activity = jobOrchestrator.registerJob({
+        jobId,
+        threadId: thread.id,
+        initialPayload: agentResp.data,
+      });
+      res.status(202).json({
+        jobId,
+        thread,
+        activity,
+      });
+    } finally {
+      if (lockedThreadId) {
+        jobOrchestrator.releaseThreadLaunch(lockedThreadId);
+      }
+    }
   });
 
   const reconcileThreadPendingApproval = async (threadId: string) => {
@@ -979,247 +1008,187 @@ async function startServer(): Promise<void> {
   };
 
   app.post('/api/chat/jobs/resume', requireSession, async (req, res) => {
-    pruneChatJobs();
-    const { threadId, decision, arguments: editedArgs, reason } = (req.body || {}) as {
+    jobOrchestrator.pruneOldJobs();
+    const { threadId, decision, arguments: editedArgs, reason, accessMode } = (req.body || {}) as {
       threadId?: string;
       decision?: 'approve' | 'reject' | 'edit';
       arguments?: Record<string, unknown>;
       reason?: string;
+      accessMode?: ExecutionAccessMode;
     };
     if (!threadId || !decision) {
       res.status(400).json({ error: 'threadId and decision are required.' });
       return;
     }
 
-    const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig());
-    const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
-    await syncProfileSecretsToCore(getSessionUsername(res), true);
-
-    const agentResp = await callAgentCore('/agent/jobs/resume', {
-      method: 'POST',
-      timeoutMs: 15_000,
-      body: {
-        thread_id: threadId,
-        decision,
-        arguments: editedArgs,
-        reason,
-        primary_model: {
-          provider: llmCfg.primary.provider,
-          model: llmCfg.primary.model,
-          base_url: llmCfg.primary.base_url,
-          temperature: llmCfg.primary.temperature,
-          max_tokens: llmCfg.primary.max_tokens,
-          reasoning_effort: llmCfg.primary.reasoning_effort,
-          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
-          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
-        },
-        worker_model: {
-          provider: llmCfg.worker.provider,
-          model: llmCfg.worker.model,
-          base_url: llmCfg.worker.base_url,
-          temperature: llmCfg.worker.temperature,
-          max_tokens: llmCfg.worker.max_tokens,
-          reasoning_effort: llmCfg.worker.reasoning_effort,
-          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
-          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
-        },
-        accessory_models: llmCfg.accessories,
-        mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
-      },
-    });
-
-    if (agentResp.status === 409) {
-      const reconciled = await reconcileThreadPendingApproval(threadId);
-      res.status(200).json({
-        jobId: null,
-        alreadyResolved: true,
-        thread: reconciled,
+    if (!jobOrchestrator.tryAcquireThreadLaunch(threadId)) {
+      const existingActive = jobOrchestrator.getActiveJobForThread(threadId);
+      res.status(409).json({
+        error: 'An agent task is already running in this session.',
+        ...(existingActive ? { activeJob: existingActive } : {}),
       });
       return;
     }
 
-    if (!agentResp.ok || !agentResp.data.job_id) {
-      res.status(agentResp.status || 502).json({
-        error: String(
-          agentResp.data.detail ||
-            agentResp.data.error ||
-            `Failed to start approval execution (HTTP ${agentResp.status}).`,
-        ),
-      });
-      return;
-    }
+    try {
+      const username = getSessionUsername(res);
+      const profileSecrets = loadProfileSecrets(username);
+      const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
+      const effectiveAccessMode =
+        accessMode === 'default' || accessMode === 'full_access'
+          ? accessMode
+          : llmCfg.access_mode;
+      const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
+      await syncProfileSecretsToCore(username, true);
 
-    const jobId = String(agentResp.data.job_id);
-    activeChatJobs.set(jobId, { threadId, finalized: false, createdAt: Date.now() });
-    const thread = store.listThreads().find((t) => t.id === threadId) || null;
-    res.status(202).json({
-      jobId,
-      thread,
-      activity: extractActivityFromJobPayload(jobId, agentResp.data),
-    });
+      if (
+        jobOrchestrator.isThreadDeleted(threadId) ||
+        !store.listThreads().some((t) => t.id === threadId)
+      ) {
+        res.status(404).json({ error: 'Thread was deleted before resume started.' });
+        return;
+      }
+
+      const agentResp = await callAgentCore('/agent/jobs/resume', {
+        method: 'POST',
+        timeoutMs: 15_000,
+        body: {
+          thread_id: threadId,
+          decision,
+          arguments: editedArgs,
+          reason,
+          access_mode: effectiveAccessMode,
+          primary_model: {
+            provider: llmCfg.primary.provider,
+            model: llmCfg.primary.model,
+            base_url: llmCfg.primary.base_url,
+            temperature: llmCfg.primary.temperature,
+            max_tokens: llmCfg.primary.max_tokens,
+            reasoning_effort: llmCfg.primary.reasoning_effort,
+            ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
+            ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
+          },
+          worker_model: {
+            provider: llmCfg.worker.provider,
+            model: llmCfg.worker.model,
+            base_url: llmCfg.worker.base_url,
+            temperature: llmCfg.worker.temperature,
+            max_tokens: llmCfg.worker.max_tokens,
+            reasoning_effort: llmCfg.worker.reasoning_effort,
+            ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
+            ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
+          },
+          accessory_models: llmCfg.accessories,
+          mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
+        },
+      });
+
+      if (agentResp.status === 409) {
+        const reconciled = await reconcileThreadPendingApproval(threadId);
+        res.status(200).json({
+          jobId: null,
+          alreadyResolved: true,
+          thread: reconciled,
+        });
+        return;
+      }
+
+      if (!agentResp.ok || !agentResp.data.job_id) {
+        res.status(agentResp.status || 502).json({
+          error: String(
+            agentResp.data.detail ||
+              agentResp.data.error ||
+              `Failed to start approval execution (HTTP ${agentResp.status}).`,
+          ),
+        });
+        return;
+      }
+
+      const jobId = String(agentResp.data.job_id);
+      if (
+        jobOrchestrator.isThreadDeleted(threadId) ||
+        !store.listThreads().some((t) => t.id === threadId)
+      ) {
+        void callAgentCore(`/agent/jobs/${encodeURIComponent(jobId)}/cancel`, {
+          method: 'POST',
+          timeoutMs: 5_000,
+        }).catch(() => undefined);
+        res.status(404).json({ error: 'Thread was deleted while resuming execution.' });
+        return;
+      }
+
+      const activity = jobOrchestrator.registerJob({
+        jobId,
+        threadId,
+        initialPayload: agentResp.data,
+      });
+      const thread = store.listThreads().find((t) => t.id === threadId) || null;
+      res.status(202).json({
+        jobId,
+        thread,
+        activity,
+      });
+    } finally {
+      jobOrchestrator.releaseThreadLaunch(threadId);
+    }
   });
 
   app.get('/api/chat/jobs/:jobId', requireSession, async (req, res) => {
     const jobId = req.params.jobId;
     const waitMs = Math.min(2000, Math.max(0, Number(req.query.wait_ms || 300) || 300));
-    const poll = await callAgentCore(`/agent/jobs/${encodeURIComponent(jobId)}?wait_ms=${waitMs}`, {
-      timeoutMs: 15_000,
+    const result = await jobOrchestrator.pollJobForClient(jobId, waitMs);
+
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+
+    if (!result.done) {
+      res.json({ done: false, activity: result.activity });
+      return;
+    }
+
+    res.json({
+      done: true,
+      activity: result.activity,
+      thread: result.thread ?? null,
+      ...(result.message ? { message: result.message } : {}),
     });
-
-    if (!poll.ok) {
-      res.status(poll.status).json({
-        error: String(poll.data.detail || 'Unable to poll live agent job.'),
-      });
-      return;
-    }
-
-    const data = poll.data;
-    const activity = extractActivityFromJobPayload(jobId, data);
-    const isTerminal = ['completed', 'awaiting_approval', 'error', 'stalled', 'cancelled'].includes(
-      activity.status,
-    );
-
-    if (!isTerminal) {
-      res.json({ done: false, activity });
-      return;
-    }
-
-    const jobMeta = activeChatJobs.get(jobId);
-    const targetThreadId = jobMeta?.threadId || String(data.thread_id || '');
-
-    if (jobMeta && !jobMeta.finalized && targetThreadId) {
-      jobMeta.finalized = true;
-      const replyNow = new Date().toISOString();
-      const resultObj =
-        data.result && typeof data.result === 'object'
-          ? (data.result as Record<string, unknown>)
-          : {};
-      const pendingApproval = (resultObj.pending_approval as Record<string, unknown> | null) || null;
-      const errText =
-        typeof data.error === 'string' && data.error.trim()
-          ? data.error.trim()
-          : typeof resultObj.error === 'string' && resultObj.error.trim()
-            ? resultObj.error.trim()
-            : null;
-      const finalText =
-        String(resultObj.final_response || '').trim() ||
-        (activity.status === 'awaiting_approval'
-          ? 'Execution paused for your approval before running a sensitive tool action.'
-          : activity.status === 'cancelled'
-            ? 'Stopped by user.'
-            : errText
-              ? `Agent-Core could not complete this run: ${errText}`
-              : activity.status === 'stalled'
-                ? 'Agent-Core stopped because the task became unresponsive with no active background work.'
-                : 'Task completed.');
-
-      const assistantMsg: ChatMessageRecord = {
-        id: `msg-${crypto.randomBytes(6).toString('hex')}`,
-        role: 'assistant',
-        content: finalText,
-        timestamp: replyNow,
-        plan: Array.isArray(resultObj.plan)
-          ? (resultObj.plan as ChatThreadRecord['messages'][number]['plan'])
-          : [],
-        activeSkills: Array.isArray(resultObj.active_skills)
-          ? (resultObj.active_skills as string[])
-          : [],
-        subagentReports: Array.isArray(resultObj.subagent_reports)
-          ? (resultObj.subagent_reports as Array<Record<string, unknown>>)
-          : [],
-        activeModels: resultObj.active_models as ChatThreadRecord['messages'][number]['activeModels'],
-        thinking: activity.thinking,
-        toolEvents: activity.toolEvents,
-        fileChanges: activity.fileChanges,
-        pendingApproval,
-        status: activity.status,
-      };
-
-      const updatedThread = store.updateThreads((freshThreads) => {
-        const target = freshThreads.find((t) => t.id === targetThreadId);
-        if (!target) return null;
-        target.messages.push(assistantMsg);
-        target.pendingApproval = pendingApproval;
-        if (activity.contextUsage) {
-          target.contextUsage = activity.contextUsage;
-        }
-        target.updatedAt = replyNow;
-        return target;
-      });
-      res.json({ done: true, activity, thread: updatedThread, message: assistantMsg });
-      return;
-    }
-
-    const thread = store.listThreads().find((t) => t.id === targetThreadId) || null;
-    res.json({ done: true, activity, thread });
   });
 
   app.post('/api/chat/jobs/:jobId/cancel', requireSession, async (req, res) => {
     const jobId = req.params.jobId;
-    const cancelResp = await callAgentCore(`/agent/jobs/${encodeURIComponent(jobId)}/cancel`, {
-      method: 'POST',
-      timeoutMs: 10_000,
+    const result = await jobOrchestrator.cancelJob(jobId);
+    res.json({
+      ok: true,
+      activity: result.activity,
+      thread: result.thread,
+      ...(result.message ? { message: result.message } : {}),
     });
-
-    const data = cancelResp.data || {};
-    const activity = extractActivityFromJobPayload(jobId, {
-      ...data,
-      status: data.status || 'cancelled',
-      current_phase: data.current_phase || 'cancelled',
-      last_event: data.last_event || 'Stopped by user.',
-    });
-
-    const jobMeta = activeChatJobs.get(jobId);
-    const targetThreadId = jobMeta?.threadId || String(data.thread_id || '');
-
-    if (jobMeta && !jobMeta.finalized && targetThreadId) {
-      jobMeta.finalized = true;
-      const replyNow = new Date().toISOString();
-      const assistantMsg: ChatMessageRecord = {
-        id: `msg-${crypto.randomBytes(6).toString('hex')}`,
-        role: 'assistant',
-        content: 'Stopped by user.',
-        timestamp: replyNow,
-        plan: [],
-        activeSkills: [],
-        subagentReports: [],
-        thinking: activity.thinking,
-        toolEvents: activity.toolEvents,
-        fileChanges: activity.fileChanges,
-        pendingApproval: null,
-        status: 'cancelled',
-      };
-      const updatedThread = store.updateThreads((freshThreads) => {
-        const target = freshThreads.find((t) => t.id === targetThreadId);
-        if (!target) return null;
-        target.messages.push(assistantMsg);
-        target.pendingApproval = null;
-        target.updatedAt = replyNow;
-        return target;
-      });
-      res.json({ ok: true, activity, thread: updatedThread, message: assistantMsg });
-      return;
-    }
-
-    const thread = store.listThreads().find((t) => t.id === targetThreadId) || null;
-    res.json({ ok: true, activity, thread });
   });
 
   app.post('/api/chat/resume', requireSession, async (req, res) => {
-    const { threadId, decision, arguments: editedArgs, reason } = (req.body || {}) as {
+    const { threadId, decision, arguments: editedArgs, reason, accessMode } = (req.body || {}) as {
       threadId?: string;
       decision?: 'approve' | 'reject' | 'edit';
       arguments?: Record<string, unknown>;
       reason?: string;
+      accessMode?: ExecutionAccessMode;
     };
     if (!threadId || !decision) {
       res.status(400).json({ error: 'threadId and decision are required.' });
       return;
     }
 
-    const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig());
+    const username = getSessionUsername(res);
+    const profileSecrets = loadProfileSecrets(username);
+    const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
+    const effectiveAccessMode =
+      accessMode === 'default' || accessMode === 'full_access'
+        ? accessMode
+        : llmCfg.access_mode;
     const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
-    await syncProfileSecretsToCore(getSessionUsername(res), true);
+    await syncProfileSecretsToCore(username, true);
     const agentResp = await callAgentCore('/agent/resume', {
       method: 'POST',
       timeoutMs: 300_000,
@@ -1228,6 +1197,7 @@ async function startServer(): Promise<void> {
         decision,
         arguments: editedArgs,
         reason,
+        access_mode: effectiveAccessMode,
         primary_model: {
           provider: llmCfg.primary.provider,
           model: llmCfg.primary.model,
@@ -1385,12 +1355,67 @@ async function startServer(): Promise<void> {
   app.get('/api/settings/llm', requireSession, async (_req, res) => {
     const username = getSessionUsername(res);
     const secrets = loadProfileSecrets(username);
-    const config = await enrichLLMConfigLimits(store.getLLMConfig());
+    const config = await enrichLLMConfigLimits(store.getLLMConfig(), { env: secrets });
     res.json({
       config,
       providers: store.getProviderAvailability(secrets),
       vault: buildVaultSummary(username),
     });
+  });
+
+  app.get('/api/settings/access-mode', requireSession, (_req, res) => {
+    const cfg = store.getLLMConfig();
+    res.json({ access_mode: cfg.access_mode });
+  });
+
+  app.put('/api/settings/access-mode', requireSession, async (req, res) => {
+    const { access_mode } = (req.body || {}) as { access_mode?: unknown };
+    if (access_mode !== 'default' && access_mode !== 'full_access') {
+      res.status(400).json({
+        error: "Invalid access_mode. Expected 'default' or 'full_access'.",
+      });
+      return;
+    }
+    const saved = store.saveLLMConfig({ access_mode });
+    const syncResp = await callAgentCore('/config/access-mode', {
+      method: 'PUT',
+      body: { access_mode: saved.access_mode },
+      timeoutMs: 4000,
+    });
+    res.json({
+      ok: true,
+      access_mode: saved.access_mode,
+      coreSynced: syncResp.ok,
+    });
+  });
+
+  app.post('/api/settings/resolve-model', requireSession, async (req, res) => {
+    const username = getSessionUsername(res);
+    const { provider, model, base_url, api_key, role } = (req.body || {}) as {
+      provider?: string;
+      model?: string;
+      base_url?: string;
+      api_key?: string;
+      role?: 'primary' | 'worker' | 'image' | 'video' | 'audio';
+    };
+    const cleanModel = (model || '').trim();
+    if (!cleanModel) {
+      res.status(400).json({ error: 'Model ID is required.' });
+      return;
+    }
+    const profileSecrets = loadProfileSecrets(username);
+    const resolved = await resolveModelMetadataUnified({
+      provider: (provider || 'river_ai').trim(),
+      model: cleanModel,
+      base_url: base_url?.trim() || undefined,
+      api_key: api_key?.trim() || undefined,
+      role: role === 'primary' ? 'primary' : 'worker',
+      env: profileSecrets,
+      allowLiveFetch: true,
+      allowReferenceFetch: true,
+      timeoutMs: 3500,
+    });
+    res.json(resolved);
   });
 
   app.put('/api/settings/llm', requireSession, async (req, res) => {
@@ -1403,7 +1428,8 @@ async function startServer(): Promise<void> {
         video: Partial<AccessoryLLMConfig>;
         audio: Partial<AccessoryLLMConfig>;
       }>;
-      max_turns?: number;
+      max_turns?: unknown;
+      access_mode?: unknown;
       api_keys?: {
         primary?: string;
         worker?: string;
@@ -1413,34 +1439,61 @@ async function startServer(): Promise<void> {
       };
     };
 
+    let validatedMaxTurns: number | undefined;
+    if (body.max_turns !== undefined) {
+      const check = validateMaxTurns(body.max_turns);
+      if (!check.ok) {
+        res.status(400).json({ error: check.error });
+        return;
+      }
+      validatedMaxTurns = check.value;
+    }
+
+    let validatedAccessMode: ExecutionAccessMode | undefined;
+    if (body.access_mode !== undefined) {
+      if (body.access_mode !== 'default' && body.access_mode !== 'full_access') {
+        res.status(400).json({
+          error: "Invalid access_mode. Expected 'default' or 'full_access'.",
+        });
+        return;
+      }
+      validatedAccessMode = normalizeAccessMode(body.access_mode);
+    }
+
+    const currentSecrets = loadProfileSecrets(username);
     const initialSaved = store.saveLLMConfig({
       primary: body.primary as ReturnType<typeof store.getLLMConfig>['primary'],
       worker: body.worker as ReturnType<typeof store.getLLMConfig>['worker'],
       accessories: body.accessories,
-      max_turns: body.max_turns,
+      ...(validatedMaxTurns !== undefined ? { max_turns: validatedMaxTurns } : {}),
+      ...(validatedAccessMode !== undefined ? { access_mode: validatedAccessMode } : {}),
     });
-    const enriched = await enrichLLMConfigLimits(initialSaved);
-    const saved =
-      JSON.stringify(enriched) !== JSON.stringify(initialSaved)
-        ? store.saveLLMConfig(enriched)
-        : initialSaved;
 
     const vaultUpdates: Record<string, string> = {};
     if (body.api_keys?.primary && body.api_keys.primary.trim()) {
-      const envVar = store.getEnvVarForProvider(saved.primary.provider, 'primary');
+      const envVar = store.getEnvVarForProvider(initialSaved.primary.provider, 'primary');
       vaultUpdates[envVar] = body.api_keys.primary.trim();
     }
     if (body.api_keys?.worker && body.api_keys.worker.trim()) {
-      const envVar = store.getEnvVarForProvider(saved.worker.provider, 'worker');
+      const envVar = store.getEnvVarForProvider(initialSaved.worker.provider, 'worker');
       vaultUpdates[envVar] = body.api_keys.worker.trim();
     }
     for (const mod of ['image', 'video', 'audio'] as const) {
       const keyVal = body.api_keys?.[mod];
       if (keyVal && keyVal.trim()) {
-        const envVar = store.getEnvVarForProvider(saved.accessories[mod].provider, 'worker');
+        const envVar = store.getEnvVarForProvider(initialSaved.accessories[mod].provider, 'worker');
         vaultUpdates[envVar] = keyVal.trim();
       }
     }
+
+    const enriched = await enrichLLMConfigLimits(initialSaved, {
+      env: { ...currentSecrets, ...vaultUpdates },
+      allowLiveFetch: true,
+    });
+    const saved =
+      JSON.stringify(enriched) !== JSON.stringify(initialSaved)
+        ? store.saveLLMConfig(enriched)
+        : initialSaved;
 
     // Store API keys encrypted at rest inside this user's profile vault (AES-256-GCM)
     let savedVaultKeys: string[] = [];
@@ -1713,6 +1766,8 @@ async function startServer(): Promise<void> {
         server.closeAllConnections();
       }
     });
+
+    jobOrchestrator.shutdown();
 
     await Promise.allSettled([
       httpClosePromise,

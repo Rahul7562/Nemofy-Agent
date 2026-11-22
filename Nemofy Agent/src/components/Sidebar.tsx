@@ -18,6 +18,7 @@ import { NemofyLogo } from './NemofyLogo.tsx';
 interface SidebarProps {
   threads: ChatThread[];
   activeThreadId: string | null;
+  runningThreadIds?: Set<string>;
   loadingThreads: boolean;
   onNewThread: () => void;
   onSelectThread: (id: string) => void;
@@ -37,6 +38,7 @@ interface SidebarProps {
 export function Sidebar({
   threads,
   activeThreadId,
+  runningThreadIds,
   loadingThreads,
   onNewThread,
   onSelectThread,
@@ -221,10 +223,13 @@ export function Sidebar({
                 </div>
                 {group.threads.map((thread) => {
                   const selected = thread.id === activeThreadId;
+                  const isRunning = Boolean(runningThreadIds?.has(thread.id));
                   const title = thread.title || 'Untitled session';
                   return (
                     <div
                       key={thread.id}
+                      data-thread-id={thread.id}
+                      data-running={isRunning ? 'true' : 'false'}
                       className={`group flex items-center justify-between gap-1 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors ${
                         selected
                           ? 'bg-[var(--blush)] text-[var(--signal)] font-medium'
@@ -238,9 +243,16 @@ export function Sidebar({
                           if (isMobile) onCloseMobile();
                         }}
                         aria-current={selected ? 'page' : undefined}
-                        className="flex-1 min-w-0 text-left truncate py-0.5 cursor-pointer"
+                        className="flex-1 min-w-0 text-left flex items-center gap-2 py-0.5 cursor-pointer"
                       >
-                        {title}
+                        {isRunning && (
+                          <span
+                            aria-label="Running in background"
+                            title="Agent running in background"
+                            className="w-1.5 h-1.5 rounded-full bg-[var(--signal)] animate-pulse shrink-0"
+                          />
+                        )}
+                        <span className="truncate">{title}</span>
                       </button>
                       <button
                         type="button"

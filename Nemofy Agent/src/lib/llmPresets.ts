@@ -143,6 +143,8 @@ export const LLM_PROVIDER_PRESETS: ProviderPreset[] = [
 ];
 
 export const REASONING_EFFORT_OPTIONS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const MIN_MAX_TURNS = 1;
+export const MAX_MAX_TURNS = 180;
 
 const PROVIDER_ALIASES: Record<string, string> = {
   river: 'river_ai',
@@ -549,9 +551,15 @@ export function validateLLMConfig(
 
   if (
     (scope === 'all' || scope === 'llm') &&
-    (Number.isNaN(config.max_turns) || config.max_turns < 1 || config.max_turns > 100)
+    (!Number.isFinite(config.max_turns) ||
+      !Number.isInteger(config.max_turns) ||
+      config.max_turns < MIN_MAX_TURNS ||
+      config.max_turns > MAX_MAX_TURNS)
   ) {
-    return { valid: false, error: 'Max execution turns must be between 1 and 100.' };
+    return {
+      valid: false,
+      error: `Max execution turns must be a whole number between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+    };
   }
 
   return { valid: true };

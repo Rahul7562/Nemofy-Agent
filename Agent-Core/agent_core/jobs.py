@@ -278,7 +278,9 @@ class AgentJob:
                     self.file_changes.append(dict(item))
 
         ctx_usage = event.get("context_usage")
-        if isinstance(ctx_usage, dict) and ctx_usage.get("context_window"):
+        if isinstance(ctx_usage, dict) and (
+            "used_tokens" in ctx_usage or "context_window" in ctx_usage
+        ):
             self.context_usage = dict(ctx_usage)
 
         detail = str(event.get("detail") or event.get("tool") or phase).strip()
@@ -347,7 +349,10 @@ class AgentJob:
         if (
             isinstance(self.result, dict)
             and isinstance(self.result.get("context_usage"), dict)
-            and self.result["context_usage"].get("context_window")
+            and (
+                "used_tokens" in self.result["context_usage"]
+                or "context_window" in self.result["context_usage"]
+            )
         ):
             merged_context_usage = dict(self.result["context_usage"])
 
@@ -437,6 +442,13 @@ class JobManager:
 
     def get_job(self, job_id: str) -> AgentJob | None:
         return self._jobs.get(job_id)
+
+    def get_active_job_for_thread(self, thread_id: str) -> AgentJob | None:
+        """Return an active (staged or running) non-stalled job for the given thread, if any."""
+        for job in self._jobs.values():
+            if job.thread_id == thread_id and job.status in ("staged", "running"):
+                return job
+        return None
 
     def verify_job_token(self, job_id: str, provided_token: str | None) -> bool:
         job = self._jobs.get(job_id)

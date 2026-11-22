@@ -1,11 +1,14 @@
 import type {
+  ActiveBackgroundJob,
   AgentHealthResponse,
   AuthSession,
   ChatAttachment,
   ChatMessage,
   ChatThread,
+  ExecutionAccessMode,
   LiveAgentActivity,
   MCPServerItem,
+  ModelResolutionResult,
   ModelRoleKey,
   PersistedLLMConfig,
   ProfileVaultSummary,
@@ -15,6 +18,7 @@ import type {
   SkillDocument,
   WorkspaceNode,
 } from '../types/agent.ts';
+import { resolveModelLimits } from './contextUtils.ts';
 import {
   DEFAULT_ADMIN_USERNAME,
   hashStandaloneCredential,
@@ -155,6 +159,7 @@ function getDefaultLLMConfig(): PersistedLLMConfig {
     },
     accessories: getDefaultAccessoriesConfig(),
     max_turns: 30,
+    access_mode: 'default',
   };
 }
 
@@ -494,12 +499,24 @@ export async function sendChatMessage(
   return res.data;
 }
 
+export async function fetchActiveChatJobs(): Promise<ActiveBackgroundJob[]> {
+  if (detectedStandaloneMode) {
+    return [];
+  }
+  const res = await apiFetch<{ jobs?: ActiveBackgroundJob[] }>('/api/chat/jobs/active');
+  if (!res.ok || !Array.isArray(res.data?.jobs)) {
+    return [];
+  }
+  return res.data.jobs;
+}
+
 export async function startChatJob(
   threadId: string,
   message: string,
   reasoningEffort?: string,
   signal?: AbortSignal,
   attachments?: ChatAttachment[],
+  accessMode?: ExecutionAccessMode,
 ): Promise<{
   jobId: string | null;
   thread: ChatThread;
@@ -529,6 +546,7 @@ export async function startChatJob(
       threadId,
       message,
       reasoningEffort,
+      ...(accessMode ? { accessMode } : {}),
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
     }),
     signal,
@@ -546,6 +564,7 @@ export async function startResumeApprovalJob(
   args?: Record<string, unknown>,
   reason?: string,
   signal?: AbortSignal,
+  accessMode?: ExecutionAccessMode,
 ): Promise<{
   jobId: string | null;
   alreadyResolved?: boolean;
@@ -563,7 +582,13 @@ export async function startResumeApprovalJob(
     error?: string;
   }>('/api/chat/jobs/resume', {
     method: 'POST',
-    body: JSON.stringify({ threadId, decision, arguments: args, reason }),
+    body: JSON.stringify({
+      threadId,
+      decision,
+      arguments: args,
+      reason,
+      ...(accessMode ? { accessMode } : {}),
+    }),
     signal,
   });
 
@@ -628,6 +653,7 @@ export async function resumeApproval(
   decision: 'approve' | 'reject' | 'edit',
   args?: Record<string, unknown>,
   reason?: string,
+  accessMode?: ExecutionAccessMode,
 ): Promise<{ thread?: ChatThread; message?: ChatMessage; alreadyResolved?: boolean }> {
   const res = await apiFetch<{
     thread?: ChatThread;
@@ -636,7 +662,13 @@ export async function resumeApproval(
     error?: string;
   }>('/api/chat/resume', {
     method: 'POST',
-    body: JSON.stringify({ threadId, decision, arguments: args, reason }),
+    body: JSON.stringify({
+      threadId,
+      decision,
+      arguments: args,
+      reason,
+      ...(accessMode ? { accessMode } : {}),
+    }),
   });
   if (!res.ok) {
     throw new Error(extractApiError(res, 'Failed to process approval.'));
@@ -933,6 +965,96 @@ export async function fetchProviderModels(params: {
     };
   }
 
+  return res.data;
+}
+
+export async function updateAccessMode(
+  accessMode: ExecutionAccessMode,
+): Promise<{ ok: boolean; access_mode: ExecutionAccessMode; coreSynced?: boolean }> {
+  if (detectedStandaloneMode) {
+    const raw = readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig());
+    writeLocalJson(STANDALONE_LLM_KEY, { ...raw, access_mode: accessMode });
+    return { ok: true, access_mode: accessMode, coreSynced: false };
+  }
+  const res = await apiFetch<{
+    ok?: boolean;
+    access_mode?: ExecutionAccessMode;
+    coreSynced?: boolean;
+    error?: string;
+  }>('/api/settings/access-mode', {
+    method: 'PUT',
+    body: JSON.stringify({ access_mode: accessMode }),
+  });
+  if (!res.ok) {
+    throw new Error(extractApiError(res, 'Unable to update execution access mode.'));
+  }
+  return {
+    ok: true,
+    access_mode: res.data.access_mode === 'full_access' ? 'full_access' : 'default',
+    coreSynced: res.data.coreSynced,
+  };
+}
+
+export async function resolveModelMetadata(params: {
+  provider: string;
+  model: string;
+  base_url?: string;
+  api_key?: string;
+  role?: ModelRoleKey;
+}): Promise<ModelResolutionResult> {
+  const cleanModel = (params.model || '').trim();
+  const cleanProvider = (params.provider || '').trim() || 'river_ai';
+  if (!cleanModel) {
+    return {
+      resolved: false,
+      provider: cleanProvider,
+      model: '',
+      matched_model: null,
+      context_window: null,
+      max_output_tokens: null,
+      context_window_source: 'unknown',
+      max_output_tokens_source: 'unknown',
+    };
+  }
+
+  if (detectedStandaloneMode) {
+    const limits = resolveModelLimits(cleanProvider, cleanModel);
+    return {
+      resolved: limits.contextWindow !== null,
+      provider: cleanProvider,
+      model: cleanModel,
+      matched_model: limits.contextWindow !== null ? cleanModel : null,
+      context_window: limits.contextWindow,
+      max_output_tokens: limits.maxOutputTokens,
+      context_window_source: limits.contextWindowSource,
+      max_output_tokens_source: limits.maxOutputTokensSource,
+    };
+  }
+
+  const res = await apiFetch<ModelResolutionResult>('/api/settings/resolve-model', {
+    method: 'POST',
+    body: JSON.stringify({
+      provider: cleanProvider,
+      model: cleanModel,
+      base_url: params.base_url?.trim() || undefined,
+      api_key: params.api_key?.trim() || undefined,
+      role: params.role || 'primary',
+    }),
+  });
+
+  if (!res.ok || !res.data) {
+    const limits = resolveModelLimits(cleanProvider, cleanModel);
+    return {
+      resolved: limits.contextWindow !== null,
+      provider: cleanProvider,
+      model: cleanModel,
+      matched_model: null,
+      context_window: limits.contextWindow,
+      max_output_tokens: limits.maxOutputTokens,
+      context_window_source: limits.contextWindowSource,
+      max_output_tokens_source: limits.maxOutputTokensSource,
+    };
+  }
   return res.data;
 }
 

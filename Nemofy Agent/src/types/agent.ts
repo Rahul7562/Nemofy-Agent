@@ -73,7 +73,8 @@ export type ContextCategoryKey =
   | 'tool_outputs'
   | 'compacted_summary';
 
-export type ContextClassificationLevel = 'optimal' | 'moderate' | 'high' | 'critical';
+export type ContextClassificationLevel = 'optimal' | 'moderate' | 'high' | 'critical' | 'unknown';
+export type ExecutionAccessMode = 'default' | 'full_access';
 
 export interface ContextClassification {
   level: ContextClassificationLevel;
@@ -93,14 +94,14 @@ export interface ContextCategoryBreakdown {
 export interface ContextUsageSnapshot {
   model: string;
   provider: string;
-  context_window: number;
+  context_window: number | null;
   context_window_source: string;
-  max_output_tokens?: number;
+  max_output_tokens?: number | null;
   max_output_tokens_source?: string;
-  configured_max_tokens?: number;
+  configured_max_tokens?: number | null;
   used_tokens: number;
-  free_tokens: number;
-  usage_percent: number;
+  free_tokens: number | null;
+  usage_percent: number | null;
   auto_compact_threshold_percent: number;
   classification: ContextClassification;
   categories: ContextCategoryBreakdown[];
@@ -131,6 +132,25 @@ export interface LiveAgentActivity {
   fileChanges: FileChangeItem[];
   contextUsage?: ContextUsageSnapshot | null;
   activeTasks?: ActiveTaskItem[];
+}
+
+export interface ActiveBackgroundJob {
+  jobId: string;
+  threadId: string;
+  status: string;
+  activity: LiveAgentActivity;
+  createdAt: number;
+}
+
+export interface ModelResolutionResult {
+  resolved: boolean;
+  provider: string;
+  model: string;
+  matched_model: string | null;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  context_window_source: 'provider_catalog' | 'reference_catalog' | 'model_registry' | 'unknown';
+  max_output_tokens_source: 'provider_catalog' | 'reference_catalog' | 'model_registry' | 'unknown';
 }
 
 export interface ChatMessage {
@@ -201,6 +221,7 @@ export interface PersistedLLMConfig {
   worker: RoleLLMConfig;
   accessories?: AccessoriesConfig;
   max_turns: number;
+  access_mode?: ExecutionAccessMode;
 }
 
 export interface ProviderAvailability {

@@ -1,6 +1,11 @@
 import { Settings, X } from 'lucide-react';
 import { useEffect } from 'react';
-import type { PersistedLLMConfig, SettingsTab, ThemeMode } from '../types/agent.ts';
+import type {
+  ExecutionAccessMode,
+  PersistedLLMConfig,
+  SettingsTab,
+  ThemeMode,
+} from '../types/agent.ts';
 import { SettingsView } from './SettingsView.tsx';
 
 interface SettingsModalProps {
@@ -10,6 +15,8 @@ interface SettingsModalProps {
   onSetTheme: (mode: ThemeMode) => void;
   initialTab: SettingsTab;
   onLLMConfigSaved: (config: PersistedLLMConfig) => void;
+  activePrimaryReasoningEffort?: string;
+  activeAccessMode?: ExecutionAccessMode;
 }
 
 export function SettingsModal({
@@ -19,6 +26,8 @@ export function SettingsModal({
   onSetTheme,
   initialTab,
   onLLMConfigSaved,
+  activePrimaryReasoningEffort,
+  activeAccessMode,
 }: SettingsModalProps) {
   useEffect(() => {
     if (!open) return;
@@ -75,6 +84,8 @@ export function SettingsModal({
             onSetTheme={onSetTheme}
             initialTab={initialTab}
             onLLMConfigSaved={onLLMConfigSaved}
+            activePrimaryReasoningEffort={activePrimaryReasoningEffort}
+            activeAccessMode={activeAccessMode}
             embedded
           />
         </div>

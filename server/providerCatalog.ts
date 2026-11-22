@@ -252,19 +252,69 @@ const ORG_PREFIX_ALIASES: Record<string, string> = {
   'mistral': 'mistralai',
   'moonshot': 'moonshotai',
   'nvidia-nim': 'nvidia',
+  'google-deepmind': 'google',
 };
 
 const MODEL_SLUG_ALIASES: Record<string, string[]> = {
   'deepseek-chat': ['deepseek/deepseek-chat', 'deepseek/deepseek-v3'],
   'deepseek-reasoner': ['deepseek/deepseek-r1', 'deepseek/deepseek-reasoner'],
   'mistral-large-4': ['mistralai/mistral-large-4-0'],
+  'gemini-2.5-pro-latest': ['google/gemini-2.5-pro'],
+  'gemini-2.5-flash-latest': ['google/gemini-2.5-flash'],
+  'gpt-4o-latest': ['openai/gpt-4o'],
+  'claude-sonnet-4-5': ['anthropic/claude-sonnet-4.5'],
+  'claude-opus-4-6': ['anthropic/claude-opus-4.6'],
 };
 
 const REFERENCE_CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
+const LIVE_CATALOG_TTL_MS = 10 * 60 * 1000;
 const OPENROUTER_PUBLIC_MODELS_URL = 'https://openrouter.ai/api/v1/models';
 
 let cachedReferenceIndex: { index: ReferenceModelIndex; fetchedAt: number } | null = null;
 let inFlightReferencePromise: Promise<ReferenceModelIndex | null> | null = null;
+
+const liveCatalogCache = new Map<string, { models: ProviderModelCatalogItem[]; fetchedAt: number }>();
+
+function liveCatalogCacheKey(provider: string, baseUrl: string): string {
+  return `${normalizeProviderId(provider)}::${(baseUrl || '').trim().replace(/\/+$/, '').toLowerCase()}`;
+}
+
+export function cacheProviderModels(
+  provider: string,
+  baseUrl: string,
+  models: ProviderModelCatalogItem[],
+): void {
+  if (!Array.isArray(models) || models.length === 0) return;
+  liveCatalogCache.set(liveCatalogCacheKey(provider, baseUrl), {
+    models,
+    fetchedAt: Date.now(),
+  });
+}
+
+export function getCachedProviderModels(
+  provider: string,
+  baseUrl?: string,
+): ProviderModelCatalogItem[] | null {
+  const prov = normalizeProviderId(provider);
+  const cleanBase = (baseUrl || PROVIDER_CATALOG_DEFAULTS[prov]?.baseUrl || '').trim().replace(/\/+$/, '');
+  const exact = liveCatalogCache.get(liveCatalogCacheKey(prov, cleanBase));
+  if (exact && Date.now() - exact.fetchedAt < LIVE_CATALOG_TTL_MS) {
+    return exact.models;
+  }
+  // Fallback to any fresh cached catalog for the same provider when baseUrl was omitted
+  if (!baseUrl) {
+    for (const [k, entry] of liveCatalogCache.entries()) {
+      if (k.startsWith(`${prov}::`) && Date.now() - entry.fetchedAt < LIVE_CATALOG_TTL_MS) {
+        return entry.models;
+      }
+    }
+  }
+  return null;
+}
+
+export function clearLiveCatalogCache(): void {
+  liveCatalogCache.clear();
+}
 
 function normalizeVersionSeparators(input: string): string {
   return input
@@ -312,13 +362,10 @@ function normalizeOrgAndBare(rawModelId: string): {
   strippedBare: string;
 } {
   let exactLower = rawModelId.trim().toLowerCase();
-  if (exactLower.startsWith('models/')) {
-    exactLower = exactLower.slice('models/'.length);
-  }
-  // Handle Fireworks prefix: accounts/fireworks/models/<slug>
-  if (exactLower.startsWith('accounts/fireworks/models/')) {
-    exactLower = exactLower.slice('accounts/fireworks/models/'.length);
-  }
+  exactLower = exactLower
+    .replace(/^accounts\/[^/]+\/models\//, '')
+    .replace(/^publishers\/[^/]+\/models\//, '')
+    .replace(/^models\//, '');
 
   let baseId = exactLower;
   let tag = '';
@@ -539,13 +586,12 @@ export function enrichModelsWithReferenceMetadata(
     }
 
     // 2. Fill remaining gaps from built-in model registry ONLY when matched to a known model family
-    //    (never stamp generic 128k fallback as a catalog value for unknown custom models)
     if (!contextLength || !maxOutputTokens) {
       const resolved = resolveModelLimits(provider, item.id, contextLength, maxOutputTokens);
-      if (!contextLength && resolved.contextWindowSource === 'model_registry') {
+      if (!contextLength && resolved.contextWindowSource === 'model_registry' && resolved.contextWindow) {
         contextLength = resolved.contextWindow;
       }
-      if (!maxOutputTokens && resolved.maxOutputTokensSource === 'model_registry') {
+      if (!maxOutputTokens && resolved.maxOutputTokensSource === 'model_registry' && resolved.maxOutputTokens) {
         maxOutputTokens = resolved.maxOutputTokens;
       }
     }
@@ -563,54 +609,205 @@ export function enrichModelsWithReferenceMetadata(
   });
 }
 
-export async function resolveModelMetadataFromCatalog(params: {
+export type ModelMetadataSource =
+  | 'provider_catalog'
+  | 'reference_catalog'
+  | 'model_registry'
+  | 'unknown';
+
+export interface UnifiedModelResolutionResult {
+  resolved: boolean;
   provider: string;
   model: string;
+  matched_model: string | null;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  context_window_source: ModelMetadataSource;
+  max_output_tokens_source: ModelMetadataSource;
+}
+
+function findMatchingCatalogItem(
+  modelId: string,
+  catalog: ProviderModelCatalogItem[],
+): ProviderModelCatalogItem | null {
+  if (!modelId.trim() || catalog.length === 0) return null;
+  const queryParts = normalizeOrgAndBare(modelId);
+  // 1. Exact case-insensitive match
+  for (const item of catalog) {
+    const itemParts = normalizeOrgAndBare(item.id);
+    if (itemParts.exactLower === queryParts.exactLower) return item;
+  }
+  // 2. Normalized org + slug match
+  if (queryParts.org) {
+    const targetOrgKey = `${queryParts.org}/${queryParts.normalizedBare}`;
+    for (const item of catalog) {
+      const itemParts = normalizeOrgAndBare(item.id);
+      if (itemParts.org && `${itemParts.org}/${itemParts.normalizedBare}` === targetOrgKey) {
+        return item;
+      }
+    }
+  }
+  // 3. Bare slug match
+  for (const item of catalog) {
+    const itemParts = normalizeOrgAndBare(item.id);
+    if (
+      itemParts.bare === queryParts.bare ||
+      itemParts.normalizedBare === queryParts.normalizedBare
+    ) {
+      return item;
+    }
+  }
+  // 4. Stripped suffix match
+  if (queryParts.strippedBare.length >= 4) {
+    for (const item of catalog) {
+      const itemParts = normalizeOrgAndBare(item.id);
+      if (itemParts.strippedBare === queryParts.strippedBare) {
+        return item;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Unified model metadata resolver used for BOTH manually entered model IDs and dropdown selections.
+ * Resolution priority:
+ *  1. Explicit positive catalog values (when passed from a dropdown item)
+ *  2. Live provider catalog (in-memory provided list, cached list, or on-demand provider query)
+ *  3. OpenRouter reference metadata catalog (supports cross-provider aliases & normalized slugs)
+ *  4. Built-in verified model registry (only genuine family matches)
+ *  5. Explicit 'unknown' state (context_window: null) — NEVER stamps a fabricated 128K fallback.
+ */
+export async function resolveModelMetadataUnified(params: {
+  provider: string;
+  model: string;
+  base_url?: string;
+  api_key?: string;
+  role?: 'primary' | 'worker';
+  env?: Record<string, string | undefined>;
   explicitContextWindow?: number | null;
   explicitMaxOutputTokens?: number | null;
+  liveModels?: ProviderModelCatalogItem[];
   referenceIndex?: ReferenceModelIndex | null;
+  allowLiveFetch?: boolean;
+  allowReferenceFetch?: boolean;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
-}): Promise<{ context_window?: number; max_output_tokens?: number }> {
+}): Promise<UnifiedModelResolutionResult> {
+  const prov = normalizeProviderId(params.provider);
   const cleanModel = (params.model || '').trim();
-  if (!cleanModel) return {};
+  if (!cleanModel) {
+    return {
+      resolved: false,
+      provider: prov,
+      model: '',
+      matched_model: null,
+      context_window: null,
+      max_output_tokens: null,
+      context_window_source: 'unknown',
+      max_output_tokens_source: 'unknown',
+    };
+  }
 
-  let contextWindow =
+  let matchedModel: string | null = null;
+  let contextWindow: number | null =
     typeof params.explicitContextWindow === 'number' &&
     Number.isFinite(params.explicitContextWindow) &&
     params.explicitContextWindow >= 512
       ? Math.round(params.explicitContextWindow)
-      : undefined;
-  let maxOutputTokens =
+      : null;
+  let contextWindowSource: ModelMetadataSource = contextWindow ? 'provider_catalog' : 'unknown';
+
+  let maxOutputTokens: number | null =
     typeof params.explicitMaxOutputTokens === 'number' &&
     Number.isFinite(params.explicitMaxOutputTokens) &&
     params.explicitMaxOutputTokens >= 256
       ? Math.round(params.explicitMaxOutputTokens)
-      : undefined;
+      : null;
+  let maxOutputTokensSource: ModelMetadataSource = maxOutputTokens ? 'provider_catalog' : 'unknown';
 
+  const applyCatalogMatch = (models: ProviderModelCatalogItem[] | null | undefined): void => {
+    if (!models || models.length === 0) return;
+    const hit = findMatchingCatalogItem(cleanModel, models);
+    if (!hit) return;
+    matchedModel = matchedModel || hit.id;
+    if (!contextWindow && typeof hit.context_length === 'number' && hit.context_length >= 512) {
+      contextWindow = Math.round(hit.context_length);
+      contextWindowSource = 'provider_catalog';
+    }
+    if (!maxOutputTokens && typeof hit.max_output_tokens === 'number' && hit.max_output_tokens >= 256) {
+      maxOutputTokens = Math.round(hit.max_output_tokens);
+      maxOutputTokensSource = 'provider_catalog';
+    }
+  };
+
+  // 1. Check explicitly provided liveModels or cached live catalog for this provider
   if (!contextWindow || !maxOutputTokens) {
-    const refIndex =
-      params.referenceIndex !== undefined
-        ? params.referenceIndex
-        : await getReferenceModelCatalog(params.fetchImpl || fetch, params.timeoutMs ?? 2_500);
-    const refMeta = lookupReferenceModelMetadata(cleanModel, refIndex);
-    if (refMeta) {
-      if (!contextWindow && refMeta.context_length) {
-        contextWindow = refMeta.context_length;
-      }
-      if (!maxOutputTokens && refMeta.max_output_tokens) {
-        maxOutputTokens = refMeta.max_output_tokens;
+    applyCatalogMatch(params.liveModels);
+  }
+  if (!contextWindow || !maxOutputTokens) {
+    applyCatalogMatch(getCachedProviderModels(prov, params.base_url));
+  }
+
+  // 2. If still missing context window and live fetch is permitted, query the provider's live catalog
+  if ((!contextWindow || !maxOutputTokens) && params.allowLiveFetch) {
+    const defaults = PROVIDER_CATALOG_DEFAULTS[prov];
+    const resolvedBase = (params.base_url || defaults?.baseUrl || '').trim().replace(/\/+$/, '');
+    const apiKey = resolveProviderApiKey(
+      prov,
+      params.role === 'worker' ? 'worker' : 'primary',
+      params.env || process.env,
+      params.api_key,
+    );
+    const canQueryWithoutKey = defaults?.requiresKey === false || prov === 'openrouter';
+    if (resolvedBase && (apiKey || canQueryWithoutKey)) {
+      const liveResult = await listProviderModelsDirect({
+        provider: prov,
+        base_url: resolvedBase,
+        api_key: params.api_key,
+        role: params.role === 'worker' ? 'worker' : 'primary',
+        env: params.env,
+        fetchImpl: params.fetchImpl,
+        referenceIndex: params.referenceIndex,
+        enableReferenceEnrichment: params.allowReferenceFetch,
+      });
+      if (liveResult.ok && liveResult.models.length > 0) {
+        applyCatalogMatch(liveResult.models);
       }
     }
   }
 
+  // 3. Reference catalog lookup (supports cross-provider aliases & normalized slugs)
   if (!contextWindow || !maxOutputTokens) {
-    const resolved = resolveModelLimits(params.provider, cleanModel, contextWindow, maxOutputTokens);
-    if (!contextWindow && resolved.contextWindowSource === 'model_registry') {
-      contextWindow = resolved.contextWindow;
+    let refIndex: ReferenceModelIndex | null = null;
+    if (params.referenceIndex !== undefined) {
+      refIndex = params.referenceIndex;
+    } else if (params.allowReferenceFetch !== false) {
+      refIndex = await getReferenceModelCatalog(params.fetchImpl || fetch, params.timeoutMs ?? 2_500);
     }
-    if (!maxOutputTokens && resolved.maxOutputTokensSource === 'model_registry') {
-      maxOutputTokens = resolved.maxOutputTokens;
+    const refMeta = lookupReferenceModelMetadata(cleanModel, refIndex);
+    if (refMeta) {
+      if (!contextWindow && refMeta.context_length && refMeta.context_length >= 512) {
+        contextWindow = Math.round(refMeta.context_length);
+        contextWindowSource = 'reference_catalog';
+      }
+      if (!maxOutputTokens && refMeta.max_output_tokens && refMeta.max_output_tokens >= 256) {
+        maxOutputTokens = Math.round(refMeta.max_output_tokens);
+        maxOutputTokensSource = 'reference_catalog';
+      }
+    }
+  }
+
+  // 4. Built-in verified model registry (only accepts genuine 'model_registry' hits, never 128K default)
+  if (!contextWindow || !maxOutputTokens) {
+    const reg = resolveModelLimits(prov, cleanModel, contextWindow, maxOutputTokens);
+    if (!contextWindow && reg.contextWindowSource === 'model_registry' && reg.contextWindow) {
+      contextWindow = reg.contextWindow;
+      contextWindowSource = 'model_registry';
+    }
+    if (!maxOutputTokens && reg.maxOutputTokensSource === 'model_registry' && reg.maxOutputTokens) {
+      maxOutputTokens = reg.maxOutputTokens;
+      maxOutputTokensSource = 'model_registry';
     }
   }
 
@@ -619,8 +816,47 @@ export async function resolveModelMetadataFromCatalog(params: {
   }
 
   return {
-    ...(contextWindow ? { context_window: contextWindow } : {}),
-    ...(maxOutputTokens ? { max_output_tokens: maxOutputTokens } : {}),
+    resolved: contextWindow !== null,
+    provider: prov,
+    model: cleanModel,
+    matched_model: matchedModel,
+    context_window: contextWindow,
+    max_output_tokens: maxOutputTokens,
+    context_window_source: contextWindowSource,
+    max_output_tokens_source: maxOutputTokensSource,
+  };
+}
+
+export async function resolveModelMetadataFromCatalog(params: {
+  provider: string;
+  model: string;
+  base_url?: string;
+  api_key?: string;
+  env?: Record<string, string | undefined>;
+  explicitContextWindow?: number | null;
+  explicitMaxOutputTokens?: number | null;
+  referenceIndex?: ReferenceModelIndex | null;
+  allowLiveFetch?: boolean;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<{ context_window?: number; max_output_tokens?: number }> {
+  const unified = await resolveModelMetadataUnified({
+    provider: params.provider,
+    model: params.model,
+    base_url: params.base_url,
+    api_key: params.api_key,
+    env: params.env,
+    explicitContextWindow: params.explicitContextWindow,
+    explicitMaxOutputTokens: params.explicitMaxOutputTokens,
+    referenceIndex: params.referenceIndex,
+    allowLiveFetch: params.allowLiveFetch ?? false,
+    fetchImpl: params.fetchImpl,
+    timeoutMs: params.timeoutMs,
+  });
+
+  return {
+    ...(unified.context_window ? { context_window: unified.context_window } : {}),
+    ...(unified.max_output_tokens ? { max_output_tokens: unified.max_output_tokens } : {}),
   };
 }
 
@@ -1005,6 +1241,7 @@ export async function listProviderModelsDirect(params: {
       const nativeGeminiModels = await fetchGeminiNativeModels(baseUrl, apiKey, fetchFn);
       if (nativeGeminiModels && nativeGeminiModels.length > 0) {
         const enriched = await finalizeModels(nativeGeminiModels);
+        cacheProviderModels(prov, baseUrl, enriched);
         return {
           ok: true,
           provider: prov,
@@ -1028,6 +1265,9 @@ export async function listProviderModelsDirect(params: {
       const payload = (await resp.json()) as unknown;
       const parsed = parseModelsPayload(payload, prov);
       const models = await finalizeModels(parsed);
+      if (models.length > 0) {
+        cacheProviderModels(prov, baseUrl, models);
+      }
       return {
         ok: models.length > 0,
         provider: prov,
@@ -1051,6 +1291,9 @@ export async function listProviderModelsDirect(params: {
         const tagsPayload = (await tagsResp.json()) as unknown;
         const parsed = parseModelsPayload(tagsPayload, prov);
         const models = await finalizeModels(parsed);
+        if (models.length > 0) {
+          cacheProviderModels(prov, baseUrl, models);
+        }
         return {
           ok: models.length > 0,
           provider: prov,

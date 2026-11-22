@@ -163,9 +163,19 @@ _MODEL_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("ernie-5", 128_000),
     ("ernie-4", 128_000),
     ("ernie", 128_000),
+    # Meta Llama 3 base / Mixtral / Command-R
+    ("llama-3-70b", 8_192),
+    ("llama-3-8b", 8_192),
+    ("llama3-70b", 8_192),
+    ("llama3-8b", 8_192),
+    ("mixtral-8x22b", 65_536),
+    ("mixtral-8x7b", 32_768),
+    ("command-r-plus", 128_000),
+    ("command-r", 128_000),
     # Gemma / Phi
     ("gemma-4", 262_144),
     ("gemma-3", 128_000),
+    ("gemma-2", 8_192),
     ("gemma", 32_768),
     ("phi-4", 128_000),
     ("phi-3.5", 128_000),
@@ -177,17 +187,21 @@ def _build_model_match_candidates(raw_model: str | None) -> tuple[str, ...]:
     if not clean:
         return ()
 
+    # Strip provider-specific path prefixes (e.g. accounts/fireworks/models/, models/, publishers/google/models/)
+    stripped = re.sub(r"^(?:accounts/[^/]+/models/|publishers/[^/]+/models/|models/)", "", clean)
+
     def _norm(s: str) -> str:
         s = re.sub(r"v(\d+)p(\d+)", r"\1.\2", s)
         s = re.sub(r"(\d)-(\d)(?=$|[-_/:])", r"\1.\2", s)
         return s
 
-    bare_with_tag = clean.split("/")[-1]
+    bare_with_tag = stripped.split("/")[-1]
     bare_no_tag = bare_with_tag.split(":")[0]
     seen: list[str] = []
     for item in (
         clean,
-        _norm(clean),
+        stripped,
+        _norm(stripped),
         bare_with_tag,
         _norm(bare_with_tag),
         bare_no_tag,
@@ -202,8 +216,8 @@ def resolve_model_context_window(
     provider: str | None,
     model: str | None,
     explicit_context_window: int | None = None,
-) -> tuple[int, str]:
-    """Return `(context_window_tokens, source)` for the specified model."""
+) -> tuple[int | None, str]:
+    """Return `(context_window_tokens, source)` for the specified model, or `(None, 'unknown')`."""
     if isinstance(explicit_context_window, (int, float)) and explicit_context_window >= MIN_CONTEXT_WINDOW:
         return int(explicit_context_window), "provider_catalog"
 
@@ -213,11 +227,7 @@ def resolve_model_context_window(
             if any(pattern in target for target in candidates):
                 return limit, "model_registry"
 
-    clean_provider = (provider or "").strip().lower()
-    if clean_provider in ("ollama", "local", "vllm"):
-        return 32_768, "provider_default"
-
-    return DEFAULT_CONTEXT_WINDOW, "default"
+    return None, "unknown"
 
 
 # Ordered from most specific model prefixes/substrings to general families.
@@ -347,8 +357,8 @@ def resolve_model_max_output_tokens(
     provider: str | None,
     model: str | None,
     explicit_max_output_tokens: int | None = None,
-) -> tuple[int, str]:
-    """Return `(max_output_tokens, source)` for the specified model."""
+) -> tuple[int | None, str]:
+    """Return `(max_output_tokens, source)` for the specified model, or `(None, 'unknown')`."""
     if (
         isinstance(explicit_max_output_tokens, (int, float))
         and explicit_max_output_tokens >= MIN_MAX_OUTPUT_TOKENS
@@ -361,11 +371,7 @@ def resolve_model_max_output_tokens(
             if any(pattern in target for target in candidates):
                 return limit, "model_registry"
 
-    clean_provider = (provider or "").strip().lower()
-    if clean_provider in ("ollama", "local", "vllm"):
-        return 8_192, "provider_default"
-
-    return DEFAULT_MAX_OUTPUT_TOKENS, "default"
+    return None, "unknown"
 
 
 def estimate_text_tokens(text: str | None) -> int:
@@ -507,11 +513,17 @@ def compute_context_usage(
     max_output_tokens, max_output_source = resolve_model_max_output_tokens(
         provider, model, explicit_max_output_tokens=explicit_max_output_tokens
     )
-    effective_max_tokens = (
-        min(int(configured_max_tokens), max_output_tokens)
-        if isinstance(configured_max_tokens, (int, float)) and configured_max_tokens >= 64
-        else max_output_tokens
-    )
+    if context_window is not None and max_output_tokens is not None:
+        max_output_tokens = min(max_output_tokens, context_window)
+
+    if isinstance(configured_max_tokens, (int, float)) and configured_max_tokens >= 64:
+        effective_max_tokens: int | None = (
+            min(int(configured_max_tokens), max_output_tokens)
+            if max_output_tokens is not None
+            else int(configured_max_tokens)
+        )
+    else:
+        effective_max_tokens = max_output_tokens
 
     skills_raw_tokens = estimate_text_tokens(skill_catalog_text) + estimate_text_tokens(
         loaded_skills_text
@@ -583,9 +595,18 @@ def compute_context_usage(
             calibrated = True
 
     used_tokens = max(0, int(estimated_total))
-    free_tokens = max(0, context_window - used_tokens)
-    usage_percent = round(min(100.0, (used_tokens / max(1, context_window)) * 100.0), 1)
-    classification = classify_context_usage(usage_percent)
+    if context_window is not None and context_window >= MIN_CONTEXT_WINDOW:
+        free_tokens: int | None = max(0, context_window - used_tokens)
+        usage_percent: float | None = round(min(100.0, (used_tokens / max(1, context_window)) * 100.0), 1)
+        classification = classify_context_usage(usage_percent)
+    else:
+        free_tokens = None
+        usage_percent = None
+        classification = {
+            "level": "unknown",
+            "label": "Unknown Window",
+            "description": "Context window metadata is unavailable for this model; token usage is tracked without assuming 128K.",
+        }
 
     category_meta = [
         ("system_prompt", "System Prompt", "Core agent instructions, guardrails, and active plan"),
@@ -600,7 +621,11 @@ def compute_context_usage(
     categories = []
     for key, label, description in category_meta:
         toks = int(raw_counts[key])
-        pct_of_window = round((toks / max(1, context_window)) * 100.0, 1)
+        pct_of_window = (
+            round((toks / max(1, context_window)) * 100.0, 1)
+            if context_window is not None and context_window >= MIN_CONTEXT_WINDOW
+            else 0.0
+        )
         pct_of_used = round((toks / max(1, used_tokens)) * 100.0, 1) if used_tokens > 0 else 0.0
         categories.append(
             {

@@ -22,7 +22,11 @@ interface ChatHeaderProps {
   onOpenMobileSidebar: () => void;
   onNewThread: () => void;
   llmConfig: PersistedLLMConfig | null;
-  onQuickSwitchPrimaryModel: (nextModel: string, option?: ProviderModelOption) => void;
+  onQuickSwitchPrimaryModel: (
+    nextModel: string,
+    option?: ProviderModelOption,
+    options?: { persist?: boolean },
+  ) => void;
   onOpenLLMSettings: () => void;
   contextUsage: ContextUsageSnapshot;
   workspaceOpen: boolean;
@@ -177,11 +181,23 @@ export function ChatHeader({
                   apiKeyDraft=""
                   value={llmConfig.primary.model}
                   onChange={(nextModel) => {
-                    onQuickSwitchPrimaryModel(nextModel);
+                    onQuickSwitchPrimaryModel(nextModel, undefined, { persist: false });
                   }}
                   onSelectOption={(option) => {
-                    onQuickSwitchPrimaryModel(option.id, option);
+                    onQuickSwitchPrimaryModel(option.id, option, { persist: true });
                     setModelPopoverOpen(false);
+                  }}
+                  onModelResolved={(resolution) => {
+                    onQuickSwitchPrimaryModel(
+                      resolution.model,
+                      {
+                        id: resolution.matched_model || resolution.model,
+                        name: resolution.matched_model || resolution.model,
+                        context_length: resolution.context_window,
+                        max_output_tokens: resolution.max_output_tokens,
+                      },
+                      { persist: true },
+                    );
                   }}
                 />
               ) : (

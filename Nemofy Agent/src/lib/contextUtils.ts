@@ -6,19 +6,20 @@ import type {
   ContextUsageSnapshot,
   LiveAgentActivity,
   PersistedLLMConfig,
+  ProviderModelOption,
 } from '../types/agent.ts';
 
 export const AUTO_COMPACT_THRESHOLD_PERCENT = 80;
-export const DEFAULT_CONTEXT_WINDOW = 128_000;
 export const MIN_CONTEXT_WINDOW = 512;
-export const DEFAULT_MAX_OUTPUT_TOKENS = 16_384;
 export const MIN_MAX_OUTPUT_TOKENS = 256;
 
 // Mirrors Agent-Core/agent_core/context_manager.py _MODEL_CONTEXT_WINDOWS
 const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   // Google Gemini
   ['gemini-2.5-flash-image', 32_768],
+  ['gemini-2.5-flash-lite', 1_048_576],
   ['gemini-1.5-pro', 2_000_000],
+  ['gemini-1.5-flash-8b', 1_000_000],
   ['gemini-1.5-flash', 1_000_000],
   ['gemini-2.5-pro', 1_048_576],
   ['gemini-2.5-flash', 1_048_576],
@@ -34,19 +35,26 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['llama-3.2', 131_072],
   ['llama-3.1', 131_072],
   ['llama3.3', 131_072],
+  ['llama3.2', 131_072],
   ['llama3.1', 131_072],
+  ['llama-3-', 8_192],
+  ['llama3:', 8_192],
   // OpenAI GPT-5 / GPT-4.1 / GPT-4o / o-series
   ['gpt-5.6', 1_050_000],
   ['gpt-5.5', 1_050_000],
   ['gpt-5.4', 1_050_000],
+  ['gpt-5.3', 400_000],
   ['gpt-5.2', 400_000],
   ['gpt-5.1', 400_000],
   ['gpt-5', 400_000],
   ['gpt-4.1', 1_047_576],
   ['o4-mini', 200_000],
+  ['o3-pro', 200_000],
   ['o3-mini', 200_000],
   ['o3', 200_000],
+  ['o1-mini', 128_000],
   ['o1', 200_000],
+  ['gpt-4o-mini', 128_000],
   ['gpt-4o', 128_000],
   ['gpt-4-turbo', 128_000],
   ['gpt-3.5', 16_385],
@@ -60,6 +68,7 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['claude-sonnet-4.6', 1_000_000],
   ['claude-sonnet-4.5', 1_000_000],
   ['claude-sonnet-4', 200_000],
+  ['claude-haiku-4.5', 200_000],
   ['claude-haiku-4', 200_000],
   ['claude-3.7', 200_000],
   ['claude-3.5', 200_000],
@@ -72,7 +81,11 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['kimi-k2.5', 262_144],
   ['kimi-k2-thinking', 262_144],
   ['kimi-k2', 131_072],
+  ['kimi-k1.5', 131_072],
   ['kimi', 131_072],
+  ['moonshot-v1-128k', 128_000],
+  ['moonshot-v1-32k', 32_768],
+  ['moonshot-v1-8k', 8_192],
   // NVIDIA Nemotron
   ['nemotron-3.5-content-safety', 131_072],
   ['nemotron-3.5', 1_048_576],
@@ -85,8 +98,10 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   // DeepSeek
   ['deepseek-v4', 1_048_576],
   ['deepseek-r1-0528', 163_840],
+  ['deepseek-r1-distill', 131_072],
   ['deepseek-v3.2', 163_840],
   ['deepseek-v3.1', 163_840],
+  ['deepseek-v3-0324', 163_840],
   ['deepseek-v3', 128_000],
   ['deepseek-r1', 128_000],
   ['deepseek-chat', 128_000],
@@ -97,6 +112,7 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['glm-4.7', 204_800],
   ['glm-4.6', 204_800],
   ['glm-4.5', 131_072],
+  ['glm-4-plus', 128_000],
   ['glm-4', 128_000],
   // MiniMax
   ['minimax-m3', 1_048_576],
@@ -112,7 +128,10 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['qwen3-max', 262_144],
   ['qwen3-next', 262_144],
   ['qwen3', 131_072],
+  ['qwen2.5-coder', 131_072],
   ['qwen2.5', 131_072],
+  ['qwen-2.5', 131_072],
+  ['qwen-qwq', 131_072],
   ['qwq', 131_072],
   ['qwen', 131_072],
   // xAI Grok
@@ -125,27 +144,42 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['grok-3', 131_072],
   ['grok-2', 131_072],
   ['grok', 131_072],
-  // Mistral
+  // Mistral / Mixtral
   ['mistral-large-4', 1_048_576],
   ['mistral-large-2512', 262_144],
   ['mistral-large-2407', 131_072],
   ['mistral-large', 128_000],
+  ['mistral-medium', 128_000],
   ['mistral-small-3', 128_000],
+  ['mistral-nemo', 128_000],
+  ['mixtral-8x22b', 65_536],
+  ['mixtral-8x7b', 32_768],
   ['pixtral', 128_000],
   ['codestral', 256_000],
   ['mistral', 128_000],
+  // Cohere Command
+  ['command-r-plus', 128_000],
+  ['command-r', 128_000],
+  // Perplexity Sonar
+  ['sonar-pro', 200_000],
+  ['sonar', 128_000],
+  // Amazon Nova
+  ['nova-pro', 300_000],
+  ['nova-lite', 300_000],
+  ['nova-micro', 128_000],
   // Upstage Solar
   ['solar-pro4', 524_288],
   // Baidu ERNIE
   ['ernie-5', 128_000],
   ['ernie-4', 128_000],
   ['ernie', 128_000],
-  // Gemma / Phi
+  // Gemma / Phi / Yi
   ['gemma-4', 262_144],
   ['gemma-3', 128_000],
   ['gemma', 32_768],
   ['phi-4', 128_000],
   ['phi-3.5', 128_000],
+  ['yi-large', 32_768],
 ];
 
 export const CONTEXT_CATEGORY_META: ReadonlyArray<{
@@ -202,6 +236,7 @@ export const CONTEXT_CATEGORY_META: ReadonlyArray<{
 const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   // Google Gemini
   ['gemini-2.5-flash-image', 8_192],
+  ['gemini-2.5-flash-lite', 65_536],
   ['gemini-2.5-pro', 65_536],
   ['gemini-2.5-flash', 65_536],
   ['gemini-3', 65_536],
@@ -213,13 +248,17 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['gpt-5.6', 128_000],
   ['gpt-5.5', 128_000],
   ['gpt-5.4', 128_000],
+  ['gpt-5.3', 128_000],
   ['gpt-5.2', 128_000],
   ['gpt-5', 128_000],
   ['o4-mini', 100_000],
+  ['o3-pro', 100_000],
   ['o3-mini', 100_000],
   ['o3', 100_000],
+  ['o1-mini', 65_536],
   ['o1', 100_000],
   ['gpt-4.1', 32_768],
+  ['gpt-4o-mini', 16_384],
   ['gpt-4o', 16_384],
   ['gpt-4-turbo', 4_096],
   ['gpt-3.5', 4_096],
@@ -232,6 +271,7 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['claude-sonnet-4.6', 128_000],
   ['claude-sonnet-4.5', 64_000],
   ['claude-sonnet-4', 64_000],
+  ['claude-haiku-4.5', 64_000],
   ['claude-haiku-4', 64_000],
   ['claude-3.7', 64_000],
   ['claude-3.5', 8_192],
@@ -274,6 +314,7 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['qwen3', 32_768],
   ['qwq', 32_768],
   ['qwen2.5', 8_192],
+  ['qwen-2.5', 8_192],
   ['qwen', 16_384],
   // xAI Grok
   ['grok-4.20', 128_000],
@@ -291,15 +332,28 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['llama-3.2', 8_192],
   ['llama-3.1', 8_192],
   ['llama3.3', 8_192],
+  ['llama3.2', 8_192],
   ['llama3.1', 8_192],
-  // Mistral
+  ['llama-3-', 4_096],
+  // Mistral / Mixtral
   ['mistral-large-4', 262_144],
   ['mistral-large-2512', 131_072],
   ['codestral', 32_768],
   ['mistral-large', 32_768],
+  ['mistral-medium', 16_384],
   ['mistral-small-3', 16_384],
+  ['mistral-nemo', 16_384],
+  ['mixtral-8x22b', 16_384],
+  ['mixtral-8x7b', 8_192],
   ['pixtral', 16_384],
   ['mistral', 16_384],
+  // Cohere / Perplexity / Amazon Nova
+  ['command-r', 4_096],
+  ['sonar-pro', 8_192],
+  ['sonar', 8_192],
+  ['nova-pro', 5_000],
+  ['nova-lite', 5_000],
+  ['nova-micro', 5_000],
   // Zhipu GLM
   ['glm-5', 131_072],
   ['glm-4.7', 131_072],
@@ -312,16 +366,28 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['ernie-5', 16_384],
   ['ernie-4', 8_192],
   ['ernie', 8_192],
-  // Gemma / Phi
+  // Gemma / Phi / Yi
   ['gemma-4', 32_768],
   ['gemma-3', 8_192],
   ['gemma', 8_192],
   ['phi-4', 16_384],
   ['phi-3.5', 8_192],
+  ['yi-large', 8_192],
 ];
 
+export function normalizeModelSlug(rawModel: string): string {
+  let clean = (rawModel || '').trim().toLowerCase();
+  if (!clean) return '';
+  // Strip Fireworks / Vertex / Gemini path prefixes
+  clean = clean
+    .replace(/^accounts\/[^/]+\/models\//, '')
+    .replace(/^publishers\/[^/]+\/models\//, '')
+    .replace(/^models\//, '');
+  return clean;
+}
+
 function buildModelMatchCandidates(rawModel: string): string[] {
-  const clean = rawModel.trim().toLowerCase();
+  const clean = normalizeModelSlug(rawModel);
   if (!clean) return [];
   const normalizeVersion = (s: string) =>
     s
@@ -340,11 +406,37 @@ function buildModelMatchCandidates(rawModel: string): string[] {
   return Array.from(new Set(rawList.filter(Boolean)));
 }
 
+/**
+ * Matches a manually typed or selected model ID against a provider's loaded model catalog
+ * using exact, case-insensitive, prefix-stripped, and version-normalized comparisons.
+ */
+export function matchLiveModelOption(
+  modelId: string,
+  options: ReadonlyArray<ProviderModelOption>,
+): ProviderModelOption | null {
+  const clean = normalizeModelSlug(modelId);
+  if (!clean || !options || options.length === 0) return null;
+
+  // 1. Exact case-insensitive match
+  const exact = options.find((opt) => normalizeModelSlug(opt.id) === clean);
+  if (exact) return exact;
+
+  // 2. Match via normalized bare slug (e.g. "claude-opus-4-6" -> "anthropic/claude-opus-4.6")
+  const queryCandidates = new Set(buildModelMatchCandidates(clean));
+  for (const opt of options) {
+    const optCandidates = buildModelMatchCandidates(opt.id);
+    if (optCandidates.some((cand) => queryCandidates.has(cand))) {
+      return opt;
+    }
+  }
+  return null;
+}
+
 export function resolveModelContextWindow(
-  provider?: string | null,
+  _provider?: string | null,
   model?: string | null,
   explicitContextWindow?: number | null,
-): { contextWindow: number; source: string } {
+): { contextWindow: number | null; source: 'provider_catalog' | 'model_registry' | 'unknown' } {
   if (
     typeof explicitContextWindow === 'number' &&
     Number.isFinite(explicitContextWindow) &&
@@ -362,19 +454,15 @@ export function resolveModelContextWindow(
     }
   }
 
-  const cleanProvider = (provider || '').trim().toLowerCase();
-  if (cleanProvider === 'ollama' || cleanProvider === 'local' || cleanProvider === 'vllm') {
-    return { contextWindow: 32_768, source: 'provider_default' };
-  }
-
-  return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: 'default' };
+  // Never pretend 128K is correct when a model's metadata is unknown.
+  return { contextWindow: null, source: 'unknown' };
 }
 
 export function resolveModelMaxOutputTokens(
-  provider?: string | null,
+  _provider?: string | null,
   model?: string | null,
   explicitMaxOutputTokens?: number | null,
-): { maxOutputTokens: number; source: string } {
+): { maxOutputTokens: number | null; source: 'provider_catalog' | 'model_registry' | 'unknown' } {
   if (
     typeof explicitMaxOutputTokens === 'number' &&
     Number.isFinite(explicitMaxOutputTokens) &&
@@ -392,12 +480,7 @@ export function resolveModelMaxOutputTokens(
     }
   }
 
-  const cleanProvider = (provider || '').trim().toLowerCase();
-  if (cleanProvider === 'ollama' || cleanProvider === 'local' || cleanProvider === 'vllm') {
-    return { maxOutputTokens: 8_192, source: 'provider_default' };
-  }
-
-  return { maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS, source: 'default' };
+  return { maxOutputTokens: null, source: 'unknown' };
 }
 
 export function resolveModelLimits(
@@ -406,15 +489,18 @@ export function resolveModelLimits(
   explicitContextWindow?: number | null,
   explicitMaxOutputTokens?: number | null,
 ): {
-  contextWindow: number;
-  contextWindowSource: string;
-  maxOutputTokens: number;
-  maxOutputTokensSource: string;
+  contextWindow: number | null;
+  contextWindowSource: 'provider_catalog' | 'model_registry' | 'unknown';
+  maxOutputTokens: number | null;
+  maxOutputTokensSource: 'provider_catalog' | 'model_registry' | 'unknown';
 } {
   const ctx = resolveModelContextWindow(provider, model, explicitContextWindow);
   const out = resolveModelMaxOutputTokens(provider, model, explicitMaxOutputTokens);
-  // Output limit can never exceed total context window
-  const clampedOut = Math.min(out.maxOutputTokens, ctx.contextWindow);
+  // Output limit can never exceed total context window when both are known
+  const clampedOut =
+    ctx.contextWindow !== null && out.maxOutputTokens !== null
+      ? Math.min(out.maxOutputTokens, ctx.contextWindow)
+      : out.maxOutputTokens;
   return {
     contextWindow: ctx.contextWindow,
     contextWindowSource: ctx.source,
@@ -423,8 +509,16 @@ export function resolveModelLimits(
   };
 }
 
-export function classifyContextUsage(usagePercent: number): ContextClassification {
-  const pct = Math.max(0, Number.isFinite(usagePercent) ? usagePercent : 0);
+export function classifyContextUsage(usagePercent: number | null): ContextClassification {
+  if (usagePercent === null || !Number.isFinite(usagePercent)) {
+    return {
+      level: 'unknown',
+      label: 'Unknown Window',
+      description:
+        'Context window metadata is unavailable for this model. Token usage is tracked without assuming a default limit.',
+    };
+  }
+  const pct = Math.max(0, usagePercent);
   if (pct >= AUTO_COMPACT_THRESHOLD_PERCENT) {
     return {
       level: 'critical',
@@ -495,8 +589,13 @@ export function rescaleSnapshotForModel(
     activeModel.length > 0 &&
     snapshot.model.trim().toLowerCase() === activeModel.toLowerCase();
 
-  let targetWindow = snapshot.context_window;
-  let targetSource = snapshot.context_window_source;
+  let targetWindow: number | null =
+    typeof snapshot.context_window === 'number' &&
+    Number.isFinite(snapshot.context_window) &&
+    snapshot.context_window >= MIN_CONTEXT_WINDOW
+      ? Math.round(snapshot.context_window)
+      : null;
+  let targetSource = snapshot.context_window_source || 'unknown';
 
   if (
     typeof explicitContextWindow === 'number' &&
@@ -509,43 +608,60 @@ export function rescaleSnapshotForModel(
     const resolved = resolveModelContextWindow(activeProvider, activeModel, explicitContextWindow);
     targetWindow = resolved.contextWindow;
     targetSource = resolved.source;
-  } else if (!targetWindow || targetWindow < MIN_CONTEXT_WINDOW) {
-    const resolved = resolveModelContextWindow(activeProvider, activeModel, explicitContextWindow);
+  } else if (targetWindow === null) {
+    const resolved = resolveModelContextWindow(activeProvider, activeModel || snapshot.model, explicitContextWindow);
     targetWindow = resolved.contextWindow;
     targetSource = resolved.source;
   }
 
-  let targetMaxOutput = snapshot.max_output_tokens;
-  let targetMaxOutputSource = snapshot.max_output_tokens_source;
+  let targetMaxOutput: number | null =
+    typeof snapshot.max_output_tokens === 'number' &&
+    Number.isFinite(snapshot.max_output_tokens) &&
+    snapshot.max_output_tokens >= MIN_MAX_OUTPUT_TOKENS
+      ? Math.round(snapshot.max_output_tokens)
+      : null;
+  let targetMaxOutputSource = snapshot.max_output_tokens_source || 'unknown';
+
   if (
     typeof explicitMaxOutputTokens === 'number' &&
     Number.isFinite(explicitMaxOutputTokens) &&
     explicitMaxOutputTokens >= MIN_MAX_OUTPUT_TOKENS
   ) {
-    targetMaxOutput = Math.min(Math.round(explicitMaxOutputTokens), targetWindow);
+    targetMaxOutput = Math.round(explicitMaxOutputTokens);
     targetMaxOutputSource = 'provider_catalog';
-  } else if (!sameModel || !targetMaxOutput || targetMaxOutput < MIN_MAX_OUTPUT_TOKENS) {
+  } else if (!sameModel || targetMaxOutput === null) {
     const resolvedOut = resolveModelMaxOutputTokens(
       activeProvider,
       activeModel || snapshot.model,
       explicitMaxOutputTokens,
     );
-    targetMaxOutput = Math.min(resolvedOut.maxOutputTokens, targetWindow);
+    targetMaxOutput = resolvedOut.maxOutputTokens;
     targetMaxOutputSource = resolvedOut.source;
-  } else {
+  }
+
+  if (targetWindow !== null && targetMaxOutput !== null) {
     targetMaxOutput = Math.min(targetMaxOutput, targetWindow);
   }
 
-  const effectiveConfiguredMaxTokens =
+  const rawConfigured =
     typeof configuredMaxTokens === 'number' && Number.isFinite(configuredMaxTokens) && configuredMaxTokens > 0
-      ? Math.min(Math.round(configuredMaxTokens), targetMaxOutput)
-      : snapshot.configured_max_tokens
-        ? Math.min(Math.round(snapshot.configured_max_tokens), targetMaxOutput)
-        : targetMaxOutput;
+      ? Math.round(configuredMaxTokens)
+      : typeof snapshot.configured_max_tokens === 'number' &&
+          Number.isFinite(snapshot.configured_max_tokens) &&
+          snapshot.configured_max_tokens > 0
+        ? Math.round(snapshot.configured_max_tokens)
+        : null;
+  const effectiveConfiguredMaxTokens =
+    rawConfigured !== null && targetMaxOutput !== null
+      ? Math.min(rawConfigured, targetMaxOutput)
+      : rawConfigured ?? targetMaxOutput;
 
   const usedTokens = Math.max(0, Math.round(snapshot.used_tokens || 0));
-  const freeTokens = Math.max(0, targetWindow - usedTokens);
-  const usagePercent = roundOneDecimal(Math.min(100, (usedTokens / Math.max(1, targetWindow)) * 100));
+  const freeTokens = targetWindow !== null ? Math.max(0, targetWindow - usedTokens) : null;
+  const usagePercent =
+    targetWindow !== null
+      ? roundOneDecimal(Math.min(100, (usedTokens / Math.max(1, targetWindow)) * 100))
+      : null;
   const classification = classifyContextUsage(usagePercent);
 
   const byKey = new Map<string, ContextCategoryBreakdown>();
@@ -561,7 +677,7 @@ export function rescaleSnapshotForModel(
       label: existing?.label || meta.label,
       description: existing?.description || meta.description,
       tokens: toks,
-      percent: roundOneDecimal((toks / Math.max(1, targetWindow)) * 100),
+      percent: targetWindow !== null ? roundOneDecimal((toks / Math.max(1, targetWindow)) * 100) : 0,
       share_of_used: usedTokens > 0 ? roundOneDecimal((toks / usedTokens) * 100) : 0,
     };
   });
@@ -573,7 +689,7 @@ export function rescaleSnapshotForModel(
     context_window: targetWindow,
     context_window_source: targetSource,
     max_output_tokens: targetMaxOutput,
-    max_output_tokens_source: targetMaxOutputSource || 'default',
+    max_output_tokens_source: targetMaxOutputSource,
     configured_max_tokens: effectiveConfiguredMaxTokens,
     used_tokens: usedTokens,
     free_tokens: freeTokens,
@@ -620,10 +736,14 @@ export function computeModelContextUsage(params: {
   const limits = resolveModelLimits(provider, model, explicitWindow, explicitMaxOutput);
   const contextWindow = limits.contextWindow;
   const source = limits.contextWindowSource;
-  const effectiveConfiguredMaxTokens =
+  const rawConfigured =
     typeof configuredMaxTokens === 'number' && Number.isFinite(configuredMaxTokens) && configuredMaxTokens > 0
-      ? Math.min(Math.round(configuredMaxTokens), limits.maxOutputTokens)
-      : limits.maxOutputTokens;
+      ? Math.round(configuredMaxTokens)
+      : null;
+  const effectiveConfiguredMaxTokens =
+    rawConfigured !== null && limits.maxOutputTokens !== null
+      ? Math.min(rawConfigured, limits.maxOutputTokens)
+      : rawConfigured ?? limits.maxOutputTokens;
 
   // Baseline overhead for Nemofy Agent system prompt, built-in sandbox+web tools, and skills catalog
   const baseSystemTokens = 720;
@@ -672,8 +792,11 @@ export function computeModelContextUsage(params: {
   };
 
   const usedTokens = Object.values(rawCounts).reduce((acc, n) => acc + n, 0);
-  const freeTokens = Math.max(0, contextWindow - usedTokens);
-  const usagePercent = roundOneDecimal(Math.min(100, (usedTokens / Math.max(1, contextWindow)) * 100));
+  const freeTokens = contextWindow !== null ? Math.max(0, contextWindow - usedTokens) : null;
+  const usagePercent =
+    contextWindow !== null
+      ? roundOneDecimal(Math.min(100, (usedTokens / Math.max(1, contextWindow)) * 100))
+      : null;
   const classification = classifyContextUsage(usagePercent);
 
   const categories: ContextCategoryBreakdown[] = CONTEXT_CATEGORY_META.map((meta) => {
@@ -683,7 +806,7 @@ export function computeModelContextUsage(params: {
       label: meta.label,
       description: meta.description,
       tokens: toks,
-      percent: roundOneDecimal((toks / Math.max(1, contextWindow)) * 100),
+      percent: contextWindow !== null ? roundOneDecimal((toks / Math.max(1, contextWindow)) * 100) : 0,
       share_of_used: usedTokens > 0 ? roundOneDecimal((toks / usedTokens) * 100) : 0,
     };
   });

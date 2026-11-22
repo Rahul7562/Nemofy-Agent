@@ -511,11 +511,10 @@ class SandboxManager:
         ws = self.get_session_workspace(session_id)
         _check_local_command_boundaries(command, workspace_root=ws)
 
-        bwrap_bin = shutil.which("bwrap")
-        if self.config.backend == "auto" and not bwrap_bin and not self.config.allow_unsafe_local_bash:
+        if self.config.backend == "auto" and not self.config.allow_unsafe_local_bash:
             raise SandboxSecurityError(
                 "Docker sandbox is unavailable and unisolated local bash fallback is disabled. "
-                "Start Docker, install bubblewrap (bwrap), or set ALLOW_UNSAFE_LOCAL_BASH=true for explicit local opt-in."
+                "Start Docker or set ALLOW_UNSAFE_LOCAL_BASH=true for explicit local opt-in."
             )
 
         env = _sanitized_sandbox_env(ws)

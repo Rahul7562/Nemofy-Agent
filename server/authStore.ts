@@ -152,8 +152,16 @@ export class AuthStore {
       return { ok: false, error: 'Password must be at least 8 characters long.' };
     }
     const cleanUser = (username || DEFAULT_USERNAME).trim() || DEFAULT_USERNAME;
-    if (!/^[a-zA-Z0-9._-]{2,32}$/.test(cleanUser)) {
-      return { ok: false, error: 'Username must be 2–32 characters (letters, numbers, ., _, -).' };
+    if (
+      !/^[a-zA-Z0-9._-]{2,32}$/.test(cleanUser) ||
+      cleanUser.includes('..') ||
+      cleanUser.startsWith('.') ||
+      cleanUser.endsWith('.')
+    ) {
+      return {
+        ok: false,
+        error: 'Username must be 2–32 characters (letters, numbers, ., _, -) without leading, trailing, or consecutive dots.',
+      };
     }
 
     const newSalt = crypto.randomBytes(16).toString('hex');

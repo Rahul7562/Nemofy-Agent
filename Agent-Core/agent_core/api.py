@@ -39,6 +39,11 @@ from agent_core.graph import (
     ModelOverrideResolver,
     create_agent_runtime,
 )
+from agent_core.guardrails import (
+    ExecutionAccessMode,
+    get_runtime_access_mode,
+    set_runtime_access_mode,
+)
 from agent_core.jobs import AgentJob, DynamicSkillSpec, JobManager
 from agent_core.models import (
     LOCAL_NO_KEY_PROVIDERS,
@@ -54,6 +59,7 @@ from agent_core.models import (
     get_worker_model,
     list_provider_models,
     load_model_spec,
+    load_persisted_access_mode,
     load_persisted_accessories_config,
     load_persisted_llm_config,
     probe_model_connectivity,
@@ -116,7 +122,12 @@ class LLMConfigUpdateRequest(BaseModel):
     primary: ModelConfigOverride | None = None
     worker: ModelConfigOverride | None = None
     accessories: AccessoriesConfigPayload | None = None
-    max_turns: int | None = Field(default=None, ge=1, le=100)
+    max_turns: int | None = Field(default=None, ge=1, le=180)
+    access_mode: ExecutionAccessMode | None = None
+
+
+class AccessModeUpdateRequest(BaseModel):
+    access_mode: ExecutionAccessMode
 
 
 class ModelProbeRequest(BaseModel):
@@ -160,7 +171,8 @@ class ProfileSecretsRequest(BaseModel):
 class AgentRunRequest(BaseModel):
     task: str = Field(default="", max_length=32_000)
     thread_id: str | None = Field(default=None, max_length=128)
-    max_turns: int | None = Field(default=None, ge=1, le=100)
+    max_turns: int | None = Field(default=None, ge=1, le=180)
+    access_mode: ExecutionAccessMode | None = None
     primary_model: ModelConfigOverride | None = None
     worker_model: ModelConfigOverride | None = None
     accessory_models: AccessoriesConfigPayload | None = None
@@ -184,6 +196,7 @@ class AgentResumeRequest(BaseModel):
     decision: Literal["approve", "reject", "edit"]
     arguments: dict[str, Any] | None = None
     reason: str | None = Field(default=None, max_length=1000)
+    access_mode: ExecutionAccessMode | None = None
     primary_model: ModelConfigOverride | None = None
     worker_model: ModelConfigOverride | None = None
     accessory_models: AccessoriesConfigPayload | None = None
@@ -241,6 +254,7 @@ def create_app(
         app.state.runtime = None
         app.state.profile_secrets = {}
         app.state.profile_secrets_active = False
+        set_runtime_access_mode(load_persisted_access_mode())
 
         resolved_sandbox = sandbox or SandboxManager()
         resolved_skills = skills or SkillRegistry()
@@ -470,6 +484,18 @@ def create_app(
         _sync_env_with_profile_secrets()
         return {"ok": True, "count": 0}
 
+    @app.get("/config/access-mode", dependencies=[Depends(require_auth)])
+    async def get_access_mode() -> dict[str, Any]:
+        return {"access_mode": get_runtime_access_mode()}
+
+    @app.put("/config/access-mode", dependencies=[Depends(require_auth)])
+    async def update_access_mode(payload: AccessModeUpdateRequest) -> dict[str, Any]:
+        applied = set_runtime_access_mode(payload.access_mode)
+        current = load_persisted_llm_config()
+        current["access_mode"] = applied
+        save_persisted_llm_config(current)
+        return {"ok": True, "access_mode": applied}
+
     @app.get("/config/llm", dependencies=[Depends(require_auth)])
     async def get_llm_config() -> dict[str, Any]:
         _sync_env_with_profile_secrets()
@@ -479,6 +505,7 @@ def create_app(
             "worker": load_model_spec("worker", include_persisted=True).safe_summary(),
             "accessories": load_persisted_accessories_config(),
             "max_turns": int(persisted.get("max_turns") or os.getenv("MAX_TURNS", "30")),
+            "access_mode": get_runtime_access_mode(),
             "providers": get_provider_presets()["providers"],
         }
 
@@ -511,6 +538,8 @@ def create_app(
 
         if payload.max_turns is not None:
             current["max_turns"] = payload.max_turns
+        if payload.access_mode is not None:
+            current["access_mode"] = set_runtime_access_mode(payload.access_mode)
         save_persisted_llm_config(current)
 
         prim_spec = load_model_spec("primary", include_persisted=True)
@@ -524,6 +553,7 @@ def create_app(
             "worker": work_spec.safe_summary(),
             "accessories": load_persisted_accessories_config(),
             "max_turns": int(current.get("max_turns") or os.getenv("MAX_TURNS", "30")),
+            "access_mode": get_runtime_access_mode(),
         }
 
     @app.post("/models/list", dependencies=[Depends(require_auth)])
@@ -621,6 +651,7 @@ def create_app(
                 return await runtime.resume_approval(
                     thread_id=job.thread_id,
                     decision=resume_body,
+                    access_mode=req.get("access_mode"),
                     primary_model_override=prim_ov,
                     worker_model_override=work_ov,
                     extra_tools=dyn_tools or None,
@@ -639,6 +670,7 @@ def create_app(
                 str(req.get("task") or ""),
                 thread_id=job.thread_id,
                 max_turns=req.get("max_turns"),
+                access_mode=req.get("access_mode"),
                 primary_model_override=prim_ov,
                 worker_model_override=work_ov,
                 extra_tools=dyn_tools or None,
@@ -672,6 +704,12 @@ def create_app(
             )
         thread_id = payload.thread_id or f"thread-{uuid.uuid4().hex[:12]}"
         job_mgr: JobManager = request.app.state.job_manager
+        existing_job = job_mgr.get_active_job_for_thread(thread_id)
+        if existing_job is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"An active job ('{existing_job.job_id}') is already running for thread '{thread_id}'.",
+            )
         job = job_mgr.create_job(
             thread_id=thread_id,
             endpoint="run",
@@ -695,13 +733,26 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Agent runtime is not initialized.",
             )
+        job_mgr: JobManager = request.app.state.job_manager
+        existing_job = job_mgr.get_active_job_for_thread(payload.thread_id)
+        if existing_job is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"An active job ('{existing_job.job_id}') is already running for thread '{payload.thread_id}'.",
+            )
         current = await runtime.inspect_thread(payload.thread_id)
         if current["status"] != "awaiting_approval":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Thread '{payload.thread_id}' is not waiting for human approval.",
             )
-        job_mgr: JobManager = request.app.state.job_manager
+        # Re-check after awaiting inspect_thread to prevent concurrent resume races
+        existing_after = job_mgr.get_active_job_for_thread(payload.thread_id)
+        if existing_after is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"An active job ('{existing_after.job_id}') is already running for thread '{payload.thread_id}'.",
+            )
         job = job_mgr.create_job(
             thread_id=payload.thread_id,
             endpoint="resume",
@@ -765,6 +816,7 @@ def create_app(
                 payload.task,
                 thread_id=thread_id,
                 max_turns=payload.max_turns,
+                access_mode=payload.access_mode,
                 primary_model_override=prim_ov,
                 worker_model_override=work_ov,
                 extra_tools=ext_tools or None,
@@ -828,6 +880,7 @@ def create_app(
             result = await runtime.resume_approval(
                 thread_id=payload.thread_id,
                 decision=resume_body,
+                access_mode=payload.access_mode,
                 primary_model_override=prim_ov,
                 worker_model_override=work_ov,
                 extra_tools=ext_tools or None,

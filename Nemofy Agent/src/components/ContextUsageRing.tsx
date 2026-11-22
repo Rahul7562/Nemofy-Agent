@@ -25,6 +25,8 @@ function getLevelColorVar(level: ContextClassificationLevel): string {
       return 'var(--honey)';
     case 'moderate':
       return 'var(--signal)';
+    case 'unknown':
+      return 'var(--ink-faint)';
     default:
       return 'var(--jade)';
   }
@@ -38,6 +40,8 @@ function getLevelTextClass(level: ContextClassificationLevel): string {
       return 'text-[var(--honey)]';
     case 'moderate':
       return 'text-[var(--signal)]';
+    case 'unknown':
+      return 'text-[var(--ink-faint)]';
     default:
       return 'text-[var(--jade)]';
   }
@@ -47,12 +51,14 @@ function formatWindowSource(source: string): string {
   switch (source) {
     case 'provider_catalog':
       return 'Provider catalog';
+    case 'reference_catalog':
+      return 'Reference catalog';
     case 'model_registry':
-      return 'Model limit';
-    case 'provider_default':
-      return 'Local default';
+      return 'Model registry';
+    case 'unknown':
+      return 'Unknown metadata';
     default:
-      return 'Standard limit';
+      return 'Model metadata';
   }
 }
 
@@ -85,15 +91,23 @@ export function ContextUsageRing({
     };
   }, [popupOpen]);
 
-  const pct = Math.max(0, Math.min(100, usage.usage_percent));
-  const roundedPctLabel = pct > 0 && pct < 1 ? '<1%' : `${Math.round(pct)}%`;
+  const hasKnownWindow =
+    typeof usage.context_window === 'number' &&
+    Number.isFinite(usage.context_window) &&
+    usage.context_window > 0;
+  const pct =
+    hasKnownWindow && typeof usage.usage_percent === 'number' && Number.isFinite(usage.usage_percent)
+      ? Math.max(0, Math.min(100, usage.usage_percent))
+      : null;
+  const roundedPctLabel =
+    pct === null ? '—' : pct > 0 && pct < 1 ? '<1%' : `${Math.round(pct)}%`;
   const strokeColor = getLevelColorVar(usage.classification.level);
   const levelTextClass = getLevelTextClass(usage.classification.level);
 
   // SVG Ring geometry (36x36 viewBox, centered at 18,18, radius 13.5)
   const radius = 13.5;
   const circumference = 2 * Math.PI * radius;
-  const visibleFillPct = pct > 0 ? Math.max(pct, 1.8) : 0;
+  const visibleFillPct = pct !== null && pct > 0 ? Math.max(pct, 1.8) : 0;
   const dashOffset = circumference * (1 - visibleFillPct / 100);
 
   // 80% threshold marker tick coordinates (clockwise from 12 o'clock: -90deg + 0.8 * 360deg = 198deg)
@@ -107,6 +121,10 @@ export function ContextUsageRing({
 
   const showHoverTooltip = hovered && !popupOpen;
 
+  const ariaSummary = hasKnownWindow && pct !== null
+    ? `Context usage ${pct.toFixed(1)}% (${usage.classification.label}), ${formatTokenCount(usage.used_tokens)} of ${formatTokenCount(usage.context_window!)} tokens. Click for category breakdown.`
+    : `Context window unknown (${formatTokenCount(usage.used_tokens)} tokens used). Click for category breakdown.`;
+
   return (
     <div
       ref={containerRef}
@@ -119,7 +137,7 @@ export function ContextUsageRing({
         data-testid="context-usage-ring"
         aria-haspopup="dialog"
         aria-expanded={popupOpen}
-        aria-label={`Context usage ${usage.usage_percent.toFixed(1)}% (${usage.classification.label}), ${formatTokenCount(usage.used_tokens)} of ${formatTokenCount(usage.context_window)} tokens. Click for category breakdown.`}
+        aria-label={ariaSummary}
         onClick={() => setPopupOpen((v) => !v)}
         onFocus={() => setHovered(true)}
         onBlur={() => setHovered(false)}
@@ -147,29 +165,33 @@ export function ContextUsageRing({
             strokeWidth="3.2"
           />
           {/* Progress arc */}
-          <circle
-            cx="18"
-            cy="18"
-            r={radius}
-            fill="none"
-            stroke={strokeColor}
-            strokeWidth="3.4"
-            strokeLinecap="round"
-            strokeDasharray={circumference}
-            strokeDashoffset={dashOffset}
-            transform="rotate(-90 18 18)"
-            className="transition-[stroke-dashoffset,stroke] duration-300 ease-out"
-          />
+          {hasKnownWindow && (
+            <circle
+              cx="18"
+              cy="18"
+              r={radius}
+              fill="none"
+              stroke={strokeColor}
+              strokeWidth="3.4"
+              strokeLinecap="round"
+              strokeDasharray={circumference}
+              strokeDashoffset={dashOffset}
+              transform="rotate(-90 18 18)"
+              className="transition-[stroke-dashoffset,stroke] duration-300 ease-out"
+            />
+          )}
           {/* 80% Auto-compact threshold tick */}
-          <line
-            x1={tickX1}
-            y1={tickY1}
-            x2={tickX2}
-            y2={tickY2}
-            stroke="var(--ink-faint)"
-            strokeWidth="1.4"
-            strokeLinecap="round"
-          />
+          {hasKnownWindow && (
+            <line
+              x1={tickX1}
+              y1={tickY1}
+              x2={tickX2}
+              y2={tickY2}
+              stroke="var(--ink-faint)"
+              strokeWidth="1.4"
+              strokeLinecap="round"
+            />
+          )}
         </svg>
         <span className="font-mono text-[11px] font-semibold tabular-nums text-[var(--ink)] min-w-[26px] text-right">
           {roundedPctLabel}
@@ -194,16 +216,18 @@ export function ContextUsageRing({
 
           <div className="flex items-baseline justify-between gap-2">
             <span className="font-mono text-xs font-semibold tabular-nums text-[var(--ink)]">
-              {formatTokenCount(usage.used_tokens)} / {formatTokenCount(usage.context_window)} tokens
+              {hasKnownWindow
+                ? `${formatTokenCount(usage.used_tokens)} / ${formatTokenCount(usage.context_window!)} tokens`
+                : `${formatTokenCount(usage.used_tokens)} tokens · Window unknown`}
             </span>
             <span className={`font-mono text-xs font-semibold tabular-nums ${levelTextClass}`}>
-              {usage.usage_percent.toFixed(1)}%
+              {pct !== null ? `${pct.toFixed(1)}%` : '—'}
             </span>
           </div>
 
-          {typeof usage.max_output_tokens === 'number' && usage.max_output_tokens > 0 && (
+          {hasKnownWindow && typeof usage.max_output_tokens === 'number' && usage.max_output_tokens > 0 && (
             <div className="font-mono text-[10px] tabular-nums text-[var(--ink-faint)]">
-              Window: {formatTokenCount(usage.context_window)} total · {formatTokenCount(usage.max_output_tokens)} max out
+              Window: {formatTokenCount(usage.context_window!)} total · {formatTokenCount(usage.max_output_tokens)} max out
             </div>
           )}
 
@@ -270,17 +294,19 @@ export function ContextUsageRing({
             </button>
           </div>
 
-          {/* Usage Summary + Segmented Bar with 80% Auto-Compact Marker */}
+          {/* Usage Summary + Segmented Bar */}
           <div className="px-4 pt-3.5 pb-3 border-b border-[var(--rule)] space-y-2.5">
             <div className="flex items-baseline justify-between gap-2">
               <div className="font-mono text-sm font-semibold tabular-nums text-[var(--ink)]">
                 {formatTokenCount(usage.used_tokens)}{' '}
                 <span className="text-xs font-normal text-[var(--ink-faint)]">
-                  / {formatTokenCount(usage.context_window)} tokens
+                  {hasKnownWindow
+                    ? `/ ${formatTokenCount(usage.context_window!)} tokens`
+                    : 'tokens used'}
                 </span>
               </div>
               <span className={`font-mono text-sm font-semibold tabular-nums ${levelTextClass}`}>
-                {usage.usage_percent.toFixed(1)}%
+                {pct !== null ? `${pct.toFixed(1)}%` : 'Unknown'}
               </span>
             </div>
 
@@ -293,8 +319,8 @@ export function ContextUsageRing({
                 <div className="text-[var(--ink-faint)] uppercase tracking-wide text-[9px] font-sans">
                   Total Window
                 </div>
-                <div className="text-[var(--ink)] font-semibold mt-0.5">
-                  {formatTokenCount(usage.context_window)}
+                <div className="text-[var(--ink)] font-semibold mt-0.5" data-testid="context-total-window">
+                  {hasKnownWindow ? formatTokenCount(usage.context_window!) : 'Unknown'}
                 </div>
               </div>
               <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1">
@@ -302,7 +328,9 @@ export function ContextUsageRing({
                   Input Avail
                 </div>
                 <div className="text-[var(--ink)] font-semibold mt-0.5">
-                  {formatTokenCount(usage.free_tokens)}
+                  {hasKnownWindow && typeof usage.free_tokens === 'number'
+                    ? formatTokenCount(usage.free_tokens)
+                    : 'Unknown'}
                 </div>
               </div>
               <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1">
@@ -312,52 +340,58 @@ export function ContextUsageRing({
                 <div className="text-[var(--ink)] font-semibold mt-0.5">
                   {typeof usage.max_output_tokens === 'number' && usage.max_output_tokens > 0
                     ? formatTokenCount(usage.max_output_tokens)
-                    : 'Auto'}
+                    : 'Unknown'}
                 </div>
               </div>
             </div>
 
-            <div className="relative pt-0.5 pb-3.5">
-              <div className="h-2.5 w-full rounded-sm bg-[var(--paper-sunk)] border border-[var(--rule)] overflow-hidden flex">
-                {usage.categories.map((cat) => {
-                  if (cat.tokens <= 0) return null;
-                  const widthPct = Math.max(
-                    0.5,
-                    (cat.tokens / Math.max(1, usage.context_window)) * 100,
-                  );
-                  return (
-                    <div
-                      key={cat.key}
-                      title={`${cat.label}: ${formatTokenCount(cat.tokens)} tokens (${cat.percent.toFixed(1)}%)`}
-                      style={{
-                        width: `${Math.min(100, widthPct)}%`,
-                        backgroundColor: CATEGORY_COLOR_BY_KEY[cat.key] || 'var(--signal)',
-                      }}
-                      className="h-full transition-[width] duration-300"
-                    />
-                  );
-                })}
+            {hasKnownWindow ? (
+              <div className="relative pt-0.5 pb-3.5">
+                <div className="h-2.5 w-full rounded-sm bg-[var(--paper-sunk)] border border-[var(--rule)] overflow-hidden flex">
+                  {usage.categories.map((cat) => {
+                    if (cat.tokens <= 0) return null;
+                    const widthPct = Math.max(
+                      0.5,
+                      (cat.tokens / Math.max(1, usage.context_window!)) * 100,
+                    );
+                    return (
+                      <div
+                        key={cat.key}
+                        title={`${cat.label}: ${formatTokenCount(cat.tokens)} tokens (${cat.percent.toFixed(1)}%)`}
+                        style={{
+                          width: `${Math.min(100, widthPct)}%`,
+                          backgroundColor: CATEGORY_COLOR_BY_KEY[cat.key] || 'var(--signal)',
+                        }}
+                        className="h-full transition-[width] duration-300"
+                      />
+                    );
+                  })}
+                </div>
+                {/* 80% Auto-Compact Threshold Line */}
+                <div
+                  aria-hidden="true"
+                  style={{ left: `${AUTO_COMPACT_THRESHOLD_PERCENT}%` }}
+                  className="absolute top-0 bottom-3 w-px bg-[var(--ink)]/55 pointer-events-none"
+                />
+                <span
+                  style={{ left: `${AUTO_COMPACT_THRESHOLD_PERCENT}%` }}
+                  className="absolute bottom-0 -translate-x-1/2 font-mono text-[10px] text-[var(--ink-faint)] pointer-events-none whitespace-nowrap"
+                >
+                  80% auto-compact
+                </span>
               </div>
-              {/* 80% Auto-Compact Threshold Line */}
-              <div
-                aria-hidden="true"
-                style={{ left: `${AUTO_COMPACT_THRESHOLD_PERCENT}%` }}
-                className="absolute top-0 bottom-3 w-px bg-[var(--ink)]/55 pointer-events-none"
-              />
-              <span
-                style={{ left: `${AUTO_COMPACT_THRESHOLD_PERCENT}%` }}
-                className="absolute bottom-0 -translate-x-1/2 font-mono text-[10px] text-[var(--ink-faint)] pointer-events-none whitespace-nowrap"
-              >
-                80% auto-compact
-              </span>
-            </div>
+            ) : (
+              <p className="text-[11px] text-[var(--ink-soft)] leading-snug rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] px-2.5 py-2">
+                No verified context-window limit was found for this model. Token counts are still tracked below without assuming a default 128k window.
+              </p>
+            )}
           </div>
 
           {/* All Context Categories */}
           <div className="px-4 py-3 space-y-1.5">
             <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wide text-[var(--ink-faint)] pb-1">
               <span>Category</span>
-              <span>Tokens · Window</span>
+              <span>{hasKnownWindow ? 'Tokens · Window' : 'Tokens · Share'}</span>
             </div>
 
             <ul className="space-y-1.5" data-testid="context-category-list">
@@ -388,7 +422,7 @@ export function ContextUsageRing({
                       {formatTokenCount(cat.tokens)}
                     </span>
                     <span className="text-[var(--ink-faint)] w-10 text-right">
-                      {cat.percent.toFixed(1)}%
+                      {hasKnownWindow ? `${cat.percent.toFixed(1)}%` : `${cat.share_of_used.toFixed(0)}%`}
                     </span>
                   </div>
                 </li>
@@ -400,10 +434,14 @@ export function ContextUsageRing({
           <div className="px-4 py-2.5 border-t border-[var(--rule)] bg-[var(--paper-sunk)]/75 space-y-1">
             <div className="flex items-center justify-between gap-2 text-[11px]">
               <span className="text-[var(--ink-soft)] font-mono tabular-nums">
-                {formatTokenCount(usage.free_tokens)} remaining
+                {hasKnownWindow && typeof usage.free_tokens === 'number'
+                  ? `${formatTokenCount(usage.free_tokens)} remaining`
+                  : 'Limit not reported'}
               </span>
               <span className="text-[var(--ink-faint)]">
-                Auto-compacts at {usage.auto_compact_threshold_percent}% only
+                {hasKnownWindow
+                  ? `Auto-compacts at ${usage.auto_compact_threshold_percent}% only`
+                  : 'Auto-compact requires known window'}
               </span>
             </div>
             {usage.compacted_count > 0 && (

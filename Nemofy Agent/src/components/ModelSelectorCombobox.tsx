@@ -1,6 +1,6 @@
 import { Check, ChevronDown, Loader2, RefreshCw, Search, Sparkles, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { fetchProviderModels } from '../lib/apiClient.ts';
+import { fetchProviderModels, resolveModelMetadata } from '../lib/apiClient.ts';
 import {
   filterProviderModels,
   formatContextLength,
@@ -8,8 +8,12 @@ import {
   getProviderPreset,
   mergeProviderModels,
 } from '../lib/llmPresets.ts';
-import { resolveModelLimits } from '../lib/contextUtils.ts';
-import type { ModelRoleKey, ProviderModelOption } from '../types/agent.ts';
+import { matchLiveModelOption, resolveModelLimits } from '../lib/contextUtils.ts';
+import type {
+  ModelResolutionResult,
+  ModelRoleKey,
+  ProviderModelOption,
+} from '../types/agent.ts';
 
 interface ModelSelectorComboboxProps {
   id: string;
@@ -21,6 +25,7 @@ interface ModelSelectorComboboxProps {
   onChange: (nextModel: string) => void;
   onSelectOption?: (option: ProviderModelOption) => void;
   onCatalogLoaded?: (models: ProviderModelOption[]) => void;
+  onModelResolved?: (resolution: ModelResolutionResult) => void;
 }
 
 const MAX_VISIBLE_OPTIONS = 120;
@@ -35,10 +40,13 @@ export function ModelSelectorCombobox({
   onChange,
   onSelectOption,
   onCatalogLoaded,
+  onModelResolved,
 }: ModelSelectorComboboxProps) {
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(false);
+  const [resolvingMetadata, setResolvingMetadata] = useState(false);
+  const [lastResolution, setLastResolution] = useState<ModelResolutionResult | null>(null);
   const [liveModels, setLiveModels] = useState<ProviderModelOption[]>([]);
   const [source, setSource] = useState<'idle' | 'live' | 'preset' | 'error'>('idle');
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -48,11 +56,15 @@ export function ModelSelectorCombobox({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const requestSeqRef = useRef(0);
+  const resolveSeqRef = useRef(0);
+  const lastResolvedKeyRef = useRef<string>('');
   const lastFetchedKeyRef = useRef<string>('');
   const lastFetchedLiveRef = useRef<boolean>(false);
   const wasOpenRef = useRef<boolean>(false);
   const onCatalogLoadedRef = useRef(onCatalogLoaded);
   onCatalogLoadedRef.current = onCatalogLoaded;
+  const onModelResolvedRef = useRef(onModelResolved);
+  onModelResolvedRef.current = onModelResolved;
 
   const preset = getProviderPreset(provider);
   const providerLabel = preset?.label || provider;
@@ -107,17 +119,127 @@ export function ModelSelectorCombobox({
     [provider, baseUrl, apiKeyDraft, role],
   );
 
+  // Unified metadata resolver used identically for BOTH manually entered model IDs and dropdown selections
+  const resolveModelNow = useCallback(
+    async (targetModel: string, optionHint?: ProviderModelOption) => {
+      const trimmed = targetModel.trim();
+      const seq = ++resolveSeqRef.current;
+
+      if (!trimmed) {
+        setResolvingMetadata(false);
+        setLastResolution(null);
+        lastResolvedKeyRef.current = '';
+        return;
+      }
+
+      // 1. Check dropdown hint or live catalog match first (instant, exact provider metadata)
+      const matchedOpt = optionHint || matchLiveModelOption(trimmed, liveModels);
+      if (
+        matchedOpt &&
+        typeof matchedOpt.context_length === 'number' &&
+        matchedOpt.context_length >= 512
+      ) {
+        const localLimits = resolveModelLimits(
+          provider,
+          matchedOpt.id,
+          matchedOpt.context_length,
+          matchedOpt.max_output_tokens,
+        );
+        const result: ModelResolutionResult = {
+          resolved: true,
+          provider,
+          model: trimmed,
+          matched_model: matchedOpt.id,
+          context_window: localLimits.contextWindow,
+          max_output_tokens: localLimits.maxOutputTokens,
+          context_window_source: 'provider_catalog',
+          max_output_tokens_source: localLimits.maxOutputTokensSource,
+        };
+        lastResolvedKeyRef.current = `${provider}|${baseUrl.trim()}|${trimmed.toLowerCase()}`;
+        setResolvingMetadata(false);
+        setLastResolution(result);
+        onModelResolvedRef.current?.(result);
+        return;
+      }
+
+      // 2. Query unified backend resolver (live provider catalog -> reference catalog -> model registry -> explicit unknown)
+      const resolveKey = `${provider}|${baseUrl.trim()}|${trimmed.toLowerCase()}`;
+      if (lastResolvedKeyRef.current === resolveKey) {
+        return;
+      }
+
+      setResolvingMetadata(true);
+      try {
+        const resolved = await resolveModelMetadata({
+          provider,
+          model: trimmed,
+          base_url: baseUrl.trim() || undefined,
+          api_key: apiKeyDraft.trim() || undefined,
+          role,
+        });
+        if (resolveSeqRef.current !== seq) return;
+        lastResolvedKeyRef.current = resolveKey;
+        setLastResolution(resolved);
+        onModelResolvedRef.current?.(resolved);
+      } catch {
+        if (resolveSeqRef.current !== seq) return;
+        const localLimits = resolveModelLimits(provider, trimmed);
+        const fallbackRes: ModelResolutionResult = {
+          resolved: localLimits.contextWindow !== null,
+          provider,
+          model: trimmed,
+          matched_model: localLimits.contextWindow !== null ? trimmed : null,
+          context_window: localLimits.contextWindow,
+          max_output_tokens: localLimits.maxOutputTokens,
+          context_window_source: localLimits.contextWindowSource,
+          max_output_tokens_source: localLimits.maxOutputTokensSource,
+        };
+        lastResolvedKeyRef.current = resolveKey;
+        setLastResolution(fallbackRes);
+        onModelResolvedRef.current?.(fallbackRes);
+      } finally {
+        if (resolveSeqRef.current === seq) {
+          setResolvingMetadata(false);
+        }
+      }
+    },
+    [provider, baseUrl, apiKeyDraft, role, liveModels],
+  );
+
   // Reset cached catalog whenever provider or baseUrl changes
   useEffect(() => {
     requestSeqRef.current += 1;
+    resolveSeqRef.current += 1;
     lastFetchedKeyRef.current = '';
     lastFetchedLiveRef.current = false;
+    lastResolvedKeyRef.current = '';
     setLiveModels([]);
+    setLastResolution(null);
     setSource('idle');
     setFetchError(null);
     setSearchQuery('');
     setHighlightIndex(0);
   }, [provider, baseUrl]);
+
+  // Automatically resolve context window whenever the user manually types or edits the model ID
+  useEffect(() => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      setLastResolution(null);
+      setResolvingMetadata(false);
+      lastResolvedKeyRef.current = '';
+      return;
+    }
+
+    const resolveKey = `${provider}|${baseUrl.trim()}|${trimmed.toLowerCase()}`;
+    if (lastResolvedKeyRef.current === resolveKey) return;
+
+    const timer = window.setTimeout(() => {
+      void resolveModelNow(trimmed);
+    }, 320);
+
+    return () => window.clearTimeout(timer);
+  }, [value, provider, baseUrl, liveModels, resolveModelNow]);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -165,6 +287,9 @@ export function ModelSelectorCombobox({
     } else {
       onChange(modelId);
     }
+    // Always run unified resolution so dropdown selection and manual typing use identical logic
+    lastResolvedKeyRef.current = '';
+    void resolveModelNow(modelId, option);
     setOpen(false);
     setSearchQuery('');
     setHasNavigatedList(false);
@@ -176,6 +301,8 @@ export function ModelSelectorCombobox({
         event.preventDefault();
         setOpen(true);
         setHasNavigatedList(true);
+      } else if (event.key === 'Enter' && value.trim()) {
+        void resolveModelNow(value.trim());
       }
       return;
     }
@@ -213,6 +340,9 @@ export function ModelSelectorCombobox({
       } else {
         event.preventDefault();
         setOpen(false);
+        if (value.trim()) {
+          void resolveModelNow(value.trim());
+        }
       }
     }
   }
@@ -222,6 +352,13 @@ export function ModelSelectorCombobox({
     trimmedQuery &&
       mergedOptions.some((m) => m.id.toLowerCase() === trimmedQuery.toLowerCase()),
   );
+
+  const resolvedCtxLabel = lastResolution?.context_window
+    ? formatContextLength(lastResolution.context_window)
+    : null;
+  const resolvedOutLabel = lastResolution?.max_output_tokens
+    ? formatOutputLength(lastResolution.max_output_tokens)
+    : null;
 
   return (
     <div ref={containerRef} className="relative" onKeyDown={handleKeyDown}>
@@ -237,7 +374,15 @@ export function ModelSelectorCombobox({
             value={value}
             onClick={() => setOpen(true)}
             onFocus={() => setOpen(true)}
-            onChange={(e) => onChange(e.target.value)}
+            onBlur={() => {
+              if (value.trim()) {
+                void resolveModelNow(value.trim());
+              }
+            }}
+            onChange={(e) => {
+              lastResolvedKeyRef.current = '';
+              onChange(e.target.value);
+            }}
             placeholder="Select or type a model ID..."
             className="w-full h-10 pl-3 pr-14 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
           />
@@ -245,7 +390,11 @@ export function ModelSelectorCombobox({
             <button
               type="button"
               tabIndex={-1}
-              onClick={() => onChange('')}
+              onClick={() => {
+                lastResolvedKeyRef.current = '';
+                setLastResolution(null);
+                onChange('');
+              }}
               aria-label="Clear model selection"
               title="Clear model selection"
               className="absolute right-8 top-1/2 -translate-y-1/2 p-1 text-[var(--ink-faint)] hover:text-[var(--ink)] cursor-pointer"
@@ -279,7 +428,7 @@ export function ModelSelectorCombobox({
         </button>
       </div>
 
-      {/* Subtle status hint below input */}
+      {/* Subtle status hint + automatic context-window detection feedback */}
       <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-[var(--ink-faint)]">
         <span className="truncate">
           {loading
@@ -288,12 +437,35 @@ export function ModelSelectorCombobox({
               ? `${liveModels.length} live models available from ${providerLabel}`
               : `Click field to load & select from ${providerLabel} models`}
         </span>
-        {source === 'live' && (
-          <span className="inline-flex items-center gap-1 text-[var(--jade)] shrink-0 font-medium">
-            <span className="w-1.5 h-1.5 rounded-full bg-[var(--jade)]" />
-            Live
-          </span>
-        )}
+        <div className="flex items-center gap-2 shrink-0">
+          {resolvingMetadata && value.trim() && (
+            <span
+              data-testid={`${id}-resolution-status`}
+              className="inline-flex items-center gap-1 font-mono text-[10px] text-[var(--signal)]"
+            >
+              <Loader2 className="w-2.5 h-2.5 animate-spin" />
+              Detecting window…
+            </span>
+          )}
+          {!resolvingMetadata && value.trim() && lastResolution && lastResolution.model.toLowerCase() === value.trim().toLowerCase() && (
+            <span
+              data-testid={`${id}-resolution-status`}
+              className={`font-mono text-[10px] tabular-nums ${
+                lastResolution.resolved ? 'text-[var(--jade)]' : 'text-[var(--honey)]'
+              }`}
+            >
+              {lastResolution.resolved
+                ? [resolvedCtxLabel, resolvedOutLabel].filter(Boolean).join(' · ')
+                : 'Window unknown'}
+            </span>
+          )}
+          {source === 'live' && (
+            <span className="inline-flex items-center gap-1 text-[var(--jade)] shrink-0 font-medium">
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--jade)]" />
+              Live
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Dropdown Popover */}

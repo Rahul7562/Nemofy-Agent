@@ -392,3 +392,50 @@ test('cross-provider reference catalog enriches NVIDIA/Anthropic/OpenAI/River mo
   assert.equal(resolved.context_window, 1_000_000);
   assert.equal(resolved.max_output_tokens, 128_000);
 });
+
+test('resolveModelMetadataFromCatalog returns explicit null/unknown for unregistered models and resolves aliases across providers', async () => {
+  const referenceIndex = buildReferenceModelIndex([
+    { id: 'google/gemini-2.5-pro', context_length: 1_048_576, max_output_tokens: 65_536 },
+    { id: 'openai/gpt-5.2', context_length: 400_000, max_output_tokens: 128_000 },
+    { id: 'anthropic/claude-sonnet-4.5', context_length: 200_000, max_output_tokens: 64_000 },
+    { id: 'deepseek/deepseek-v3', context_length: 128_000, max_output_tokens: 8_192 },
+  ]);
+
+  // Manually entered provider-prefixed alias
+  const geminiAlias = await resolveModelMetadataFromCatalog({
+    provider: 'gemini',
+    model: 'models/gemini-2.5-pro',
+    referenceIndex,
+  });
+  assert.equal(geminiAlias.context_window, 1_048_576);
+  assert.equal(geminiAlias.max_output_tokens, 65_536);
+
+  // Fireworks path-prefixed model
+  const fwAlias = await resolveModelMetadataFromCatalog({
+    provider: 'fireworks',
+    model: 'accounts/fireworks/models/deepseek-v3',
+    referenceIndex,
+  });
+  assert.equal(fwAlias.context_window, 128_000);
+
+  // Unknown model MUST NOT default to 128K (undefined on catalog wrapper, explicit null/unknown on unified resolver)
+  const unknown = await resolveModelMetadataFromCatalog({
+    provider: 'custom',
+    model: 'my-private-unlisted-model-42',
+    referenceIndex,
+  });
+  assert.equal(unknown.context_window, undefined);
+  assert.equal(unknown.max_output_tokens, undefined);
+
+  const { resolveModelMetadataUnified } = await import('./providerCatalog.ts');
+  const unifiedUnknown = await resolveModelMetadataUnified({
+    provider: 'custom',
+    model: 'my-private-unlisted-model-42',
+    referenceIndex,
+  });
+  assert.equal(unifiedUnknown.resolved, false);
+  assert.equal(unifiedUnknown.context_window, null);
+  assert.equal(unifiedUnknown.max_output_tokens, null);
+  assert.equal(unifiedUnknown.context_window_source, 'unknown');
+  assert.equal(unifiedUnknown.max_output_tokens_source, 'unknown');
+});

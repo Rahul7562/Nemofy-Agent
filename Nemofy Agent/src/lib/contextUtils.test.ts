@@ -81,12 +81,33 @@ test('resolveModelContextWindow returns model-specific context limits and prefer
     source: 'model_registry',
   });
   assert.deepEqual(resolveModelContextWindow('ollama', 'my-custom-local-model'), {
-    contextWindow: 32_768,
-    source: 'provider_default',
+    contextWindow: null,
+    source: 'unknown',
+  });
+  assert.deepEqual(resolveModelContextWindow('openai', 'completely-unknown-custom-model-v9'), {
+    contextWindow: null,
+    source: 'unknown',
   });
   assert.deepEqual(resolveModelContextWindow('openrouter', 'some/custom-model', 262_144), {
     contextWindow: 262_144,
     source: 'provider_catalog',
+  });
+  // Aliases & provider-specific identifiers resolve to actual context windows
+  assert.deepEqual(resolveModelContextWindow('fireworks', 'accounts/fireworks/models/deepseek-v3'), {
+    contextWindow: 128_000,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('gemini', 'models/gemini-2.5-flash'), {
+    contextWindow: 1_048_576,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('groq', 'llama-3.3-70b-versatile'), {
+    contextWindow: 131_072,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('xai', 'grok-3'), {
+    contextWindow: 131_072,
+    source: 'model_registry',
   });
 });
 
@@ -130,6 +151,13 @@ test('resolveModelMaxOutputTokens and resolveModelLimits return exact model-spec
   // Output limit can never exceed total context window
   const clamped = resolveModelLimits('custom', 'tiny-model', 4_096, 65_536);
   assert.equal(clamped.maxOutputTokens, 4_096);
+
+  // Completely unknown model retains explicit unknown/null state (never pretends 128K)
+  const unknown = resolveModelLimits('custom', 'unregistered-model-xyz-999');
+  assert.equal(unknown.contextWindow, null);
+  assert.equal(unknown.contextWindowSource, 'unknown');
+  assert.equal(unknown.maxOutputTokens, null);
+  assert.equal(unknown.maxOutputTokensSource, 'unknown');
 });
 
 test('classifyContextUsage enforces strict 80% Auto-Compacting threshold and tier boundaries', () => {
@@ -243,7 +271,8 @@ test('computeModelContextUsage estimates all 7 categories for threads without ba
   assert.ok(byKey.assistant_messages > 0);
   assert.ok(byKey.tool_outputs > 0);
   assert.equal(byKey.compacted_summary, 0);
-  assert.equal(snap.used_tokens + snap.free_tokens, snap.context_window);
+  assert.equal(typeof snap.free_tokens, 'number');
+  assert.equal(snap.used_tokens + (snap.free_tokens as number), snap.context_window);
 });
 
 test('formatTokenCount formats tokens cleanly across scales', () => {

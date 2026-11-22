@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { createThread, deleteThread, listThreads } from '../lib/apiClient.ts';
 import type { ChatThread } from '../types/agent.ts';
 
@@ -7,9 +7,13 @@ export function useChatThreads(authenticated: boolean) {
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [threadsError, setThreadsError] = useState<string | null>(null);
+  const deletedIdsRef = useRef<Set<string>>(new Set());
+  const threadsRef = useRef<ChatThread[]>([]);
+  threadsRef.current = threads;
 
   useEffect(() => {
     if (!authenticated) {
+      deletedIdsRef.current.clear();
       setThreads([]);
       setActiveThreadId(null);
       setLoadingThreads(false);
@@ -23,10 +27,25 @@ export function useChatThreads(authenticated: boolean) {
       try {
         const loaded = await listThreads();
         if (!mounted) return;
-        setThreads(loaded);
+        const filteredLoaded = loaded.filter((t) => !deletedIdsRef.current.has(t.id));
+        setThreads((prev) => {
+          // Preserve any threads created locally while initial load was in-flight
+          const loadedIds = new Set(filteredLoaded.map((t) => t.id));
+          const localOnly = prev.filter(
+            (t) => !loadedIds.has(t.id) && !deletedIdsRef.current.has(t.id),
+          );
+          return [...localOnly, ...filteredLoaded];
+        });
         setActiveThreadId((prev) => {
-          if (prev && loaded.some((t) => t.id === prev)) return prev;
-          return loaded[0]?.id || null;
+          if (prev && !deletedIdsRef.current.has(prev)) {
+            if (
+              filteredLoaded.some((t) => t.id === prev) ||
+              threadsRef.current.some((t) => t.id === prev)
+            ) {
+              return prev;
+            }
+          }
+          return filteredLoaded[0]?.id || null;
         });
         setThreadsError(null);
       } catch (err) {
@@ -44,6 +63,9 @@ export function useChatThreads(authenticated: boolean) {
   }, [authenticated]);
 
   const upsertThread = useCallback((thread: ChatThread, activate = false) => {
+    if (deletedIdsRef.current.has(thread.id)) {
+      return;
+    }
     setThreads((prev) => {
       const exists = prev.some((t) => t.id === thread.id);
       if (exists) {
@@ -58,6 +80,7 @@ export function useChatThreads(authenticated: boolean) {
 
   const updateThreadById = useCallback(
     (id: string, updater: (thread: ChatThread) => ChatThread) => {
+      if (deletedIdsRef.current.has(id)) return;
       setThreads((prev) => prev.map((t) => (t.id === id ? updater(t) : t)));
     },
     [],
@@ -67,7 +90,8 @@ export function useChatThreads(authenticated: boolean) {
     setThreadsError(null);
     try {
       const created = await createThread(title);
-      setThreads((prev) => [created, ...prev]);
+      deletedIdsRef.current.delete(created.id);
+      setThreads((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
       setActiveThreadId(created.id);
       return created;
     } catch (err) {
@@ -78,14 +102,14 @@ export function useChatThreads(authenticated: boolean) {
 
   const removeThread = useCallback(async (id: string) => {
     setThreadsError(null);
+    deletedIdsRef.current.add(id);
     try {
       await deleteThread(id);
-      setThreads((prev) => {
-        const remaining = prev.filter((t) => t.id !== id);
-        setActiveThreadId((current) => (current === id ? remaining[0]?.id || null : current));
-        return remaining;
-      });
+      const nextRemaining = threadsRef.current.filter((t) => t.id !== id);
+      setThreads((prev) => prev.filter((t) => t.id !== id));
+      setActiveThreadId((current) => (current === id ? nextRemaining[0]?.id || null : current));
     } catch (err) {
+      deletedIdsRef.current.delete(id);
       setThreadsError(err instanceof Error ? err.message : 'Unable to delete session.');
     }
   }, []);

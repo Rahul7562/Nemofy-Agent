@@ -7,6 +7,8 @@ import {
   ChevronUp,
   Loader2,
   Paperclip,
+  Shield,
+  ShieldCheck,
   Square,
   Video as VideoIcon,
   X,
@@ -23,10 +25,36 @@ import {
 import { formatFileSize } from '../lib/llmPresets.ts';
 import { computeAutoGrowHeight } from '../lib/scrollUtils.ts';
 import type { ModelThinkingProfile, ThinkingLevel } from '../lib/thinkingModes.ts';
-import type { AccessoriesConfig, ChatAttachment, MediaModality } from '../types/agent.ts';
+import type {
+  AccessoriesConfig,
+  ChatAttachment,
+  ExecutionAccessMode,
+  MediaModality,
+} from '../types/agent.ts';
 
 const MEDIA_ACCEPT_ATTR =
   'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-matroska,audio/mpeg,audio/wav,audio/ogg,audio/flac,audio/mp4,audio/aac,audio/webm';
+
+const ACCESS_MODE_OPTIONS: Array<{
+  value: ExecutionAccessMode;
+  label: string;
+  shortLabel: string;
+  description: string;
+}> = [
+  {
+    value: 'default',
+    label: 'Default',
+    shortLabel: 'Default',
+    description: 'Ask for approval before running sensitive commands and shell actions.',
+  },
+  {
+    value: 'full_access',
+    label: 'Full Access',
+    shortLabel: 'Full Access',
+    description:
+      'Auto-approve command execution requests within the workspace sandbox without prompts.',
+  },
+];
 
 interface ChatComposerProps {
   prompt: string;
@@ -49,6 +77,8 @@ interface ChatComposerProps {
   thinkingProfile: ModelThinkingProfile;
   selectedThinking: ThinkingLevel;
   onSelectThinking: (level: ThinkingLevel) => void;
+  accessMode: ExecutionAccessMode;
+  onChangeAccessMode: (mode: ExecutionAccessMode) => void;
   onOpenLLMSettings: () => void;
   onOpenAccessoriesSettings?: () => void;
   autoFocus?: boolean;
@@ -75,12 +105,16 @@ export function ChatComposer({
   thinkingProfile,
   selectedThinking,
   onSelectThinking,
+  accessMode,
+  onChangeAccessMode,
   onOpenLLMSettings,
   onOpenAccessoriesSettings,
   autoFocus = false,
 }: ChatComposerProps) {
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
+  const [accessMenuOpen, setAccessMenuOpen] = useState(false);
   const thinkingMenuRef = useRef<HTMLDivElement>(null);
+  const accessMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -100,14 +134,21 @@ export function ChatComposer({
   }, [autoFocus]);
 
   useEffect(() => {
-    if (!thinkingMenuOpen) return;
+    if (!thinkingMenuOpen && !accessMenuOpen) return;
     function handleOutside(e: MouseEvent) {
-      if (thinkingMenuRef.current && !thinkingMenuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (thinkingMenuOpen && thinkingMenuRef.current && !thinkingMenuRef.current.contains(target)) {
         setThinkingMenuOpen(false);
+      }
+      if (accessMenuOpen && accessMenuRef.current && !accessMenuRef.current.contains(target)) {
+        setAccessMenuOpen(false);
       }
     }
     function handleEscape(e: globalThis.KeyboardEvent) {
-      if (e.key === 'Escape') setThinkingMenuOpen(false);
+      if (e.key === 'Escape') {
+        setThinkingMenuOpen(false);
+        setAccessMenuOpen(false);
+      }
     }
     document.addEventListener('mousedown', handleOutside);
     document.addEventListener('keydown', handleEscape);
@@ -115,7 +156,7 @@ export function ChatComposer({
       document.removeEventListener('mousedown', handleOutside);
       document.removeEventListener('keydown', handleEscape);
     };
-  }, [thinkingMenuOpen]);
+  }, [thinkingMenuOpen, accessMenuOpen]);
 
   const canSend =
     (prompt.trim().length > 0 || pendingAttachments.length > 0) && uploadingFiles.length === 0;
@@ -280,13 +321,16 @@ export function ChatComposer({
             </button>
           </div>
 
-          {/* Right: Adaptive Thinking Mode + Circular Send/Stop Button */}
-          <div className="flex items-center gap-2">
+          {/* Right: Adaptive Thinking Mode + Execution Access Mode + Circular Send/Stop Button */}
+          <div className="flex items-center gap-1.5 sm:gap-2">
             <div ref={thinkingMenuRef} className="relative shrink-0">
               <button
                 type="button"
-                disabled={sending}
-                onClick={() => setThinkingMenuOpen((v) => !v)}
+                data-testid="thinking-mode-trigger"
+                onClick={() => {
+                  setAccessMenuOpen(false);
+                  setThinkingMenuOpen((v) => !v);
+                }}
                 aria-haspopup="listbox"
                 aria-expanded={thinkingMenuOpen}
                 aria-label={`Thinking mode: ${
@@ -298,7 +342,7 @@ export function ChatComposer({
                     ? `Thinking mode for ${primaryModel} (${thinkingProfile.familyLabel})`
                     : 'Select a Primary model in Settings to configure thinking mode'
                 }
-                className={`h-8 px-2.5 inline-flex items-center gap-1.5 rounded-full border text-xs font-medium transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap ${
+                className={`h-8 px-2.5 inline-flex items-center gap-1.5 rounded-full border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
                   !thinkingProfile.supported
                     ? 'border-[var(--rule)] bg-transparent text-[var(--ink-faint)] hover:text-[var(--ink-soft)] hover:bg-[var(--paper-sunk)]'
                     : selectedThinking !== 'off'
@@ -307,7 +351,7 @@ export function ChatComposer({
                 }`}
               >
                 <Brain className="w-3.5 h-3.5 shrink-0" />
-                <span className="max-w-[82px] truncate">
+                <span className="max-w-[78px] truncate">
                   {thinkingProfile.options.find((o) => o.value === selectedThinking)?.shortLabel ||
                     'Standard'}
                 </span>
@@ -347,6 +391,7 @@ export function ChatComposer({
                             key={opt.value}
                             type="button"
                             role="option"
+                            data-testid={`thinking-option-${opt.value}`}
                             aria-selected={isSelected}
                             onClick={() => {
                               onSelectThinking(opt.value);
@@ -399,6 +444,109 @@ export function ChatComposer({
                       </button>
                     </div>
                   )}
+                </div>
+              )}
+            </div>
+
+            {/* Execution Access Mode (Default / Full Access) directly beside Thinking Mode */}
+            <div ref={accessMenuRef} className="relative shrink-0">
+              <button
+                type="button"
+                data-testid="access-mode-trigger"
+                data-access-mode={accessMode}
+                onClick={() => {
+                  setThinkingMenuOpen(false);
+                  setAccessMenuOpen((v) => !v);
+                }}
+                aria-haspopup="listbox"
+                aria-expanded={accessMenuOpen}
+                aria-label={`Execution access mode: ${
+                  accessMode === 'full_access' ? 'Full Access' : 'Default'
+                }`}
+                title={
+                  accessMode === 'full_access'
+                    ? 'Full Access: command approval prompts are automatically approved inside the sandbox'
+                    : 'Default: sensitive commands require your explicit approval before executing'
+                }
+                className={`h-8 px-2.5 inline-flex items-center gap-1.5 rounded-full border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  accessMode === 'full_access'
+                    ? 'border-[var(--honey)]/60 bg-[var(--honey)]/12 text-[var(--honey)] hover:border-[var(--honey)]'
+                    : 'border-[var(--rule)] bg-transparent text-[var(--ink-soft)] hover:border-[var(--rule-strong)] hover:text-[var(--ink)] hover:bg-[var(--paper-sunk)]'
+                }`}
+              >
+                {accessMode === 'full_access' ? (
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <Shield className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span>{accessMode === 'full_access' ? 'Full Access' : 'Default'}</span>
+                {accessMenuOpen ? (
+                  <ChevronDown className="w-3 h-3 opacity-70 shrink-0" />
+                ) : (
+                  <ChevronUp className="w-3 h-3 opacity-70 shrink-0" />
+                )}
+              </button>
+
+              {accessMenuOpen && (
+                <div
+                  role="listbox"
+                  aria-label="Select execution access mode"
+                  className="absolute bottom-full right-0 mb-2 w-64 rounded-2xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] shadow-xl overflow-hidden z-30"
+                >
+                  <div className="px-3.5 py-2.5 border-b border-[var(--rule)] bg-[var(--paper-sunk)]">
+                    <div className="text-[11px] font-semibold text-[var(--ink)]">
+                      Execution Access Mode
+                    </div>
+                    <div className="text-[10px] text-[var(--ink-faint)] mt-0.5">
+                      Takes effect immediately without restarting the session.
+                    </div>
+                  </div>
+
+                  <div className="p-1.5 space-y-0.5">
+                    {ACCESS_MODE_OPTIONS.map((opt) => {
+                      const isSelected = accessMode === opt.value;
+                      const isFull = opt.value === 'full_access';
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          role="option"
+                          data-testid={`access-mode-option-${opt.value}`}
+                          aria-selected={isSelected}
+                          onClick={() => {
+                            onChangeAccessMode(opt.value);
+                            setAccessMenuOpen(false);
+                          }}
+                          className={`w-full px-2.5 py-2 rounded-xl text-left flex items-start justify-between gap-2 transition-colors cursor-pointer ${
+                            isSelected
+                              ? isFull
+                                ? 'bg-[var(--honey)]/15 text-[var(--honey)]'
+                                : 'bg-[var(--blush)] text-[var(--signal)]'
+                              : 'text-[var(--ink)] hover:bg-[var(--paper-sunk)]'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold leading-tight flex items-center gap-1.5">
+                              {isFull ? (
+                                <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                              ) : (
+                                <Shield className="w-3.5 h-3.5 shrink-0" />
+                              )}
+                              <span>{opt.label}</span>
+                            </div>
+                            <div
+                              className={`text-[11px] leading-snug mt-0.5 ${
+                                isSelected ? 'opacity-85' : 'text-[var(--ink-faint)]'
+                              }`}
+                            >
+                              {opt.description}
+                            </div>
+                          </div>
+                          {isSelected && <Check className="w-3.5 h-3.5 shrink-0 mt-0.5" />}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>

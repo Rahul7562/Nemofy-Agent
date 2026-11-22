@@ -133,6 +133,32 @@ test('validateLLMConfig catches missing URLs and accepts valid NVIDIA config', (
     max_turns: 30,
   });
   assert.equal(invalid.valid, false);
+
+  // Max execution turns 1..180 boundary validation
+  const baseValid = {
+    primary: {
+      provider: 'nvidia',
+      model: 'nvidia/llama-3.3-nemotron-super-49b-v1',
+      base_url: 'https://integrate.api.nvidia.com/v1',
+      temperature: 0.2,
+      max_tokens: 4096,
+      reasoning_effort: 'high',
+    },
+    worker: {
+      provider: 'river_ai',
+      model: 'deepseek-ai/DeepSeek-V4.1-Flash',
+      base_url: 'https://api.river.ai/v1',
+      temperature: 0.1,
+      max_tokens: 2048,
+      reasoning_effort: 'off',
+    },
+  };
+  assert.equal(validateLLMConfig({ ...baseValid, max_turns: 1 }).valid, true);
+  assert.equal(validateLLMConfig({ ...baseValid, max_turns: 180 }).valid, true);
+  assert.equal(validateLLMConfig({ ...baseValid, max_turns: 0 }).valid, false);
+  assert.equal(validateLLMConfig({ ...baseValid, max_turns: -1 }).valid, false);
+  assert.equal(validateLLMConfig({ ...baseValid, max_turns: 181 }).valid, false);
+  assert.equal(validateLLMConfig({ ...baseValid, max_turns: 12.5 }).valid, false);
 });
 
 test('detectModelInputModalities matches DeepSeek-V4.1-Flash, Nemotron Omni, and text-only models', () => {

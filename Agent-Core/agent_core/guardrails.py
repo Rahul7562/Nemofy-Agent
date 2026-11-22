@@ -10,6 +10,7 @@ import json
 import re
 import shlex
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -18,6 +19,51 @@ from langgraph.types import interrupt
 from pydantic import ValidationError
 
 SafetyLevel = Literal["SAFE", "SENSITIVE"]
+ExecutionAccessMode = Literal["default", "full_access"]
+
+_RUNTIME_ACCESS_MODE: ExecutionAccessMode = "default"
+_RUNTIME_ACCESS_MODE_VERSION: int = 0
+# Stores (mode, runtime_version_when_bound) so live runtime mode switches take effect immediately
+current_access_mode: ContextVar[tuple[ExecutionAccessMode, int] | None] = ContextVar(
+    "guardrails_access_mode",
+    default=None,
+)
+
+
+def normalize_access_mode(raw: str | None) -> ExecutionAccessMode:
+    clean = (raw or "").strip().lower()
+    if clean in ("full_access", "full-access", "full", "auto"):
+        return "full_access"
+    return "default"
+
+
+def get_runtime_access_mode() -> ExecutionAccessMode:
+    return _RUNTIME_ACCESS_MODE
+
+
+def set_runtime_access_mode(mode: str | None) -> ExecutionAccessMode:
+    global _RUNTIME_ACCESS_MODE, _RUNTIME_ACCESS_MODE_VERSION
+    normalized = normalize_access_mode(mode)
+    _RUNTIME_ACCESS_MODE = normalized
+    _RUNTIME_ACCESS_MODE_VERSION += 1
+    return normalized
+
+
+def bind_run_access_mode(mode: str | None) -> Any:
+    """Bind a per-run access mode that automatically yields if runtime mode is toggled mid-run."""
+    if mode is None:
+        return current_access_mode.set(None)
+    return current_access_mode.set((normalize_access_mode(mode), _RUNTIME_ACCESS_MODE_VERSION))
+
+
+def get_effective_access_mode() -> ExecutionAccessMode:
+    bound = current_access_mode.get()
+    if bound is None:
+        return _RUNTIME_ACCESS_MODE
+    bound_mode, bound_version = bound
+    if _RUNTIME_ACCESS_MODE_VERSION > bound_version:
+        return _RUNTIME_ACCESS_MODE
+    return bound_mode
 
 EXPLICIT_SAFE_TOOLS: frozenset[str] = frozenset(
     {
@@ -633,36 +679,45 @@ async def execute_tool_with_guardrails(
         is_mcp_tool=is_mcp_tool,
     )
 
+    effective_access_mode = get_effective_access_mode()
     final_args = dict(arguments)
     approval_record: dict[str, Any] = {
         "tool_name": tool_obj.name,
         "safety_level": classification.safety_level,
         "source": source,
+        "access_mode": effective_access_mode,
         "approved": True,
+        "auto_approved": False,
         "edited": False,
         "executed": False,
     }
 
     if classification.safety_level == "SENSITIVE":
-        decision = request_human_approval(
-            classification=classification,
-            arguments=final_args,
-            tool_obj=tool_obj,
-            source=source,
-        )
-        approval_record["approval_id"] = decision.approval_id
-        approval_record["approved"] = decision.approved
-        approval_record["edited"] = decision.edited
-        approval_record["reason"] = decision.reason
-
-        if not decision.approved:
-            approval_record["executed"] = False
-            return (
-                f"ACTION REJECTED BY HUMAN: Tool '{tool_obj.name}' was NOT executed. "
-                f"Reason: {decision.reason}",
-                approval_record,
+        if effective_access_mode == "full_access":
+            approval_record["approval_id"] = f"auto-{uuid.uuid4().hex[:10]}"
+            approval_record["approved"] = True
+            approval_record["auto_approved"] = True
+            approval_record["reason"] = "Auto-approved under Full Access execution mode."
+        else:
+            decision = request_human_approval(
+                classification=classification,
+                arguments=final_args,
+                tool_obj=tool_obj,
+                source=source,
             )
-        final_args = decision.arguments
+            approval_record["approval_id"] = decision.approval_id
+            approval_record["approved"] = decision.approved
+            approval_record["edited"] = decision.edited
+            approval_record["reason"] = decision.reason
+
+            if not decision.approved:
+                approval_record["executed"] = False
+                return (
+                    f"ACTION REJECTED BY HUMAN: Tool '{tool_obj.name}' was NOT executed. "
+                    f"Reason: {decision.reason}",
+                    approval_record,
+                )
+            final_args = decision.arguments
 
     validated_args, val_err = validate_tool_arguments(tool_obj, final_args)
     if val_err is not None or validated_args is None:

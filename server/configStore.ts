@@ -4,6 +4,57 @@ import net from 'node:net';
 import path from 'node:path';
 
 export type MediaModality = 'image' | 'video' | 'audio';
+export type ExecutionAccessMode = 'default' | 'full_access';
+
+export const MIN_MAX_TURNS = 1;
+export const MAX_MAX_TURNS = 180;
+
+export function normalizeAccessMode(raw: unknown): ExecutionAccessMode {
+  return raw === 'full_access' ? 'full_access' : 'default';
+}
+
+export function validateMaxTurns(
+  raw: unknown,
+): { ok: true; value: number } | { ok: false; error: string } {
+  if (typeof raw === 'boolean' || raw === null || raw === undefined) {
+    return {
+      ok: false,
+      error: `Max execution turns must be a whole number between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+    };
+  }
+  let parsed: number;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!/^-?\d+$/.test(trimmed)) {
+      return {
+        ok: false,
+        error: `Max execution turns must be a whole number between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+      };
+    }
+    parsed = Number(trimmed);
+  } else if (typeof raw === 'number') {
+    parsed = raw;
+  } else {
+    return {
+      ok: false,
+      error: `Max execution turns must be a whole number between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+    };
+  }
+
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    return {
+      ok: false,
+      error: `Max execution turns must be a whole number between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS}.`,
+    };
+  }
+  if (parsed < MIN_MAX_TURNS || parsed > MAX_MAX_TURNS) {
+    return {
+      ok: false,
+      error: `Max execution turns must be between ${MIN_MAX_TURNS} and ${MAX_MAX_TURNS} (received ${parsed}).`,
+    };
+  }
+  return { ok: true, value: parsed };
+}
 
 export interface RoleLLMConfig {
   provider: string;
@@ -28,17 +79,17 @@ export interface ContextCategorySnapshot {
 export interface ContextUsageSnapshot {
   model: string;
   provider: string;
-  context_window: number;
+  context_window: number | null;
   context_window_source: string;
-  max_output_tokens?: number;
+  max_output_tokens?: number | null;
   max_output_tokens_source?: string;
-  configured_max_tokens?: number;
+  configured_max_tokens?: number | null;
   used_tokens: number;
-  free_tokens: number;
-  usage_percent: number;
+  free_tokens: number | null;
+  usage_percent: number | null;
   auto_compact_threshold_percent: number;
   classification: {
-    level: 'optimal' | 'moderate' | 'high' | 'critical';
+    level: 'optimal' | 'moderate' | 'high' | 'critical' | 'unknown';
     label: string;
     description: string;
   };
@@ -64,6 +115,7 @@ export interface PersistedLLMConfig {
   worker: RoleLLMConfig;
   accessories: AccessoriesConfig;
   max_turns: number;
+  access_mode: ExecutionAccessMode;
 }
 
 export interface ChatAttachmentRecord {
@@ -970,7 +1022,11 @@ export class WorkspaceAndConfigStore {
         reasoning_effort: process.env.WORKER_REASONING_EFFORT || 'off',
       },
       accessories: getDefaultAccessoriesConfig(),
-      max_turns: Number(process.env.MAX_TURNS || '30'),
+      max_turns: Math.max(
+        MIN_MAX_TURNS,
+        Math.min(MAX_MAX_TURNS, Math.round(Number(process.env.MAX_TURNS || '30') || 30)),
+      ),
+      access_mode: normalizeAccessMode(process.env.EXECUTION_ACCESS_MODE),
     };
 
     if (!fs.existsSync(this.llmConfigPath)) {
@@ -989,8 +1045,12 @@ export class WorkspaceAndConfigStore {
         },
         max_turns:
           typeof parsed.max_turns === 'number' && Number.isFinite(parsed.max_turns)
-            ? Math.max(1, Math.min(100, Math.round(parsed.max_turns)))
+            ? Math.max(MIN_MAX_TURNS, Math.min(MAX_MAX_TURNS, Math.round(parsed.max_turns)))
             : defaults.max_turns,
+        access_mode:
+          parsed.access_mode !== undefined
+            ? normalizeAccessMode(parsed.access_mode)
+            : defaults.access_mode,
       };
     } catch {
       return defaults;
@@ -1017,10 +1077,17 @@ export class WorkspaceAndConfigStore {
       },
       max_turns:
         typeof next.max_turns === 'number' && Number.isFinite(next.max_turns)
-          ? Math.max(1, Math.min(100, Math.round(next.max_turns)))
+          ? Math.max(MIN_MAX_TURNS, Math.min(MAX_MAX_TURNS, Math.round(next.max_turns)))
           : current.max_turns,
+      access_mode:
+        next.access_mode !== undefined
+          ? normalizeAccessMode(next.access_mode)
+          : current.access_mode,
     };
-    fs.writeFileSync(this.llmConfigPath, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+    const payload = JSON.stringify(merged, null, 2) + '\n';
+    const tmpPath = `${this.llmConfigPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    fs.writeFileSync(tmpPath, payload, 'utf-8');
+    fs.renameSync(tmpPath, this.llmConfigPath);
     return merged;
   }
 

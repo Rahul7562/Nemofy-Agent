@@ -303,3 +303,55 @@ test('updateThreads preserves concurrent thread writes and saveMCPServers blocks
   }
 });
 
+test('WorkspaceAndConfigStore enforces 1..180 max_turns and persists execution access_mode cleanly', async () => {
+  const { validateMaxTurns, normalizeAccessMode, MIN_MAX_TURNS, MAX_MAX_TURNS } = await import(
+    './configStore.ts'
+  );
+  assert.equal(MIN_MAX_TURNS, 1);
+  assert.equal(MAX_MAX_TURNS, 180);
+
+  assert.equal(validateMaxTurns(1).ok, true);
+  assert.equal(validateMaxTurns(180).ok, true);
+  assert.equal(validateMaxTurns(0).ok, false);
+  assert.equal(validateMaxTurns(-1).ok, false);
+  assert.equal(validateMaxTurns(181).ok, false);
+  assert.equal(validateMaxTurns(12.5).ok, false);
+  assert.equal(validateMaxTurns('abc').ok, false);
+  assert.equal(validateMaxTurns('').ok, false);
+  assert.equal(validateMaxTurns(null).ok, false);
+
+  assert.equal(normalizeAccessMode(undefined), 'default');
+  assert.equal(normalizeAccessMode('default'), 'default');
+  assert.equal(normalizeAccessMode('full_access'), 'full_access');
+  assert.equal(normalizeAccessMode('invalid'), 'default');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-turns-access-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+    const initial = store.getLLMConfig();
+    assert.equal(initial.access_mode, 'default');
+
+    const saved180 = store.saveLLMConfig({
+      ...initial,
+      max_turns: 180,
+      access_mode: 'full_access',
+    });
+    assert.equal(saved180.max_turns, 180);
+    assert.equal(saved180.access_mode, 'full_access');
+
+    const reloaded = new WorkspaceAndConfigStore(tmpRoot).getLLMConfig();
+    assert.equal(reloaded.max_turns, 180);
+    assert.equal(reloaded.access_mode, 'full_access');
+
+    const saved1 = store.saveLLMConfig({
+      ...reloaded,
+      max_turns: 1,
+      access_mode: 'default',
+    });
+    assert.equal(saved1.max_turns, 1);
+    assert.equal(saved1.access_mode, 'default');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
