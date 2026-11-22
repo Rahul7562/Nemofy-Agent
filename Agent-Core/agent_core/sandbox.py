@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -43,9 +44,12 @@ SENSITIVE_ENV_PREFIXES = (
 
 _LOCAL_ESCAPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"/var/run/docker\.sock", re.IGNORECASE),
-    re.compile(r"/etc/(?:shadow|passwd|sudoers)", re.IGNORECASE),
-    re.compile(r"/proc/\d+/(?:environ|mem|root)", re.IGNORECASE),
-    re.compile(r"(?:^|[\s;|&`\"'/])\.env(?=$|[\s;|&`\"'])", re.IGNORECASE),
+    re.compile(r"(?:^|[\s\"'`;|&=<>])/(?:etc|proc|sys|root|boot|var|home|opt|srv|mnt|media|app)(?:/|[\s\"'`;|&<>]|$)", re.IGNORECASE),
+    re.compile(r"(?:^|[\s/\\.\"'`=;|&<>])\.\.(?:[/\\]|$|[\s\"'`;|&<>])"),
+    re.compile(r"(?:^|[\s\"'`;|&=/])\.env(?:[\.\w*?\[\]]*)?(?=$|[\s\"'`;|&<>])", re.IGNORECASE),
+    re.compile(r"(?:data/)?(?:auth\.json|llm_config\.json|threads\.json|checkpoints\.db|vaults(?:/|\b))", re.IGNORECASE),
+    re.compile(r"(?:^|[\s\"'`;|&=/])server(?:\.ts|/[\w.-]+)", re.IGNORECASE),
+    re.compile(r"\bln\s+[^\n]*(?:-s\b|--symbolic\b)", re.IGNORECASE),
 )
 
 _WORKSPACE_TOKEN_RE = re.compile(
@@ -82,8 +86,10 @@ class SandboxConfig:
     cpu_quota: int = 100_000
     cpu_period: int = 100_000
     pids_limit: int = 128
-    timeout_seconds: int = 60
+    timeout_seconds: int = 300
+    max_timeout_seconds: int = 1800
     network_mode: str = "bridge"
+    allow_unsafe_local_bash: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> SandboxConfig:
@@ -96,6 +102,13 @@ class SandboxConfig:
             backend = "local_isolated"
         else:
             backend = "auto"
+        allow_unsafe = (src.get("ALLOW_UNSAFE_LOCAL_BASH") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        default_timeout = max(1, int(src.get("SANDBOX_TIMEOUT_SECONDS") or "300"))
+        max_timeout = max(default_timeout, int(src.get("SANDBOX_MAX_TIMEOUT_SECONDS") or "1800"))
         return cls(
             workspace_dir=Path(src.get("WORKSPACE_DIR") or "./workspace").resolve(),
             backend=backend,
@@ -104,8 +117,10 @@ class SandboxConfig:
             cpu_quota=max(10_000, int(src.get("SANDBOX_CPU_QUOTA") or "100000")),
             cpu_period=max(10_000, int(src.get("SANDBOX_CPU_PERIOD") or "100000")),
             pids_limit=max(16, int(src.get("SANDBOX_PIDS_LIMIT") or "128")),
-            timeout_seconds=max(1, int(src.get("SANDBOX_TIMEOUT_SECONDS") or "60")),
+            timeout_seconds=default_timeout,
+            max_timeout_seconds=max_timeout,
             network_mode=(src.get("SANDBOX_NETWORK_MODE") or "bridge").strip(),
+            allow_unsafe_local_bash=allow_unsafe,
         )
 
 
@@ -248,14 +263,24 @@ def _sanitized_sandbox_env(workspace_root: Path) -> dict[str, str]:
     return safe
 
 
-def _check_local_command_boundaries(command: str) -> None:
-    """Block obvious host escape reads when running in local_isolated mode."""
+def _check_local_command_boundaries(command: str, workspace_root: Path | None = None) -> None:
+    """Block host escape reads/writes and traversal when running in local_isolated mode."""
     for pattern in _LOCAL_ESCAPE_PATTERNS:
         if pattern.search(command):
             raise SandboxSecurityError(
-                f"Command rejected by sandbox policy (matched restricted host path: "
-                f"{pattern.pattern})."
+                "Command rejected by sandbox policy (restricted host path, traversal, or sensitive file pattern)."
             )
+
+    if workspace_root is not None:
+        ws_str = str(workspace_root.resolve())
+        parent_str = str(workspace_root.resolve().parent)
+        # Reject commands referencing the parent application root directly
+        if parent_str and parent_str != "/" and parent_str in command:
+            stripped_ws = command.replace(ws_str, "")
+            if parent_str in stripped_ws:
+                raise SandboxSecurityError(
+                    "Command rejected by sandbox policy (references host directory outside /workspace)."
+                )
 
 
 class SandboxManager:
@@ -398,8 +423,9 @@ class SandboxManager:
                 session_id=session_id,
             )
 
+        max_cap = max(self.config.timeout_seconds, self.config.max_timeout_seconds)
         effective_timeout = (
-            min(timeout, self.config.timeout_seconds)
+            min(int(timeout), max_cap)
             if timeout is not None and timeout > 0
             else self.config.timeout_seconds
         )
@@ -442,11 +468,19 @@ class SandboxManager:
             stderr = (err_b or b"").decode("utf-8", errors="replace")
             return exit_code, stdout, stderr, recovered
 
+        from agent_core.jobs import track_active_task
+
+        cmd_preview = " ".join(command.strip().split())[:80]
         try:
-            exit_code, stdout, stderr, recovered = await asyncio.wait_for(
-                asyncio.to_thread(_run_once),
-                timeout=float(timeout),
-            )
+            with track_active_task(
+                "background_process",
+                f"bash_exec: {cmd_preview}",
+                expected_seconds=float(timeout),
+            ):
+                exit_code, stdout, stderr, recovered = await asyncio.wait_for(
+                    asyncio.to_thread(_run_once),
+                    timeout=float(timeout),
+                )
             return ExecResult(
                 exit_code=exit_code,
                 stdout=stdout,
@@ -474,8 +508,16 @@ class SandboxManager:
         session_id: str,
         timeout: int,
     ) -> ExecResult:
-        _check_local_command_boundaries(command)
         ws = self.get_session_workspace(session_id)
+        _check_local_command_boundaries(command, workspace_root=ws)
+
+        bwrap_bin = shutil.which("bwrap")
+        if self.config.backend == "auto" and not bwrap_bin and not self.config.allow_unsafe_local_bash:
+            raise SandboxSecurityError(
+                "Docker sandbox is unavailable and unisolated local bash fallback is disabled. "
+                "Start Docker, install bubblewrap (bwrap), or set ALLOW_UNSAFE_LOCAL_BASH=true for explicit local opt-in."
+            )
+
         env = _sanitized_sandbox_env(ws)
         mem_bytes = _parse_memory_bytes(self.config.memory_limit)
         cpu_seconds = max(timeout + 2, 5)
@@ -515,8 +557,36 @@ class SandboxManager:
             preexec_fn=_preexec,
         )
 
+        from agent_core.jobs import track_active_task
+
+        cmd_preview = " ".join(command.strip().split())[:80]
+
+        async def _terminate_proc_group() -> None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except TimeoutError:
+                pass
+
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout))
+            with track_active_task(
+                "background_process",
+                f"bash_exec: {cmd_preview}",
+                pid=proc.pid,
+                expected_seconds=float(timeout),
+                liveness_check=lambda: proc.returncode is None,
+            ):
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=float(timeout)
+                )
             exit_code = int(proc.returncode or 0)
             stdout_str = stdout_b.decode("utf-8", errors="replace")
             stderr_str = stderr_b.decode("utf-8", errors="replace")
@@ -549,17 +619,11 @@ class SandboxManager:
                 backend="local_isolated",
                 session_id=session_id,
             )
+        except asyncio.CancelledError:
+            await _terminate_proc_group()
+            raise
         except TimeoutError:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                proc.kill()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except TimeoutError:
-                pass
+            await _terminate_proc_group()
             return ExecResult(
                 exit_code=124,
                 stdout="",

@@ -20,6 +20,7 @@ export function App() {
   const [theme, setTheme] = useState<ThemeMode>(getInitialTheme);
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
+  const [needsSetup, setNeedsSetup] = useState(false);
   const [username, setUsername] = useState('admin');
 
   const [activeSection, setActiveSection] = useState<NavSection>('chat');
@@ -47,6 +48,7 @@ export function App() {
       const session = await checkAuthSession();
       if (!mounted) return;
       setAuthenticated(Boolean(session.authenticated));
+      setNeedsSetup(Boolean(session.needsSetup));
       if (session.username) setUsername(session.username);
       setAuthChecked(true);
     })();
@@ -115,9 +117,11 @@ export function App() {
     return (
       <LoginGate
         theme={theme}
+        needsSetup={needsSetup}
         onToggleTheme={toggleTheme}
         onAuthenticated={(user) => {
           setUsername(user);
+          setNeedsSetup(false);
           setAuthenticated(true);
         }}
       />

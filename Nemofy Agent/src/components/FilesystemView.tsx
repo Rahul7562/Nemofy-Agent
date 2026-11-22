@@ -160,7 +160,7 @@ export function FilesystemView() {
         await createWorkspaceFolder(clean);
         setFeedback({ type: 'ok', text: `Created folder /workspace/${clean}` });
       } else {
-        await saveWorkspaceFile(clean, '');
+        await saveWorkspaceFile(clean, '', { createOnly: true });
         setFeedback({ type: 'ok', text: `Created file /workspace/${clean}` });
         await handleSelectFile(clean);
       }

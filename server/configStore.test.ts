@@ -202,3 +202,104 @@ test('WorkspaceAndConfigStore preserves blank primary.model and explicit context
   }
 });
 
+test('resolveWorkspacePath and workspace file ops reject symlinks escaping workspace and enforce createOnly (BUG-4, BUG-18)', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-symlink-test-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+    const outsideSecret = path.join(tmpRoot, 'outside-secret.txt');
+    fs.writeFileSync(outsideSecret, 'TOP_SECRET', 'utf-8');
+
+    const outsideDir = path.join(tmpRoot, 'outside-dir');
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'leak.txt'), 'LEAK', 'utf-8');
+
+    fs.symlinkSync(outsideSecret, path.join(store.workspaceDir, 'link.txt'));
+    fs.symlinkSync(outsideDir, path.join(store.workspaceDir, 'linked-dir'));
+
+    assert.throws(() => store.readWorkspaceFile('link.txt'), /symlink|escapes/i);
+    assert.throws(() => store.writeWorkspaceFile('link.txt', 'overwrite'), /symlink|escapes/i);
+    assert.throws(() => store.writeWorkspaceFile('linked-dir/pwned.txt', 'x'), /symlink|escapes/i);
+    assert.throws(() => store.listWorkspaceDirectory('linked-dir'), /symlink|escapes/i);
+    assert.equal(fs.readFileSync(outsideSecret, 'utf-8'), 'TOP_SECRET');
+
+    const treeNames = store.listWorkspaceTree().map((n) => n.name);
+    assert.equal(treeNames.includes('link.txt'), false);
+    assert.equal(treeNames.includes('linked-dir'), false);
+
+    // createOnly prevents silent truncation of existing workspace files
+    store.writeWorkspaceFile('notes.md', 'important content');
+    assert.throws(
+      () => store.writeWorkspaceFile('notes.md', '', { createOnly: true }),
+      /already exists/i,
+    );
+    assert.equal(store.readWorkspaceFile('notes.md').content, 'important content');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('updateThreads preserves concurrent thread writes and saveMCPServers blocks internal SSRF URLs (BUG-5, BUG-16)', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nemofy-threads-mcp-'));
+  try {
+    const store = new WorkspaceAndConfigStore(tmpRoot);
+    const now = new Date().toISOString();
+
+    store.updateThreads((threads) => {
+      threads.push({
+        id: 'thread-1',
+        title: 'First',
+        createdAt: now,
+        updatedAt: now,
+        messages: [],
+      });
+    });
+    store.updateThreads((threads) => {
+      threads.push({
+        id: 'thread-2',
+        title: 'Second',
+        createdAt: now,
+        updatedAt: now,
+        messages: [],
+      });
+    });
+
+    const ids = store.listThreads().map((t) => t.id).sort();
+    assert.deepEqual(ids, ['thread-1', 'thread-2']);
+
+    for (const badUrl of [
+      'http://127.0.0.1:8080/mcp',
+      'http://169.254.169.254/latest/meta-data',
+      'http://localhost:3000/api',
+      'file:///etc/passwd',
+    ]) {
+      assert.throws(
+        () =>
+          store.saveMCPServers([
+            {
+              name: 'bad',
+              url: badUrl,
+              transport: 'streamable_http',
+              enabled: true,
+              timeout_seconds: 30,
+            },
+          ]),
+        /URL|loopback|private|internal|http/i,
+      );
+    }
+
+    const saved = store.saveMCPServers([
+      {
+        name: 'valid',
+        url: 'https://mcp.example.com/sse',
+        transport: 'sse',
+        enabled: true,
+        timeout_seconds: 30,
+      },
+    ]);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].url, 'https://mcp.example.com/sse');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+

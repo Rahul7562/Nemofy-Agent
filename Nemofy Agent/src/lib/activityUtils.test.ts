@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   DEFAULT_ACTIVITY_PREFS,
+  MAX_CONSECUTIVE_POLL_ERRORS,
+  computePollRetryDelayMs,
   dedupeFileChanges,
   extractLatestThoughtLine,
   formatElapsedSeconds,
   formatPhaseLabel,
   parseActivityPrefs,
+  shouldRetryPollError,
   summarizeActivity,
 } from './activityUtils.ts';
 
@@ -105,4 +108,25 @@ test('parseActivityPrefs falls back safely on invalid JSON and preserves valid u
       showFilesSection: true,
     },
   );
+});
+
+test('formatPhaseLabel covers rate_limited, background_task, and resuming_approval phases', () => {
+  assert.equal(formatPhaseLabel('rate_limited'), 'Rate limited (HTTP 429) — retrying every 3s');
+  assert.equal(formatPhaseLabel('background_task'), 'Waiting for background task');
+  assert.equal(formatPhaseLabel('resuming_approval'), 'Applying your approval decision');
+  assert.equal(formatPhaseLabel('compacting_context'), 'Compacting conversation context');
+  assert.equal(
+    formatPhaseLabel('rate_limited', 'Rate limit (429) — retrying in 3s (attempt 2)'),
+    'Rate limit (429) — retrying in 3s (attempt 2)',
+  );
+});
+
+test('shouldRetryPollError and computePollRetryDelayMs bound retries and skip aborts', () => {
+  assert.equal(shouldRetryPollError(1, MAX_CONSECUTIVE_POLL_ERRORS, false), true);
+  assert.equal(shouldRetryPollError(MAX_CONSECUTIVE_POLL_ERRORS, MAX_CONSECUTIVE_POLL_ERRORS, false), true);
+  assert.equal(shouldRetryPollError(MAX_CONSECUTIVE_POLL_ERRORS + 1, MAX_CONSECUTIVE_POLL_ERRORS, false), false);
+  assert.equal(shouldRetryPollError(1, MAX_CONSECUTIVE_POLL_ERRORS, true), false);
+  assert.equal(computePollRetryDelayMs(1), 800);
+  assert.equal(computePollRetryDelayMs(2), 1500);
+  assert.equal(computePollRetryDelayMs(10), 4000);
 });

@@ -1,19 +1,30 @@
-import { Eye, EyeOff, Lock, Moon, Sun, ArrowRight } from 'lucide-react';
+import { Eye, EyeOff, Lock, Moon, Sun, ArrowRight, ShieldCheck } from 'lucide-react';
 import { type FormEvent, useState } from 'react';
-import { loginWithCredentials } from '../lib/apiClient.ts';
-import { validateLoginInput } from '../lib/authValidation.ts';
+import { loginWithCredentials, setupAdminPassword } from '../lib/apiClient.ts';
+import {
+  DEFAULT_ADMIN_USERNAME,
+  validateInitialSetup,
+  validateLoginInput,
+} from '../lib/authValidation.ts';
 import type { ThemeMode } from '../types/agent.ts';
 import { NemofyLogo } from './NemofyLogo.tsx';
 
 interface LoginGateProps {
   theme: ThemeMode;
+  needsSetup?: boolean;
   onToggleTheme: () => void;
   onAuthenticated: (username: string) => void;
 }
 
-export function LoginGate({ theme, onToggleTheme, onAuthenticated }: LoginGateProps) {
-  const [username, setUsername] = useState('');
+export function LoginGate({
+  theme,
+  needsSetup = false,
+  onToggleTheme,
+  onAuthenticated,
+}: LoginGateProps) {
+  const [username, setUsername] = useState(needsSetup ? DEFAULT_ADMIN_USERNAME : '');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -21,6 +32,29 @@ export function LoginGate({ theme, onToggleTheme, onAuthenticated }: LoginGatePr
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
+
+    if (needsSetup) {
+      const check = validateInitialSetup(username, password, confirmPassword);
+      if (!check.valid) {
+        setError(check.error || 'Please check your setup details.');
+        return;
+      }
+      setSubmitting(true);
+      try {
+        const result = await setupAdminPassword(username, password);
+        if (!result.ok) {
+          setError(result.error || 'Unable to complete administrator setup.');
+          return;
+        }
+        onAuthenticated(result.username || username.trim() || DEFAULT_ADMIN_USERNAME);
+      } catch {
+        setError('Unable to complete setup right now. Please try again.');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
     const check = validateLoginInput(username, password);
     if (!check.valid) {
       setError(check.error || 'Please check your credentials.');
@@ -69,14 +103,16 @@ export function LoginGate({ theme, onToggleTheme, onAuthenticated }: LoginGatePr
         <div className="w-full max-w-[420px]">
           <div className="mb-8">
             <div className="inline-flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-[var(--signal)] mb-3">
-              <Lock className="w-3.5 h-3.5" />
-              <span>Protected Workspace</span>
+              {needsSetup ? <ShieldCheck className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+              <span>{needsSetup ? 'First-Run Admin Setup' : 'Protected Workspace'}</span>
             </div>
             <h1 className="font-display text-3xl font-semibold tracking-tight text-[var(--ink)]">
-              Sign in to Nemofy Agent
+              {needsSetup ? 'Set up administrator account' : 'Sign in to Nemofy Agent'}
             </h1>
             <p className="mt-2 text-sm text-[var(--ink-soft)] leading-relaxed">
-              Enter your administrator credentials to access autonomous chat, workspace files, and model configuration.
+              {needsSetup
+                ? 'Choose your initial administrator password (at least 8 characters) to secure this workspace before signing in.'
+                : 'Enter your administrator credentials to access autonomous chat, workspace files, and model configuration.'}
             </p>
           </div>
 
@@ -118,11 +154,11 @@ export function LoginGate({ theme, onToggleTheme, onAuthenticated }: LoginGatePr
                   id="login-password"
                   name="password"
                   type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
+                  autoComplete={needsSetup ? 'new-password' : 'current-password'}
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password"
+                  placeholder={needsSetup ? 'Create a strong password (min 8 chars)' : 'Enter password'}
                   className="w-full h-11 pl-3.5 pr-11 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)] focus:ring-2 focus:ring-[var(--signal)]/20 transition-colors"
                 />
                 <button
@@ -135,6 +171,28 @@ export function LoginGate({ theme, onToggleTheme, onAuthenticated }: LoginGatePr
                 </button>
               </div>
             </div>
+
+            {needsSetup && (
+              <div>
+                <label
+                  htmlFor="login-confirm-password"
+                  className="block text-sm font-medium text-[var(--ink)] mb-1.5"
+                >
+                  Confirm Password
+                </label>
+                <input
+                  id="login-confirm-password"
+                  name="confirmPassword"
+                  type={showPassword ? 'text' : 'password'}
+                  autoComplete="new-password"
+                  required
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="Re-enter your password"
+                  className="w-full h-11 px-3.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)] focus:ring-2 focus:ring-[var(--signal)]/20 transition-colors"
+                />
+              </div>
+            )}
 
             {error && (
               <div
@@ -150,7 +208,15 @@ export function LoginGate({ theme, onToggleTheme, onAuthenticated }: LoginGatePr
               disabled={submitting}
               className="w-full h-11 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-60 text-white text-sm font-semibold transition-colors cursor-pointer"
             >
-              <span>{submitting ? 'Verifying...' : 'Sign in'}</span>
+              <span>
+                {submitting
+                  ? needsSetup
+                    ? 'Creating account...'
+                    : 'Verifying...'
+                  : needsSetup
+                    ? 'Create administrator account'
+                    : 'Sign in'}
+              </span>
               {!submitting && <ArrowRight className="w-4 h-4" />}
             </button>
           </form>

@@ -1,0 +1,307 @@
+{
+  "generatedAt": "2026-11-21T14:48:41.163Z",
+  "target": "/app/applet",
+  "totalFiles": 72,
+  "scannableFiles": 49,
+  "strategy": "large-codebase",
+  "modeFile": "modes/large-codebase.md",
+  "needsLoop": true,
+  "fileBudget": 9,
+  "avgLines": 538,
+  "avgTokensPerFile": 4504,
+  "estimatedTotalLines": 26362,
+  "estimatedSourceTokens": 220683,
+  "sampledFiles": 30,
+  "plannedChunkCount": 6,
+  "domains": [
+    {
+      "path": ".",
+      "tier": "CRITICAL",
+      "fileCount": 2,
+      "riskBreakdown": {
+        "critical": 1,
+        "high": 0,
+        "medium": 1,
+        "low": 0,
+        "context-only": 0
+      }
+    },
+    {
+      "path": "server",
+      "tier": "CRITICAL",
+      "fileCount": 9,
+      "riskBreakdown": {
+        "critical": 5,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "context-only": 4
+      }
+    },
+    {
+      "path": "Nemofy Agent",
+      "tier": "HIGH",
+      "fileCount": 31,
+      "riskBreakdown": {
+        "critical": 2,
+        "high": 2,
+        "medium": 19,
+        "low": 0,
+        "context-only": 8
+      }
+    },
+    {
+      "path": "Agent-Core",
+      "tier": "HIGH",
+      "fileCount": 27,
+      "riskBreakdown": {
+        "critical": 0,
+        "high": 3,
+        "medium": 13,
+        "low": 0,
+        "context-only": 11
+      }
+    },
+    {
+      "path": "src",
+      "tier": "MEDIUM",
+      "fileCount": 1,
+      "riskBreakdown": {
+        "critical": 0,
+        "high": 0,
+        "medium": 1,
+        "low": 0,
+        "context-only": 0
+      }
+    },
+    {
+      "path": "MCPs",
+      "tier": "MEDIUM",
+      "fileCount": 2,
+      "riskBreakdown": {
+        "critical": 0,
+        "high": 0,
+        "medium": 2,
+        "low": 0,
+        "context-only": 0
+      }
+    }
+  ],
+  "domainSummaries": [
+    "./ (2 files, CRITICAL)",
+    "server/ (9 files, CRITICAL)",
+    "Nemofy Agent/ (31 files, HIGH)",
+    "Agent-Core/ (27 files, HIGH)",
+    "src/ (1 files, MEDIUM)",
+    "MCPs/ (2 files, MEDIUM)"
+  ],
+  "scanOrder": [
+    "Nemofy Agent/src/components/LoginGate.tsx",
+    "Nemofy Agent/src/lib/authValidation.ts",
+    "server.ts",
+    "server/agentProcessManager.ts",
+    "server/authStore.ts",
+    "server/configStore.ts",
+    "server/profileVault.ts",
+    "server/providerCatalog.ts",
+    "Agent-Core/agent_core/api.py",
+    "Agent-Core/agent_core/models.py",
+    "Agent-Core/agent_core/state.py",
+    "Nemofy Agent/src/components/ModelSelectorCombobox.tsx",
+    "Nemofy Agent/src/lib/apiClient.ts",
+    "Agent-Core/agent_core/__init__.py",
+    "Agent-Core/agent_core/context_manager.py",
+    "Agent-Core/agent_core/graph.py",
+    "Agent-Core/agent_core/guardrails.py",
+    "Agent-Core/agent_core/jobs.py",
+    "Agent-Core/agent_core/multimodal.py",
+    "Agent-Core/agent_core/planner.py",
+    "Agent-Core/agent_core/sandbox.py",
+    "Agent-Core/agent_core/skills.py",
+    "Agent-Core/agent_core/subagents.py",
+    "Agent-Core/agent_core/tools/__init__.py",
+    "Agent-Core/agent_core/tools/local.py",
+    "Agent-Core/main.py",
+    "MCPs/__init__.py",
+    "MCPs/manager.py",
+    "Nemofy Agent/src/App.tsx",
+    "Nemofy Agent/src/components/AgentActivityPanel.tsx",
+    "Nemofy Agent/src/components/ChatView.tsx",
+    "Nemofy Agent/src/components/ContextUsageRing.tsx",
+    "Nemofy Agent/src/components/FilesystemView.tsx",
+    "Nemofy Agent/src/components/MarkdownMessage.tsx",
+    "Nemofy Agent/src/components/NemofyLogo.tsx",
+    "Nemofy Agent/src/components/SettingsView.tsx",
+    "Nemofy Agent/src/components/Sidebar.tsx",
+    "Nemofy Agent/src/lib/activityUtils.ts",
+    "Nemofy Agent/src/lib/contextUtils.ts",
+    "Nemofy Agent/src/lib/filesystemUtils.ts",
+    "Nemofy Agent/src/lib/llmPresets.ts",
+    "Nemofy Agent/src/lib/markdownRenderer.ts",
+    "Nemofy Agent/src/lib/scrollUtils.ts",
+    "Nemofy Agent/src/lib/thinkingModes.ts",
+    "Nemofy Agent/src/main.tsx",
+    "Nemofy Agent/src/types/agent.ts",
+    "Nemofy Agent/vite.config.ts",
+    "src/main.tsx",
+    "vite.config.ts"
+  ],
+  "coverageComplete": true,
+  "coverageLimitations": [],
+  "tokenEstimate": {
+    "recon": 1440,
+    "perHunterChunk": 47804,
+    "totalPipeline": 231923
+  },
+  "recommendations": [
+    "Large codebase — use domain-scoped auditing. Process one domain at a time.",
+    "2 CRITICAL domains to audit first.",
+    "Large files (avg 538 lines) — FILE_BUDGET is 9. Chunking is important."
+  ],
+  "riskMap": {
+    "critical": [
+      "Nemofy Agent/src/components/LoginGate.tsx",
+      "Nemofy Agent/src/lib/authValidation.ts",
+      "server.ts",
+      "server/agentProcessManager.ts",
+      "server/authStore.ts",
+      "server/configStore.ts",
+      "server/profileVault.ts",
+      "server/providerCatalog.ts"
+    ],
+    "high": [
+      "Agent-Core/agent_core/api.py",
+      "Agent-Core/agent_core/models.py",
+      "Agent-Core/agent_core/state.py",
+      "Nemofy Agent/src/components/ModelSelectorCombobox.tsx",
+      "Nemofy Agent/src/lib/apiClient.ts"
+    ],
+    "medium": [
+      "Agent-Core/agent_core/__init__.py",
+      "Agent-Core/agent_core/context_manager.py",
+      "Agent-Core/agent_core/graph.py",
+      "Agent-Core/agent_core/guardrails.py",
+      "Agent-Core/agent_core/jobs.py",
+      "Agent-Core/agent_core/multimodal.py",
+      "Agent-Core/agent_core/planner.py",
+      "Agent-Core/agent_core/sandbox.py",
+      "Agent-Core/agent_core/skills.py",
+      "Agent-Core/agent_core/subagents.py",
+      "Agent-Core/agent_core/tools/__init__.py",
+      "Agent-Core/agent_core/tools/local.py",
+      "Agent-Core/main.py",
+      "MCPs/__init__.py",
+      "MCPs/manager.py",
+      "Nemofy Agent/src/App.tsx",
+      "Nemofy Agent/src/components/AgentActivityPanel.tsx",
+      "Nemofy Agent/src/components/ChatView.tsx",
+      "Nemofy Agent/src/components/ContextUsageRing.tsx",
+      "Nemofy Agent/src/components/FilesystemView.tsx",
+      "Nemofy Agent/src/components/MarkdownMessage.tsx",
+      "Nemofy Agent/src/components/NemofyLogo.tsx",
+      "Nemofy Agent/src/components/SettingsView.tsx",
+      "Nemofy Agent/src/components/Sidebar.tsx",
+      "Nemofy Agent/src/lib/activityUtils.ts",
+      "Nemofy Agent/src/lib/contextUtils.ts",
+      "Nemofy Agent/src/lib/filesystemUtils.ts",
+      "Nemofy Agent/src/lib/llmPresets.ts",
+      "Nemofy Agent/src/lib/markdownRenderer.ts",
+      "Nemofy Agent/src/lib/scrollUtils.ts",
+      "Nemofy Agent/src/lib/thinkingModes.ts",
+      "Nemofy Agent/src/main.tsx",
+      "Nemofy Agent/src/types/agent.ts",
+      "Nemofy Agent/vite.config.ts",
+      "src/main.tsx",
+      "vite.config.ts"
+    ],
+    "low": [],
+    "context-only": [
+      "Agent-Core/tests/conftest.py",
+      "Agent-Core/tests/self_test.py",
+      "Agent-Core/tests/test_api_and_cli.py",
+      "Agent-Core/tests/test_context_management.py",
+      "Agent-Core/tests/test_graph_and_memory.py",
+      "Agent-Core/tests/test_hitl_guardrails.py",
+      "Agent-Core/tests/test_models.py",
+      "Agent-Core/tests/test_multimodal_and_search.py",
+      "Agent-Core/tests/test_resilience_concurrency.py",
+      "Agent-Core/tests/test_sandbox_security.py",
+      "Agent-Core/tests/test_skills_and_subagents.py",
+      "Nemofy Agent/src/lib/activityUtils.test.ts",
+      "Nemofy Agent/src/lib/authValidation.test.ts",
+      "Nemofy Agent/src/lib/contextUtils.test.ts",
+      "Nemofy Agent/src/lib/filesystemUtils.test.ts",
+      "Nemofy Agent/src/lib/llmPresets.test.ts",
+      "Nemofy Agent/src/lib/markdownRenderer.test.ts",
+      "Nemofy Agent/src/lib/scrollUtils.test.ts",
+      "Nemofy Agent/src/lib/thinkingModes.test.ts",
+      "server/authStore.test.ts",
+      "server/configStore.test.ts",
+      "server/profileVault.test.ts",
+      "server/providerCatalog.test.ts"
+    ]
+  },
+  "domainFileLists": {
+    ".": [
+      "server.ts",
+      "vite.config.ts"
+    ],
+    "server": [
+      "server/agentProcessManager.ts",
+      "server/authStore.ts",
+      "server/configStore.ts",
+      "server/profileVault.ts",
+      "server/providerCatalog.ts"
+    ],
+    "Nemofy Agent": [
+      "Nemofy Agent/vite.config.ts",
+      "Nemofy Agent/src/App.tsx",
+      "Nemofy Agent/src/main.tsx",
+      "Nemofy Agent/src/types/agent.ts",
+      "Nemofy Agent/src/lib/activityUtils.ts",
+      "Nemofy Agent/src/lib/apiClient.ts",
+      "Nemofy Agent/src/lib/authValidation.ts",
+      "Nemofy Agent/src/lib/contextUtils.ts",
+      "Nemofy Agent/src/lib/filesystemUtils.ts",
+      "Nemofy Agent/src/lib/llmPresets.ts",
+      "Nemofy Agent/src/lib/markdownRenderer.ts",
+      "Nemofy Agent/src/lib/scrollUtils.ts",
+      "Nemofy Agent/src/lib/thinkingModes.ts",
+      "Nemofy Agent/src/components/AgentActivityPanel.tsx",
+      "Nemofy Agent/src/components/ChatView.tsx",
+      "Nemofy Agent/src/components/ContextUsageRing.tsx",
+      "Nemofy Agent/src/components/FilesystemView.tsx",
+      "Nemofy Agent/src/components/LoginGate.tsx",
+      "Nemofy Agent/src/components/MarkdownMessage.tsx",
+      "Nemofy Agent/src/components/ModelSelectorCombobox.tsx",
+      "Nemofy Agent/src/components/NemofyLogo.tsx",
+      "Nemofy Agent/src/components/SettingsView.tsx",
+      "Nemofy Agent/src/components/Sidebar.tsx"
+    ],
+    "Agent-Core": [
+      "Agent-Core/main.py",
+      "Agent-Core/agent_core/__init__.py",
+      "Agent-Core/agent_core/api.py",
+      "Agent-Core/agent_core/context_manager.py",
+      "Agent-Core/agent_core/graph.py",
+      "Agent-Core/agent_core/guardrails.py",
+      "Agent-Core/agent_core/jobs.py",
+      "Agent-Core/agent_core/models.py",
+      "Agent-Core/agent_core/multimodal.py",
+      "Agent-Core/agent_core/planner.py",
+      "Agent-Core/agent_core/sandbox.py",
+      "Agent-Core/agent_core/skills.py",
+      "Agent-Core/agent_core/state.py",
+      "Agent-Core/agent_core/subagents.py",
+      "Agent-Core/agent_core/tools/__init__.py",
+      "Agent-Core/agent_core/tools/local.py"
+    ],
+    "src": [
+      "src/main.tsx"
+    ],
+    "MCPs": [
+      "MCPs/__init__.py",
+      "MCPs/manager.py"
+    ]
+  }
+}

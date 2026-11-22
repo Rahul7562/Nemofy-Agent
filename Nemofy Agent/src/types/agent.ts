@@ -16,6 +16,7 @@ export interface ChatAttachment {
 
 export interface AuthSession {
   authenticated: boolean;
+  needsSetup?: boolean;
   username?: string;
   updatedAt?: string;
   mode?: 'server' | 'standalone';
@@ -109,6 +110,14 @@ export interface ContextUsageSnapshot {
   calibrated_from_provider: boolean;
 }
 
+export interface ActiveTaskItem {
+  id: string;
+  kind: string;
+  label: string;
+  elapsed_seconds: number;
+  expected_seconds?: number;
+}
+
 export interface LiveAgentActivity {
   jobId: string;
   status: string;
@@ -121,6 +130,7 @@ export interface LiveAgentActivity {
   toolEvents: ToolEventItem[];
   fileChanges: FileChangeItem[];
   contextUsage?: ContextUsageSnapshot | null;
+  activeTasks?: ActiveTaskItem[];
 }
 
 export interface ChatMessage {

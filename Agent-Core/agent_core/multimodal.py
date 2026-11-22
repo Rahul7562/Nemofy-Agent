@@ -447,7 +447,12 @@ async def run_accessory_media_subagent(
             SystemMessage(content=_MODALITY_SYSTEM_PROMPTS[modality]),
             HumanMessage(content=blocks),
         ]
-        reply = await model.ainvoke(messages)
+        from agent_core.models import invoke_with_rate_limit_retry
+
+        reply = await invoke_with_rate_limit_retry(
+            lambda: model.ainvoke(messages),
+            label=f"{modality} accessory ({model_label})",
+        )
         report_text = _extract_plain_text(getattr(reply, "content", ""))
         if not report_text:
             report_text = (

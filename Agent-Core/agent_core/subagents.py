@@ -2,24 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
 from agent_core.guardrails import execute_tool_with_guardrails, normalize_tool_arguments
-from agent_core.jobs import emit_progress
+from agent_core.jobs import emit_progress, track_active_task
+from agent_core.models import invoke_with_rate_limit_retry
 from agent_core.state import compact_tool_output
+from agent_core.tools.local import current_session_id
 
-import re
-
+_WORKER_CHECKPOINTER = MemorySaver()
 _WORKER_THINK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.IGNORECASE)
 _WORKER_UNCLOSED_THINK_RE = re.compile(r"<think>[\s\S]*$", flags=re.IGNORECASE)
 
@@ -246,8 +251,12 @@ async def run_isolated_subagent(
         *,
         bind_permitted_tools: bool = True,
     ) -> AIMessage:
+        worker_label = f"sub-agent ({normalized_role})"
         try:
-            res = await model_to_call.ainvoke(prompt_msgs)
+            res = await invoke_with_rate_limit_retry(
+                lambda: model_to_call.ainvoke(prompt_msgs),
+                label=worker_label,
+            )
         except GraphInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -266,7 +275,10 @@ async def run_isolated_subagent(
                     if bind_permitted_tools and permitted_tools and hasattr(fb, "bind_tools")
                     else fb
                 )
-                res = await fb_bound.ainvoke(prompt_msgs)
+                res = await invoke_with_rate_limit_retry(
+                    lambda: fb_bound.ainvoke(prompt_msgs),
+                    label=worker_label,
+                )
             else:
                 raise
         return res if isinstance(res, AIMessage) else AIMessage(content=str(getattr(res, "content", "") or ""))
@@ -393,62 +405,90 @@ async def run_isolated_subagent(
             "final_output": content_text,
         }
 
+    def _find_pending_worker_calls(
+        msgs: list[BaseMessage],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        last_ai_idx = -1
+        for i in range(len(msgs) - 1, -1, -1):
+            if isinstance(msgs[i], AIMessage):
+                last_ai_idx = i
+                break
+        if last_ai_idx < 0:
+            return []
+        raw_tcs = list(getattr(msgs[last_ai_idx], "tool_calls", None) or [])
+        if not raw_tcs:
+            return []
+        answered = {
+            str(getattr(m, "tool_call_id", ""))
+            for m in msgs[last_ai_idx + 1 :]
+            if isinstance(m, ToolMessage)
+        }
+        return [
+            (idx, tc)
+            for idx, tc in enumerate(raw_tcs)
+            if str(tc.get("id") or f"worker-tc-{idx}") not in answered
+        ]
+
     async def worker_act(state: WorkerState) -> dict[str, Any]:
-        last_msg = state["messages"][-1]
-        tool_calls = getattr(last_msg, "tool_calls", None) or []
+        pending = _find_pending_worker_calls(list(state["messages"]))
+        if not pending:
+            return {"tools_used": list(state["tools_used"])}
+
         tool_messages: list[ToolMessage] = []
         used = list(state["tools_used"])
 
-        for tc in tool_calls:
-            tc_name = str(tc.get("name", "")).strip()
-            tc_args = normalize_tool_arguments(tc_name, tc.get("args"))
-            tc_id = str(tc.get("id", f"worker-tc-{len(tool_messages)}"))
+        # Execute one pending tool call per checkpointed step so HITL resume never replays
+        # already-completed worker tools.
+        idx, tc = pending[0]
+        tc_name = str(tc.get("name", "")).strip()
+        tc_args = normalize_tool_arguments(tc_name, tc.get("args"))
+        tc_id = str(tc.get("id") or f"worker-tc-{idx}")
 
-            if tc_name not in permitted_tools:
-                tool_messages.append(
-                    ToolMessage(
-                        content=(
-                            f"PERMISSION DENIED: Sub-agent '{normalized_role}' is not authorized "
-                            f"to call tool '{tc_name}'. Assigned tools: "
-                            f"{sorted(permitted_tools.keys())}"
-                        ),
-                        tool_call_id=tc_id,
-                        name=tc_name,
-                    )
+        if tc_name not in permitted_tools:
+            tool_messages.append(
+                ToolMessage(
+                    content=(
+                        f"PERMISSION DENIED: Sub-agent '{normalized_role}' is not authorized "
+                        f"to call tool '{tc_name}'. Assigned tools: "
+                        f"{sorted(permitted_tools.keys())}"
+                    ),
+                    tool_call_id=tc_id,
+                    name=tc_name,
                 )
-                continue
+            )
+            return {"messages": tool_messages, "tools_used": used}
 
-            tool_obj = permitted_tools[tc_name]
-            emit_progress(
-                "subagent_tool_start",
-                tool=tc_name,
-                detail=f"Sub-agent '{normalized_role}' running tool '{tc_name}'",
+        tool_obj = permitted_tools[tc_name]
+        emit_progress(
+            "subagent_tool_start",
+            tool=tc_name,
+            detail=f"Sub-agent '{normalized_role}' running tool '{tc_name}'",
+        )
+        try:
+            raw_result, _audit = await execute_tool_with_guardrails(
+                tool_obj,
+                tc_args,
+                is_mcp_tool=(tc_name in mcp_names),
+                source=f"subagent:{normalized_role}",
             )
-            try:
-                raw_result, _audit = await execute_tool_with_guardrails(
-                    tool_obj,
-                    tc_args,
-                    is_mcp_tool=(tc_name in mcp_names),
-                    source=f"subagent:{normalized_role}",
-                )
-            except GraphInterrupt:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raw_result = f"ERROR: Tool '{tc_name}' raised {type(exc).__name__}: {exc}"
+        except GraphInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raw_result = f"ERROR: Tool '{tc_name}' raised {type(exc).__name__}: {exc}"
 
-            emit_progress(
-                "subagent_tool_done",
-                tool=tc_name,
-                detail=f"Sub-agent '{normalized_role}' finished tool '{tc_name}'",
-            )
-            compacted, _saved = compact_tool_output(
-                f"subagent_{normalized_role}_{tc_name}",
-                raw_result,
-                workspace_dir=workspace_dir,
-            )
-            if tc_name not in used:
-                used.append(tc_name)
-            tool_messages.append(ToolMessage(content=compacted, tool_call_id=tc_id, name=tc_name))
+        emit_progress(
+            "subagent_tool_done",
+            tool=tc_name,
+            detail=f"Sub-agent '{normalized_role}' finished tool '{tc_name}'",
+        )
+        compacted, _saved = compact_tool_output(
+            f"subagent_{normalized_role}_{tc_name}",
+            raw_result,
+            workspace_dir=workspace_dir,
+        )
+        if tc_name not in used:
+            used.append(tc_name)
+        tool_messages.append(ToolMessage(content=compacted, tool_call_id=tc_id, name=tc_name))
 
         return {"messages": tool_messages, "tools_used": used}
 
@@ -460,6 +500,11 @@ async def run_isolated_subagent(
             return "worker_act"
         return "__end__"
 
+    def route_after_worker_act(state: WorkerState) -> Literal["worker_act", "worker_reason"]:
+        if _find_pending_worker_calls(list(state["messages"])):
+            return "worker_act"
+        return "worker_reason"
+
     builder: StateGraph[WorkerState] = StateGraph(WorkerState)
     builder.add_node("worker_reason", worker_reason)
     builder.add_node("worker_act", worker_act)
@@ -469,8 +514,12 @@ async def run_isolated_subagent(
         route_worker,
         {"worker_act": "worker_act", "__end__": END},
     )
-    builder.add_edge("worker_act", "worker_reason")
-    worker_graph = builder.compile()
+    builder.add_conditional_edges(
+        "worker_act",
+        route_after_worker_act,
+        {"worker_act": "worker_act", "worker_reason": "worker_reason"},
+    )
+    worker_graph = builder.compile(checkpointer=_WORKER_CHECKPOINTER)
 
     sys_prompt = (
         f"You are an isolated specialist sub-agent (role='{normalized_role}') executing a "
@@ -494,8 +543,68 @@ async def run_isolated_subagent(
         "final_output": "",
     }
 
+    parent_session = current_session_id.get()
+    key_material = json.dumps(
+        {
+            "session": parent_session,
+            "role": normalized_role,
+            "task": task.strip(),
+            "context": context.strip(),
+            "tools": sorted(permitted_tools.keys()),
+        },
+        sort_keys=True,
+    )
+    sub_thread_id = f"sub-{hashlib.sha256(key_material.encode('utf-8')).hexdigest()[:24]}"
+    worker_config: dict[str, Any] = {"configurable": {"thread_id": sub_thread_id}}
+
+    def _extract_pending_interrupt_value(snapshot: Any) -> tuple[bool, Any]:
+        for task_info in getattr(snapshot, "tasks", ()) or ():
+            interrupts = getattr(task_info, "interrupts", ()) or ()
+            if interrupts:
+                return True, getattr(interrupts[0], "value", interrupts[0])
+        return False, None
+
+    def _clear_worker_checkpoint() -> None:
+        try:
+            delete_fn = getattr(_WORKER_CHECKPOINTER, "delete_thread", None)
+            if callable(delete_fn):
+                delete_fn(sub_thread_id)
+            else:
+                storage = getattr(_WORKER_CHECKPOINTER, "storage", None)
+                if isinstance(storage, dict):
+                    storage.pop(sub_thread_id, None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    subagent_label = f"Sub-agent ({normalized_role})"
     try:
-        final_state = await worker_graph.ainvoke(initial_worker_state)
+        state_snap = await worker_graph.aget_state(worker_config)
+        has_pending, pending_payload = _extract_pending_interrupt_value(state_snap)
+        if has_pending:
+            # Parent graph is resuming after HITL approval: retrieve decision and resume
+            # worker_graph from its saved checkpoint instead of restarting at turn 0.
+            decision = interrupt(pending_payload)
+            with track_active_task("subagent", subagent_label, task_id=sub_thread_id):
+                final_state = await worker_graph.ainvoke(
+                    Command(resume=decision), config=worker_config
+                )
+        else:
+            with track_active_task("subagent", subagent_label, task_id=sub_thread_id):
+                final_state = await worker_graph.ainvoke(
+                    initial_worker_state, config=worker_config
+                )
+
+        while isinstance(final_state, dict) and final_state.get("__interrupt__"):
+            intr_list = final_state["__interrupt__"]
+            first_intr = intr_list[0] if isinstance(intr_list, (list, tuple)) and intr_list else intr_list
+            payload = getattr(first_intr, "value", first_intr)
+            decision = interrupt(payload)
+            with track_active_task("subagent", subagent_label, task_id=sub_thread_id):
+                final_state = await worker_graph.ainvoke(
+                    Command(resume=decision), config=worker_config
+                )
+
+        _clear_worker_checkpoint()
         return _parse_worker_report(
             role=normalized_role,
             task=task,
@@ -507,6 +616,7 @@ async def run_isolated_subagent(
     except GraphInterrupt:
         raise
     except Exception as exc:  # noqa: BLE001
+        _clear_worker_checkpoint()
         logger.warning("Isolated sub-agent '%s' failed: %s", normalized_role, exc)
         return _parse_worker_report(
             role=normalized_role,

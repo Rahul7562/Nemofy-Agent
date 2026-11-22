@@ -186,6 +186,7 @@ class AgentResumeRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
     primary_model: ModelConfigOverride | None = None
     worker_model: ModelConfigOverride | None = None
+    accessory_models: AccessoriesConfigPayload | None = None
     dynamic_skills: list[DynamicSkillSpec] | None = None
     mcp_servers: list[MCPServerConfig] | None = None
     stall_timeout_seconds: float | None = Field(default=None, ge=0.2, le=3600.0)
@@ -315,15 +316,19 @@ def create_app(
 
     cors_origins = [
         origin.strip()
-        for origin in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
+        for origin in os.getenv(
+            "CORS_ALLOW_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+        ).split(",")
         if origin.strip()
     ]
+    resolved_origins = cors_origins or ["http://localhost:3000", "http://127.0.0.1:3000"]
+    allow_creds = "*" not in resolved_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins or ["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=resolved_origins,
+        allow_credentials=allow_creds,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
     def require_auth(
@@ -399,6 +404,13 @@ def create_app(
         job_mgr: JobManager = request.app.state.job_manager
         db_path: Path = request.app.state.checkpoint_db_path
 
+        sandbox_health = dict(sandbox_mgr.health_status())
+        sandbox_health.pop("workspace_dir", None)
+        skills_health = dict(get_skills_health(skills_reg))
+        skills_health.pop("directory", None)
+        mcp_health = dict(mcp_mgr.health_status())
+        mcp_health.pop("config_path", None)
+
         overall = "ok" if runtime is not None else "degraded"
         return {
             "status": overall,
@@ -410,12 +422,11 @@ def create_app(
                 "worker": worker_summary,
             },
             "checkpoint": {
-                "path": str(db_path),
                 "exists": await asyncio.to_thread(db_path.exists),
             },
-            "sandbox": sandbox_mgr.health_status(),
-            "skills": get_skills_health(skills_reg),
-            "mcps": mcp_mgr.health_status(),
+            "sandbox": sandbox_health,
+            "skills": skills_health,
+            "mcps": mcp_health,
             "jobs": job_mgr.health_summary(),
         }
 
@@ -684,6 +695,12 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Agent runtime is not initialized.",
             )
+        current = await runtime.inspect_thread(payload.thread_id)
+        if current["status"] != "awaiting_approval":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Thread '{payload.thread_id}' is not waiting for human approval.",
+            )
         job_mgr: JobManager = request.app.state.job_manager
         job = job_mgr.create_job(
             thread_id=payload.thread_id,
@@ -822,6 +839,13 @@ def create_app(
             )
         except (ValueError, ModelConfigurationError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except (
+            ModelAuthenticationError,
+            ModelRateLimitError,
+            ModelConnectionError,
+            ModelProviderError,
+        ) as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error during /agent/resume for thread=%s", payload.thread_id)
             raise HTTPException(

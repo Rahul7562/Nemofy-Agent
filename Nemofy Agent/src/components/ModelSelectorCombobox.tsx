@@ -8,6 +8,7 @@ import {
   getProviderPreset,
   mergeProviderModels,
 } from '../lib/llmPresets.ts';
+import { resolveModelLimits } from '../lib/contextUtils.ts';
 import type { ModelRoleKey, ProviderModelOption } from '../types/agent.ts';
 
 interface ModelSelectorComboboxProps {
@@ -19,6 +20,7 @@ interface ModelSelectorComboboxProps {
   value: string;
   onChange: (nextModel: string) => void;
   onSelectOption?: (option: ProviderModelOption) => void;
+  onCatalogLoaded?: (models: ProviderModelOption[]) => void;
 }
 
 const MAX_VISIBLE_OPTIONS = 120;
@@ -32,6 +34,7 @@ export function ModelSelectorCombobox({
   value,
   onChange,
   onSelectOption,
+  onCatalogLoaded,
 }: ModelSelectorComboboxProps) {
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -48,6 +51,8 @@ export function ModelSelectorCombobox({
   const lastFetchedKeyRef = useRef<string>('');
   const lastFetchedLiveRef = useRef<boolean>(false);
   const wasOpenRef = useRef<boolean>(false);
+  const onCatalogLoadedRef = useRef(onCatalogLoaded);
+  onCatalogLoadedRef.current = onCatalogLoaded;
 
   const preset = getProviderPreset(provider);
   const providerLabel = preset?.label || provider;
@@ -79,6 +84,7 @@ export function ModelSelectorCombobox({
           setLiveModels(res.models);
           setSource(res.source === 'preset' ? 'preset' : 'live');
           setFetchError(null);
+          onCatalogLoadedRef.current?.(res.models);
         } else {
           lastFetchedLiveRef.current = false;
           setLiveModels([]);
@@ -154,9 +160,10 @@ export function ModelSelectorCombobox({
   }, [searchQuery, provider, open]);
 
   function selectModel(modelId: string, option?: ProviderModelOption) {
-    onChange(modelId);
-    if (option) {
-      onSelectOption?.(option);
+    if (option && onSelectOption) {
+      onSelectOption(option);
+    } else {
+      onChange(modelId);
     }
     setOpen(false);
     setSearchQuery('');
@@ -353,8 +360,22 @@ export function ModelSelectorCombobox({
               visibleOptions.map((item, idx) => {
                 const isSelected = item.id === value;
                 const isHighlighted = hasNavigatedList && idx === highlightIndex;
-                const ctxLabel = formatContextLength(item.context_length);
-                const outLabel = formatOutputLength(item.max_output_tokens);
+                const fallbackLimits =
+                  !item.context_length || !item.max_output_tokens
+                    ? resolveModelLimits(provider, item.id, item.context_length, item.max_output_tokens)
+                    : null;
+                const displayCtx =
+                  item.context_length ||
+                  (fallbackLimits?.contextWindowSource === 'model_registry'
+                    ? fallbackLimits.contextWindow
+                    : null);
+                const displayOut =
+                  item.max_output_tokens ||
+                  (fallbackLimits?.maxOutputTokensSource === 'model_registry'
+                    ? fallbackLimits.maxOutputTokens
+                    : null);
+                const ctxLabel = formatContextLength(displayCtx);
+                const outLabel = formatOutputLength(displayOut);
 
                 return (
                   <button

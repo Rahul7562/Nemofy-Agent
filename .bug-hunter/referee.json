@@ -1,0 +1,202 @@
+[
+  {
+    "bugId": "BUG-1",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Critical",
+    "confidenceScore": 97,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Critical: unauthenticated exploit with material security impact (hardcoded default admin credential). Reachability: EXTERNAL. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H (9.8). server/authStore.ts:21-22 seeds a hardcoded fallback password when NEMOFY_ADMIN_PASSWORD is unset (and .env.example omits the variable), while Nemofy Agent/src/lib/authValidation.ts:3-4 embeds the standalone digest for the same credential. Expected: fail closed on startup or require explicit first-boot admin password provisioning; actual: fresh deployments accept the hardcoded default admin login and grant full access to workspace files, vault operations, and Agent-Core.",
+    "suggestedFix": "Remove the hardcoded fallback password in server/authStore.ts:22 and the embedded digest in Nemofy Agent/src/lib/authValidation.ts:3-4. Require NEMOFY_ADMIN_PASSWORD (documented in .env.example) or generate a one-time high-entropy bootstrap password on first run with mandatory rotation."
+  },
+  {
+    "bugId": "BUG-2",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 93,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: unauthenticated cross-request availability disruption of active agent runs via global secret clearing. Reachability: EXTERNAL. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:H (8.2). server.ts:264-268 mounts POST /api/auth/logout without requireSession or isSameOriginMutation and triggers DELETE /config/secrets (Agent-Core/agent_core/api.py:455-460), popping all provider API keys from Agent-Core's os.environ. Although new runs re-sync secrets (server.ts:510, 725), unauthenticated or repeated requests wipe keys mid-execution and cause active agent tasks to fail. Expected: require an authenticated same-origin session before clearing backend secrets; actual: any unauthenticated caller can wipe live Agent-Core provider keys.",
+    "suggestedFix": "Verify a valid session (and same-origin check via isSameOriginMutation) before invoking DELETE /config/secrets on Agent-Core in server.ts:264-268, while still allowing cookie clearing for already-expired clients without touching Agent-Core state."
+  },
+  {
+    "bugId": "BUG-3",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 95,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: authenticated SSRF and exfiltration of decrypted profile vault API keys. Reachability: AUTHENTICATED. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N (7.7). server.ts:1252-1300 forwards caller-supplied base_url and decrypted profileSecrets into server/providerCatalog.ts:288-311 and 391-450, which check only /^https?:\\/\\//i and attach decrypted vault API keys in Authorization/x-api-key headers to arbitrary outbound hosts without private/metadata IP restrictions. Expected: send stored vault keys only to canonical provider hosts and block private/loopback/link-local/metadata destinations unless explicitly allowlisted for local providers; actual: arbitrary base_url requests leak plaintext vault secrets and probe internal endpoints.",
+    "suggestedFix": "Never attach stored vault API keys when base_url differs from the canonical provider origin (unless explicitly marked as a trusted custom endpoint). Validate target URLs via DNS resolution to block loopback, RFC1918, link-local/metadata IP ranges (except explicitly permitted local Ollama/LM Studio hosts without vault secrets), and disable automatic redirects across origins."
+  },
+  {
+    "bugId": "BUG-4",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 95,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: authenticated host filesystem boundary bypass (arbitrary file read/write via symlinks). Reachability: AUTHENTICATED. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N (9.6). server/configStore.ts:524-538 resolveWorkspacePath relies solely on lexical path.resolve without fs.realpathSync, so readWorkspaceFile (lines 710-737), writeWorkspaceFile (lines 739-749), and listWorkspaceDirectory (lines 641-708) follow symbolic links pointing outside workspace/ (such as data/auth.json or host files). Expected: resolve real paths for every path segment and reject symlinks escaping workspace/; actual: symlinks inside workspace/ expose and allow overwriting host files.",
+    "suggestedFix": "Canonicalize this.workspaceDir with fs.realpathSync and validate every existing ancestor and target path component in resolveWorkspacePath using fs.lstatSync / fs.realpathSync so any symlink resolving outside workspaceDir is rejected before read, write, or directory listing."
+  },
+  {
+    "bugId": "BUG-5",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 95,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: data loss/corruption under normal concurrent load. server.ts:462 loads threads from data/threads.json before awaiting callAgentCore('/agent/run') (line 512, up to 120s) and writes back the stale threads snapshot at lines 558 and 596 via store.saveThreads(threads); server.ts:677-774 repeats the same pattern on job-start failure. Any thread created or updated during the awaited request is silently erased.",
+    "suggestedFix": "Reload threads inside a serialized per-store update helper (or async write queue/mutex) right before mutating and atomically writing data/threads.json (write to temp file + rename), updating only the target thread by ID rather than overwriting with a pre-await snapshot."
+  },
+  {
+    "bugId": "BUG-6",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 96,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: unhandled exception on malformed input across authenticated routes and /api/auth/me. server/authStore.ts:201 calls decodeURIComponent without try/catch inside parseCookieHeader, which extractSessionToken (server.ts:96) invokes on every request to /api/auth/me and requireSession routes. Any malformed percent-encoded cookie triggers an uncaught URIError and HTTP 500.",
+    "suggestedFix": "Wrap decodeURIComponent in server/authStore.ts:201 in a try/catch block and fall back to the raw value or skip the malformed cookie entry cleanly."
+  },
+  {
+    "bugId": "BUG-7",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 94,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: insufficient session expiration (CWE-613). Reachability: AUTHENTICATED. Exploitability: MEDIUM. server/authStore.ts:121-167 issues stateless HMAC-signed tokens valid for 24 hours, and server.ts:264-268 POST /api/auth/logout clears only the browser cookie without rotating sessionSecret, bumping a server-side session generation, or recording revoked token IDs. Expected: server-side invalidation of logged-out tokens; actual: captured session tokens remain accepted for up to 24 hours after logout.",
+    "suggestedFix": "Include a unique jti (or server-side session generation counter persisted in auth.json) in SessionPayload and revoke the token or rotate the session generation on authenticated logout."
+  },
+  {
+    "bugId": "BUG-8",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 95,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: wrong state persisted on a common validation error path. server.ts:480-497 (POST /api/chat/send) and server.ts:695-712 (POST /api/chat/jobs/start) append the user message and save data/threads.json before checking whether llmCfg.primary.model is configured, returning HTTP 400 while leaving orphaned or duplicated messages stored on disk.",
+    "suggestedFix": "Validate that llmCfg.primary.model.trim() is non-empty before creating a thread or appending and persisting userMsg to data/threads.json."
+  },
+  {
+    "bugId": "BUG-9",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 90,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: overly permissive CORS policy combined with unauthenticated metadata disclosure (CWE-942). Reachability: EXTERNAL. Exploitability: MEDIUM. Agent-Core/agent_core/api.py:316-327 defaults CORS_ALLOW_ORIGINS to '*' with allow_credentials=True (and server/agentProcessManager.ts:188-201 does not restrict it), while GET /health (api.py:384-420) is unauthenticated and returns local filesystem paths (checkpoint.path, sandbox/skills/mcp metadata) and configured model info. Authenticated routes require Bearer/X-API-Key headers rather than cookies, bounding impact to unauthenticated endpoints.",
+    "suggestedFix": "Default CORS_ALLOW_ORIGINS to an explicit localhost frontend allowlist (or empty list when proxied through Express), set allow_credentials=False unless explicit trusted origins are configured, and minimize sensitive host paths exposed by unauthenticated GET /health."
+  },
+  {
+    "bugId": "BUG-10",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 97,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: common valid multi-tool agent conversations fail after compaction with invalid message histories. Agent-Core/agent_core/context_manager.py:582-597 advances candidate across ToolMessages only while candidate < n - 1, stopping at n - 1 when a turn ends with 2+ parallel ToolMessages; line 588 then inspects only messages[candidate - 1] (another ToolMessage, not the preceding AIMessage), returning n - 1 and leaving remaining = [ToolMessage] orphaned in compact_conversation_history (lines 686-691), which LLM providers reject with HTTP 400.",
+    "suggestedFix": "When candidate lands on a ToolMessage (including at n - 1), walk backward to the preceding AIMessage that initiated the tool_call batch (or return 0 if that reaches index <= 0) so an AIMessage and all of its ToolMessages always stay on the same side of the compaction split."
+  },
+  {
+    "bugId": "BUG-11",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 92,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: authenticated SSRF and server-side API key exfiltration in Agent-Core model catalog/probe handlers. Reachability: INTERNAL. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:N/A:N (6.8). Agent-Core/agent_core/api.py:518-552 exposes POST /models/list and POST /models/probe (requiring AGENT_API_TOKEN), calling list_provider_models and probe_model_connectivity in Agent-Core/agent_core/models.py:1222-1350. While resolve_model_spec_with_override (models.py:549) checks http(s):// for /models/probe, neither endpoint blocks private/loopback/metadata IPs, prevents redirect-following to internal hosts, or stops server-side env API keys from being sent to caller-supplied base_url origins. Expected: validate target origins/IPs and restrict server-side keys to canonical provider hosts; actual: arbitrary base_url requests transmit server-side API keys and follow redirects to internal endpoints.",
+    "suggestedFix": "Introduce a shared outbound URL validator that resolves DNS, rejects loopback/private/link-local/metadata IPs (except explicitly allowed local providers with no API keys), disables automatic redirects or re-validates every redirect hop, and refuses to attach server-side environment API keys when base_url does not match the canonical provider host."
+  },
+  {
+    "bugId": "BUG-12",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 94,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: duplicate execution of side-effecting or previously approved tools during normal HITL resume flow. Agent-Core/agent_core/graph.py:2110-2219 executes all tool_calls from an AIMessage inside one act_node loop without LangGraph @task wrapping or persisted per-call state. When a subsequent tool triggers interrupt() (Agent-Core/agent_core/guardrails.py:367) and re-raises GraphInterrupt (graph.py:2192), resuming replays act_node from line 2110 and re-runs all preceding tool calls.",
+    "suggestedFix": "Wrap each tool call execution in a LangGraph @task (or dispatch one tool call per graph step / record completed tool_call_id results in checkpointed state before advancing) so resuming after GraphInterrupt never replays already-completed tool calls."
+  },
+  {
+    "bugId": "BUG-13",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 92,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: bypass of human-in-the-loop safety guardrail for destructive shell operations and outbound mutations (CWE-184). Reachability: AUTHENTICATED. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:H (8.3). Agent-Core/agent_core/guardrails.py:44-79 and 132-147 classify bash_exec using only a 10-regex denylist and default all unmatched commands to SAFE. Common non-matching shell/interpreter primitives for file deletion, truncation, or outbound HTTP uploads execute without HITL approval. Expected: fail-closed or capability-scoped approval policy for mutating/networked shell execution; actual: denylist gaps permit unapproved destructive and outbound-mutating shell commands.",
+    "suggestedFix": "Replace the default-SAFE regex denylist for bash_exec with an explicit allowlist of strictly read-only inspection commands (or require HITL approval by default for bash_exec unless running inside an isolated network-disabled ephemeral container with snapshot rollback)."
+  },
+  {
+    "bugId": "BUG-14",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "High",
+    "confidenceScore": 97,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "High: SSRF filter bypass on an EXPLICIT_SAFE_TOOLS tool reachable via untrusted web/prompt input (CWE-918). Reachability: AUTHENTICATED. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N (7.7). Agent-Core/agent_core/tools/local.py:58-81 _validate_web_url skips DNS resolution (passing any hostname via except ValueError: pass), and lines 99-105 use httpx.AsyncClient(follow_redirects=True, max_redirects=5) without re-validating redirect targets; web_fetch is in EXPLICIT_SAFE_TOOLS (guardrails.py:26). Expected: resolve hostnames to IPs, block all non-global/private/loopback/link-local addresses, and validate every redirect hop; actual: DNS aliases and HTTP redirects reach internal loopback and cloud metadata endpoints without HITL approval.",
+    "suggestedFix": "Resolve target hostnames via socket.getaddrinfo, reject any address that is not globally routable (is_private, is_loopback, is_link_local, is_multicast, is_reserved, is_unspecified), disable automatic redirect following (follow_redirects=False), and manually validate each redirect Location hop before issuing the next request."
+  },
+  {
+    "bugId": "BUG-15",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Critical",
+    "confidenceScore": 96,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Critical: complete sandbox escape on the default non-Docker fallback path exposing host secrets and code (CWE-265). Reachability: AUTHENTICATED. Exploitability: EASY. CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.9). Agent-Core/agent_core/sandbox.py:44-49, 251-258, and 471-516 guard local_isolated bash_exec with only 4 static regexes while spawning bash -c directly on the host filesystem under the application OS user. Expected: strict OS-level filesystem/process isolation confining bash_exec to /workspace; actual: shell or Python file I/O reads and writes host files outside /workspace, including ../data/auth.json (sessionSecret, vaultMasterSecret), ../data/vaults/*.vault.json, and application source files.",
+    "suggestedFix": "Require Docker (or an OS-level namespace/bubblewrap/Landlock/container sandbox with only workspace/ bind-mounted) for bash_exec in production, fail closed when no real OS isolation backend is available unless an explicit insecure dev opt-in is enabled, and require HITL approval for any unisolated host shell execution."
+  },
+  {
+    "bugId": "BUG-16",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 90,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: unvalidated outbound MCP server URLs enabling authenticated SSRF (CWE-918). Reachability: AUTHENTICATED. Exploitability: EASY. MCPs/manager.py:28-33, 68-114, Agent-Core/agent_core/api.py:575-588, and server/configStore.ts:1019-1031 accept arbitrary URL strings for MCP servers without scheme checks or private/loopback/metadata IP restrictions and return connection failure diagnostics in warnings.",
+    "suggestedFix": "Validate MCPServerConfig.url in both server/configStore.ts and MCPs/manager.py to allow only https:// (or http:// for explicitly allowlisted hosts), resolve DNS, and reject loopback, RFC1918 private, and link-local/metadata IP ranges before connecting."
+  },
+  {
+    "bugId": "BUG-17",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 92,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: sub-agent HITL resume restarts from scratch rather than resuming at the paused tool call. Agent-Core/agent_core/subagents.py:473 compiles worker_graph without a checkpointer while worker_act (lines 428-435) and run_isolated_subagent (line 507) propagate GraphInterrupt to the parent graph. Upon approval resume, the parent re-invokes spawn_subagent from turn_count=0, repeating earlier LLM calls and side-effecting worker tools.",
+    "suggestedFix": "Either attach a checkpointer with a deterministic sub-thread ID derived from the parent thread_id and tool_call_id and resume worker_graph with Command(resume=...), or wire worker_graph as a compiled LangGraph subgraph so interrupts checkpoint and resume natively."
+  },
+  {
+    "bugId": "BUG-18",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 94,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: silent data loss in a reachable user workflow. Nemofy Agent/src/components/FilesystemView.tsx:146-166 implements 'New file' creation by calling saveWorkspaceFile(clean, '') without checking whether clean already exists, and server/configStore.ts:739-749 writes unconditionally via fs.writeFileSync. Entering an existing path silently truncates that file to 0 bytes.",
+    "suggestedFix": "Add a create-only mode (for example a dedicated POST /api/filesystem/file endpoint or createOnly flag using fs.writeFileSync(..., { flag: 'wx' })) that returns HTTP 409 when the target file already exists, and surface the conflict error in FilesystemView."
+  },
+  {
+    "bugId": "BUG-19",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Medium",
+    "confidenceScore": 95,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Medium: silent failure, false success UI feedback, and unhandled promise rejections on backend errors. Nemofy Agent/src/components/SettingsView.tsx:880-922 lacks try/catch around handleDeleteSkill, handleAddMcpServer, handleToggleMcp, and handleDeleteMcp, and Nemofy Agent/src/lib/apiClient.ts:886-895 deleteSkillDocument ignores !res.ok on DELETE /api/skills/:name, causing failed deletions to still display a 'Deleted skill' confirmation banner.",
+    "suggestedFix": "Check !res.ok and throw a descriptive Error in deleteSkillDocument (apiClient.ts:894), and wrap handleDeleteSkill, handleAddMcpServer, handleToggleMcp, and handleDeleteMcp in try/catch blocks that display actionable error banners in SettingsView."
+  },
+  {
+    "bugId": "BUG-20",
+    "verdict": "REAL_BUG",
+    "trueSeverity": "Low",
+    "confidenceScore": 91,
+    "confidenceLabel": "high",
+    "verificationMode": "INDEPENDENTLY_VERIFIED",
+    "analysisSummary": "Low: minor external-link handling bypass requiring user click (CWE-601). Reachability: AUTHENTICATED. Exploitability: MEDIUM. Nemofy Agent/src/lib/markdownRenderer.ts:289-290 allows protocol-relative URLs starting with '//' via `(?:https?:\\/\\/|\\/)`, while Nemofy Agent/src/components/MarkdownMessage.tsx:81-83 applies target='_blank' and rel='noopener noreferrer' only when tok.href.startsWith('http'). Expected: reject protocol-relative external links or treat them as external links with opener isolation; actual: clicking such a link navigates the authenticated SPA tab off-origin.",
+    "suggestedFix": "Tighten INLINE_PATTERN in Nemofy Agent/src/lib/markdownRenderer.ts:290 to reject '//' after '/' (e.g., `(?:https?:\\/\\/|\\/(?!\\/))`) and treat any non-same-origin href in MarkdownMessage.tsx as external with target='_blank' and rel='noopener noreferrer'."
+  }
+]

@@ -32,7 +32,10 @@ import {
 } from 'react';
 import {
   type ActivityUserPrefs,
+  MAX_CONSECUTIVE_POLL_ERRORS,
+  computePollRetryDelayMs,
   readActivityPrefs,
+  shouldRetryPollError,
   writeActivityPrefs,
 } from '../lib/activityUtils.ts';
 import {
@@ -41,8 +44,8 @@ import {
   deleteThread,
   listThreads,
   pollChatJob,
-  resumeApproval,
   startChatJob,
+  startResumeApprovalJob,
   uploadChatMedia,
 } from '../lib/apiClient.ts';
 import {
@@ -787,30 +790,7 @@ export function ChatView({
         setLiveActivity(started.activity);
       }
 
-      // Live poll loop until terminal state (fast 300ms long-poll for live thinking deltas)
-      while (!pollCancelledRef.current && !stopRequestedRef.current) {
-        const polled = await pollChatJob(started.jobId, 300, controller.signal);
-        if (pollCancelledRef.current || stopRequestedRef.current) break;
-
-        if (polled.activity) {
-          setLiveActivity(polled.activity);
-        }
-
-        if (polled.done) {
-          if (polled.thread) {
-            const finalThread = polled.thread;
-            setThreads((prev) => {
-              const exists = prev.some((t) => t.id === finalThread.id);
-              if (exists) {
-                return prev.map((t) => (t.id === finalThread.id ? finalThread : t));
-              }
-              return [finalThread, ...prev];
-            });
-            setActiveThreadId(finalThread.id);
-          }
-          break;
-        }
-      }
+      await pollJobUntilComplete(started.jobId, controller);
     } catch (err) {
       const isAbort =
         stopRequestedRef.current ||
@@ -872,8 +852,61 @@ export function ChatView({
     }
   }
 
+  async function pollJobUntilComplete(jobId: string, controller: AbortController) {
+    let consecutivePollErrors = 0;
+
+    while (!pollCancelledRef.current && !stopRequestedRef.current) {
+      try {
+        const polled = await pollChatJob(jobId, 300, controller.signal);
+        consecutivePollErrors = 0;
+        if (pollCancelledRef.current || stopRequestedRef.current) break;
+
+        if (polled.activity) {
+          setLiveActivity(polled.activity);
+        }
+
+        if (polled.done) {
+          if (polled.thread) {
+            const finalThread = polled.thread;
+            setThreads((prev) => {
+              const exists = prev.some((t) => t.id === finalThread.id);
+              if (exists) {
+                return prev.map((t) => (t.id === finalThread.id ? finalThread : t));
+              }
+              return [finalThread, ...prev];
+            });
+            setActiveThreadId(finalThread.id);
+          }
+          break;
+        }
+      } catch (pollErr) {
+        const isAbort =
+          stopRequestedRef.current ||
+          pollCancelledRef.current ||
+          (pollErr instanceof DOMException && pollErr.name === 'AbortError') ||
+          (pollErr instanceof Error && pollErr.name === 'AbortError');
+        consecutivePollErrors += 1;
+        if (!shouldRetryPollError(consecutivePollErrors, MAX_CONSECUTIVE_POLL_ERRORS, isAbort)) {
+          throw pollErr;
+        }
+        const delayMs = computePollRetryDelayMs(consecutivePollErrors);
+        await new Promise<void>((resolve) => {
+          const timer = window.setTimeout(resolve, delayMs);
+          controller.signal.addEventListener(
+            'abort',
+            () => {
+              window.clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      }
+    }
+  }
+
   async function handleApprovalDecision(decision: 'approve' | 'reject' | 'edit') {
-    if (!activeThread || resuming) return;
+    if (!activeThread || resuming || sending) return;
     setError(null);
     let parsedArgs: Record<string, unknown> | undefined;
     if (decision === 'edit') {
@@ -884,17 +917,94 @@ export function ChatView({
         return;
       }
     }
+
+    const threadId = activeThread.id;
+    const toolLabel = String(activeThread.pendingApproval?.tool_name || 'approved tool');
+    const actionLabel =
+      decision === 'reject'
+        ? `Rejecting ${toolLabel}`
+        : decision === 'edit'
+          ? `Applying edited arguments for ${toolLabel}`
+          : `Running approved tool: ${toolLabel}`;
+
+    const controller = new AbortController();
+    activeAbortRef.current = controller;
+    stopRequestedRef.current = false;
     setResuming(true);
+    setSending(true);
+    setStopping(false);
+    isPinnedToBottomRef.current = true;
+    setLiveActivity({
+      jobId: 'resuming',
+      status: 'running',
+      currentPhase: 'resuming_approval',
+      lastEvent: actionLabel,
+      elapsedSeconds: 0,
+      turnCount: 1,
+      thinking: null,
+      activityFeed: [
+        {
+          id: 'resume-init-1',
+          phase: 'resuming_approval',
+          text: actionLabel,
+        },
+      ],
+      toolEvents: [],
+      fileChanges: [],
+    });
+
     try {
-      const res = await resumeApproval(activeThread.id, decision, parsedArgs);
-      if (res.thread) {
-        setThreads((prev) => prev.map((t) => (t.id === res.thread!.id ? res.thread! : t)));
-      }
+      const started = await startResumeApprovalJob(
+        threadId,
+        decision,
+        parsedArgs,
+        undefined,
+        controller.signal,
+      );
       setEditingApproval(false);
+
+      if (started.thread) {
+        const updatedThread = started.thread;
+        setThreads((prev) => prev.map((t) => (t.id === updatedThread.id ? updatedThread : t)));
+      }
+
+      if (!started.jobId) {
+        setLiveActivity(null);
+        return;
+      }
+
+      activeJobIdRef.current = started.jobId;
+
+      if (stopRequestedRef.current) {
+        const stopped = await cancelChatJob(started.jobId);
+        if (stopped.thread) {
+          const stoppedThread = stopped.thread;
+          setThreads((prev) => prev.map((t) => (t.id === stoppedThread.id ? stoppedThread : t)));
+        }
+        return;
+      }
+
+      if (started.activity) {
+        setLiveActivity(started.activity);
+      }
+
+      await pollJobUntilComplete(started.jobId, controller);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to submit approval decision.');
+      const isAbort =
+        stopRequestedRef.current ||
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
+      if (!isAbort) {
+        setError(err instanceof Error ? err.message : 'Unable to submit approval decision.');
+      }
     } finally {
+      activeJobIdRef.current = null;
+      activeAbortRef.current = null;
+      stopRequestedRef.current = false;
       setResuming(false);
+      setSending(false);
+      setStopping(false);
+      setLiveActivity(null);
     }
   }
 
@@ -1115,7 +1225,7 @@ export function ChatView({
               })}
 
               {/* Pending HITL Approval Banner */}
-              {activeThread.pendingApproval && (
+              {activeThread.pendingApproval && !resuming && (
                 <div className="rounded-xl border border-[var(--honey)]/50 bg-[var(--paper-raised)] p-4 space-y-3">
                   <div className="flex items-start gap-2.5">
                     <ShieldAlert className="w-5 h-5 text-[var(--honey)] shrink-0 mt-0.5" />

@@ -17,7 +17,6 @@ import type {
 } from '../types/agent.ts';
 import {
   DEFAULT_ADMIN_USERNAME,
-  DEFAULT_STANDALONE_CREDENTIAL_DIGEST,
   hashStandaloneCredential,
 } from './authValidation.ts';
 import {
@@ -119,6 +118,23 @@ async function apiFetch<T>(
   return { ok: resp.ok, status: resp.status, data, isHtmlFallback: false };
 }
 
+function extractApiError(
+  res: { status: number; data: unknown; isHtmlFallback: boolean },
+  fallback: string,
+): string {
+  const dataObj = res.data && typeof res.data === 'object' ? (res.data as { error?: string; detail?: string }) : null;
+  if (dataObj?.error && typeof dataObj.error === 'string' && dataObj.error.trim()) {
+    return dataObj.error.trim();
+  }
+  if (dataObj?.detail && typeof dataObj.detail === 'string' && dataObj.detail.trim()) {
+    return dataObj.detail.trim();
+  }
+  if (res.isHtmlFallback && res.status >= 400) {
+    return `${fallback} (HTTP ${res.status} gateway/proxy response).`;
+  }
+  return fallback;
+}
+
 function getDefaultLLMConfig(): PersistedLLMConfig {
   return {
     primary: {
@@ -174,11 +190,50 @@ export async function checkAuthSession(): Promise<AuthSession> {
   }
 
   detectedStandaloneMode = true;
+  const savedDigest = window.localStorage.getItem(STANDALONE_DIGEST_KEY);
   const active = window.sessionStorage.getItem(STANDALONE_SESSION_KEY);
-  if (active === DEFAULT_ADMIN_USERNAME) {
-    return { authenticated: true, username: DEFAULT_ADMIN_USERNAME, mode: 'standalone' };
+  if (savedDigest && active) {
+    return { authenticated: true, username: active, mode: 'standalone' };
   }
-  return { authenticated: false, mode: 'standalone' };
+  return { authenticated: false, needsSetup: !savedDigest, mode: 'standalone' };
+}
+
+export async function setupAdminPassword(
+  username: string,
+  password: string,
+): Promise<{ ok: boolean; username?: string; error?: string }> {
+  const cleanUser = username.trim() || DEFAULT_ADMIN_USERNAME;
+  if (!detectedStandaloneMode) {
+    try {
+      const res = await apiFetch<{
+        authenticated?: boolean;
+        username?: string;
+        token?: string;
+        error?: string;
+      }>('/api/auth/setup', {
+        method: 'POST',
+        body: JSON.stringify({ username: cleanUser, password }),
+      });
+      if (!res.isHtmlFallback && res.status !== 404) {
+        if (!res.ok || !res.data.authenticated) {
+          return { ok: false, error: res.data.error || 'Unable to complete administrator setup.' };
+        }
+        if (res.data.token) setSessionToken(res.data.token);
+        return { ok: true, username: res.data.username || cleanUser };
+      }
+      detectedStandaloneMode = true;
+    } catch {
+      detectedStandaloneMode = true;
+    }
+  }
+
+  if (window.localStorage.getItem(STANDALONE_DIGEST_KEY)) {
+    return { ok: false, error: 'Administrator account is already configured.' };
+  }
+  const digest = await hashStandaloneCredential(cleanUser, password);
+  window.localStorage.setItem(STANDALONE_DIGEST_KEY, digest);
+  window.sessionStorage.setItem(STANDALONE_SESSION_KEY, cleanUser);
+  return { ok: true, username: cleanUser };
 }
 
 export async function loginWithCredentials(
@@ -209,12 +264,15 @@ export async function loginWithCredentials(
     }
   }
 
-  const expectedDigest =
-    window.localStorage.getItem(STANDALONE_DIGEST_KEY) || DEFAULT_STANDALONE_CREDENTIAL_DIGEST;
+  const expectedDigest = window.localStorage.getItem(STANDALONE_DIGEST_KEY);
+  if (!expectedDigest) {
+    return { ok: false, error: 'Please complete first-time administrator setup first.' };
+  }
   const candidate = await hashStandaloneCredential(username, password);
-  if (username.trim().toLowerCase() === DEFAULT_ADMIN_USERNAME && candidate === expectedDigest) {
-    window.sessionStorage.setItem(STANDALONE_SESSION_KEY, DEFAULT_ADMIN_USERNAME);
-    return { ok: true, username: DEFAULT_ADMIN_USERNAME };
+  if (candidate === expectedDigest) {
+    const cleanUser = username.trim() || DEFAULT_ADMIN_USERNAME;
+    window.sessionStorage.setItem(STANDALONE_SESSION_KEY, cleanUser);
+    return { ok: true, username: cleanUser };
   }
   return { ok: false, error: 'Invalid username or password.' };
 }
@@ -250,13 +308,16 @@ export async function changeAdminPassword(
     return { ok: true, message: res.data.message || 'Password updated successfully.' };
   }
 
-  const expectedDigest =
-    window.localStorage.getItem(STANDALONE_DIGEST_KEY) || DEFAULT_STANDALONE_CREDENTIAL_DIGEST;
-  const currentHash = await hashStandaloneCredential(DEFAULT_ADMIN_USERNAME, currentPassword);
+  const expectedDigest = window.localStorage.getItem(STANDALONE_DIGEST_KEY);
+  if (!expectedDigest) {
+    return { ok: false, error: 'Administrator account is not configured yet.' };
+  }
+  const activeUser = window.sessionStorage.getItem(STANDALONE_SESSION_KEY) || DEFAULT_ADMIN_USERNAME;
+  const currentHash = await hashStandaloneCredential(activeUser, currentPassword);
   if (currentHash !== expectedDigest) {
     return { ok: false, error: 'Current password is incorrect.' };
   }
-  const nextHash = await hashStandaloneCredential(DEFAULT_ADMIN_USERNAME, newPassword);
+  const nextHash = await hashStandaloneCredential(activeUser, newPassword);
   window.localStorage.setItem(STANDALONE_DIGEST_KEY, nextHash);
   return { ok: true, message: 'Password updated for this browser deployment.' };
 }
@@ -474,7 +535,40 @@ export async function startChatJob(
   });
 
   if (!res.ok) {
-    throw new Error((res.data as { error?: string }).error || 'Failed to start agent task.');
+    throw new Error(extractApiError(res, 'Failed to start agent task.'));
+  }
+  return res.data;
+}
+
+export async function startResumeApprovalJob(
+  threadId: string,
+  decision: 'approve' | 'reject' | 'edit',
+  args?: Record<string, unknown>,
+  reason?: string,
+  signal?: AbortSignal,
+): Promise<{
+  jobId: string | null;
+  alreadyResolved?: boolean;
+  thread?: ChatThread | null;
+  activity?: LiveAgentActivity;
+  message?: ChatMessage;
+  error?: string;
+}> {
+  const res = await apiFetch<{
+    jobId: string | null;
+    alreadyResolved?: boolean;
+    thread?: ChatThread | null;
+    activity?: LiveAgentActivity;
+    message?: ChatMessage;
+    error?: string;
+  }>('/api/chat/jobs/resume', {
+    method: 'POST',
+    body: JSON.stringify({ threadId, decision, arguments: args, reason }),
+    signal,
+  });
+
+  if (!res.ok) {
+    throw new Error(extractApiError(res, 'Failed to process approval.'));
   }
   return res.data;
 }
@@ -498,7 +592,7 @@ export async function pollChatJob(
   }>(`/api/chat/jobs/${encodeURIComponent(jobId)}?wait_ms=${waitMs}`, { signal });
 
   if (!res.ok) {
-    throw new Error(res.data.error || 'Failed to poll agent progress.');
+    throw new Error(extractApiError(res, 'Failed to poll agent progress.'));
   }
   return res.data;
 }
@@ -534,16 +628,18 @@ export async function resumeApproval(
   decision: 'approve' | 'reject' | 'edit',
   args?: Record<string, unknown>,
   reason?: string,
-): Promise<{ thread?: ChatThread; message: ChatMessage }> {
-  const res = await apiFetch<{ thread?: ChatThread; message: ChatMessage; error?: string }>(
-    '/api/chat/resume',
-    {
-      method: 'POST',
-      body: JSON.stringify({ threadId, decision, arguments: args, reason }),
-    },
-  );
+): Promise<{ thread?: ChatThread; message?: ChatMessage; alreadyResolved?: boolean }> {
+  const res = await apiFetch<{
+    thread?: ChatThread;
+    message?: ChatMessage;
+    alreadyResolved?: boolean;
+    error?: string;
+  }>('/api/chat/resume', {
+    method: 'POST',
+    body: JSON.stringify({ threadId, decision, arguments: args, reason }),
+  });
   if (!res.ok) {
-    throw new Error(res.data.error || 'Failed to process approval.');
+    throw new Error(extractApiError(res, 'Failed to process approval.'));
   }
   return res.data;
 }
@@ -602,16 +698,24 @@ export async function readWorkspaceFile(
   return res.data;
 }
 
-export async function saveWorkspaceFile(filePath: string, content: string): Promise<void> {
+export async function saveWorkspaceFile(
+  filePath: string,
+  content: string,
+  options?: { createOnly?: boolean },
+): Promise<void> {
+  const createOnly = Boolean(options?.createOnly);
   if (detectedStandaloneMode) {
     const files = readLocalJson<Record<string, string>>(STANDALONE_FILES_KEY, {});
+    if (createOnly && Object.prototype.hasOwnProperty.call(files, filePath)) {
+      throw new Error(`File already exists: /workspace/${filePath}`);
+    }
     files[filePath] = content;
     writeLocalJson(STANDALONE_FILES_KEY, files);
     return;
   }
   const res = await apiFetch<{ ok?: boolean; error?: string }>('/api/filesystem/file', {
     method: 'PUT',
-    body: JSON.stringify({ path: filePath, content }),
+    body: JSON.stringify({ path: filePath, content, ...(createOnly ? { createOnly: true } : {}) }),
   });
   if (!res.ok) throw new Error(res.data.error || 'Unable to save file.');
 }
@@ -891,7 +995,11 @@ export async function deleteSkillDocument(name: string): Promise<void> {
     writeLocalJson(STANDALONE_SKILLS_KEY, next);
     return;
   }
-  await apiFetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  const res = await apiFetch<{ ok?: boolean; error?: string }>(
+    `/api/skills/${encodeURIComponent(name)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) throw new Error(res.data.error || 'Unable to delete skill.');
 }
 
 export async function fetchMCPServers(): Promise<MCPServerItem[]> {

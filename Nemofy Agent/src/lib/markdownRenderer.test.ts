@@ -78,3 +78,15 @@ test('parseMarkdownBlocks detects fenced and unfenced ASCII charts and checklist
   }
   assert.equal(looksLikeAsciiVisual('┌────┐\n│ OK │\n└────┘'), true);
 });
+
+test('parseInlineMarkdown rejects protocol-relative external URLs while keeping relative paths and https links (BUG-20)', () => {
+  const protoRel = parseInlineMarkdown('Click [phish](//evil.example/login) safely.');
+  assert.equal(
+    protoRel.some((t) => t.type === 'link'),
+    false,
+  );
+
+  const okLinks = parseInlineMarkdown('See [docs](/docs/guide) and [site](https://nemofy.tech).');
+  assert.ok(okLinks.some((t) => t.type === 'link' && t.href === '/docs/guide'));
+  assert.ok(okLinks.some((t) => t.type === 'link' && t.href === 'https://nemofy.tech'));
+});

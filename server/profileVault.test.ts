@@ -90,3 +90,24 @@ test('ProfileSecretVaultStore deletes secrets cleanly and migrates + scrubs lega
   assert.equal(vault.deleteSecret('admin', 'NVIDIA_API_KEY'), false);
   assert.deepEqual(Object.keys(vault.getDecryptedSecrets('admin')), ['RIVER_AI_API']);
 });
+
+test('ProfileSecretVaultStore recovers cleanly on write when resetIfUnreadable is enabled after master key rotation', () => {
+  const dir = createTempDir();
+  const oldVault = new ProfileSecretVaultStore(dir, () => 'old-master-key-material-0000000000');
+  oldVault.setSecrets('admin', { OPENROUTER_API_KEY: 'sk-or-old-key-1111' });
+
+  const newVault = new ProfileSecretVaultStore(dir, () => 'new-master-key-material-9999999999');
+  // Strict reads and strict writes still fail on key mismatch
+  assert.throws(() => newVault.getDecryptedSecrets('admin'));
+  assert.throws(() => newVault.setSecrets('admin', { OPENROUTER_API_KEY: 'sk-or-new-key-2222' }));
+
+  // Explicit recovery re-initializes the encrypted vault cleanly under the new master key
+  const saved = newVault.setSecrets(
+    'admin',
+    { OPENROUTER_API_KEY: 'sk-or-new-key-2222' },
+    { resetIfUnreadable: true },
+  );
+  assert.deepEqual(saved, ['OPENROUTER_API_KEY']);
+  assert.equal(newVault.getDecryptedSecrets('admin').OPENROUTER_API_KEY, 'sk-or-new-key-2222');
+});
+

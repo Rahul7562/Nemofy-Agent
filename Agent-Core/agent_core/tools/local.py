@@ -5,9 +5,10 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 from contextvars import ContextVar
 from html import unescape
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -55,6 +56,19 @@ def html_to_clean_markdown(html: str, *, base_url: str = "") -> str:
     return markdown
 
 
+def _is_blocked_web_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    )
+
+
 def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
     cleaned = url.strip()
     parsed = urlparse(cleaned)
@@ -62,21 +76,43 @@ def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
         raise ValueError(f"Unsupported URL scheme {parsed.scheme!r}; only http/https allowed.")
     if not parsed.hostname:
         raise ValueError(f"Invalid URL (missing hostname): {url!r}")
+    if parsed.username or parsed.password:
+        raise SandboxSecurityError("Access denied: web_fetch URLs must not contain embedded credentials.")
 
     if not allow_private:
-        host = parsed.hostname.lower()
-        if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):  # noqa: S104
+        host = parsed.hostname.lower().rstrip(".")
+        if (
+            host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "metadata.google.internal")  # noqa: S104
+            or host.endswith((".localhost", ".local", ".internal", ".localdomain"))
+        ):
             raise SandboxSecurityError(
-                f"Access denied: web_fetch cannot target loopback address {host!r}."
+                f"Access denied: web_fetch cannot target internal or loopback host {host!r}."
             )
         try:
-            ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            literal_ip = ipaddress.ip_address(host)
+        except ValueError:
+            literal_ip = None
+
+        if literal_ip is not None:
+            if _is_blocked_web_ip(literal_ip):
                 raise SandboxSecurityError(
                     f"Access denied: web_fetch cannot target private/internal IP {host!r}."
                 )
-        except ValueError:
-            pass
+        else:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            try:
+                addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            except socket.gaierror:
+                addr_infos = []
+            for _family, _socktype, _proto, _canon, sockaddr in addr_infos:
+                try:
+                    resolved_ip = ipaddress.ip_address(sockaddr[0])
+                except ValueError:
+                    continue
+                if _is_blocked_web_ip(resolved_ip):
+                    raise SandboxSecurityError(
+                        f"Access denied: web_fetch host {host!r} resolves to private/internal IP {resolved_ip}."
+                    )
 
     return cleaned
 
@@ -90,19 +126,35 @@ async def fetch_webpage_markdown(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> str:
     """Fetch a webpage and return clean Markdown or plain text."""
-    validated_url = _validate_web_url(url, allow_private=allow_private)
+    current_url = _validate_web_url(url, allow_private=allow_private)
     headers = {
         "User-Agent": "NemofyAgentCore/2.0 (+https://nemofy.tech; research-fetch)",
         "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
     }
 
+    max_redirects = 5
     async with httpx.AsyncClient(
         timeout=timeout_seconds,
-        follow_redirects=True,
-        max_redirects=5,
+        follow_redirects=False,
         transport=transport,
     ) as client:
-        response = await client.get(validated_url, headers=headers)
+        response: httpx.Response | None = None
+        for _hop in range(max_redirects + 1):
+            response = await client.get(current_url, headers=headers)
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                if not location:
+                    break
+                next_url = urljoin(current_url, location.strip())
+                current_url = _validate_web_url(next_url, allow_private=allow_private)
+                continue
+            break
+        else:
+            raise httpx.TooManyRedirects(f"Exceeded {max_redirects} redirects while fetching {url!r}.")
+
+        assert response is not None
+        if response.status_code in (301, 302, 303, 307, 308) and response.headers.get("location"):
+            raise httpx.TooManyRedirects(f"Exceeded {max_redirects} redirects while fetching {url!r}.")
         response.raise_for_status()
         content_type = response.headers.get("content-type", "").lower()
         body = response.text

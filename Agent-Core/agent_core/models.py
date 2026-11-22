@@ -8,12 +8,19 @@ Credentials are never logged or exposed in reprs or diagnostics.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import logging
 import os
+import re
+import socket
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -21,6 +28,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphInterrupt
 from pydantic import SecretStr
 
 load_dotenv()
@@ -34,6 +42,15 @@ def reload_env_file(dotenv_path: Path | str | None = None) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+DEFAULT_RATE_LIMIT_RETRY_INTERVAL_SECONDS = max(
+    0.05, float(os.getenv("RATE_LIMIT_RETRY_INTERVAL_SECONDS", "3.0"))
+)
+_RATE_LIMIT_TEXT_RE = re.compile(
+    r"(?:\b429\b|rate[\s_-]*limit|too many requests|quota[\s_-]*exceeded)",
+    re.IGNORECASE,
+)
 
 DEFAULT_RIVER_AI_BASE_URL = "https://api.river.ai/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -665,6 +682,134 @@ def classify_provider_exception(exc: Exception, spec: ModelSpec) -> RuntimeError
     )
 
 
+def is_rate_limit_exception(exc: BaseException, *, _depth: int = 0) -> bool:
+    """Return True if an exception (or its wrapped cause) represents an HTTP 429 rate-limit error."""
+    if _depth > 4:
+        return False
+    if isinstance(exc, ModelRateLimitError):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        if exc.response.status_code == 429:
+            return True
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) == 429:
+        return True
+    cls_name = type(exc).__name__.lower()
+    if "ratelimit" in cls_name or "toomanyrequests" in cls_name:
+        return True
+    if _RATE_LIMIT_TEXT_RE.search(str(exc)):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc and is_rate_limit_exception(cause, _depth=_depth + 1):
+        return True
+    ctx = getattr(exc, "__context__", None)
+    if ctx is not None and ctx is not exc and is_rate_limit_exception(ctx, _depth=_depth + 1):
+        return True
+    return False
+
+
+def format_rate_limit_error_detail(exc: BaseException) -> str:
+    """Extract a clean, compact single-line summary of an HTTP 429 rate-limit error."""
+    raw = str(exc).strip() or type(exc).__name__
+    compact = " ".join(raw.split())
+    return compact[:320]
+
+
+async def invoke_with_rate_limit_retry(
+    call_fn: Callable[[], Awaitable[_T]],
+    *,
+    label: str = "model",
+    retry_interval_seconds: float | None = None,
+    max_wait_seconds: float | None = None,
+    turn_count: int | None = None,
+    on_retry: Callable[[int, float, float, BaseException], None] | None = None,
+) -> _T:
+    """Invoke an async LLM call, retrying HTTP 429 rate limits every 3 seconds until success or timeout.
+
+    Keeps the active job alive by emitting progress heartbeats on each retry. If the upstream
+    provider continues returning HTTP 429 past the timeout budget, raises ``ModelRateLimitError``
+    containing both the timeout explanation and the HTTP 429 error detail.
+    """
+    from agent_core.jobs import (
+        DEFAULT_STALL_TIMEOUT_SECONDS,
+        emit_progress,
+        get_active_timeout_seconds,
+    )
+
+    interval = (
+        max(0.01, float(retry_interval_seconds))
+        if retry_interval_seconds is not None
+        else DEFAULT_RATE_LIMIT_RETRY_INTERVAL_SECONDS
+    )
+    timeout_budget = (
+        max(0.05, float(max_wait_seconds))
+        if max_wait_seconds is not None
+        else get_active_timeout_seconds(DEFAULT_STALL_TIMEOUT_SECONDS)
+    )
+
+    first_429_at: float | None = None
+    attempt = 0
+
+    while True:
+        try:
+            return await call_fn()
+        except (GraphInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if not is_rate_limit_exception(exc):
+                raise
+
+            now = time.monotonic()
+            if first_429_at is None:
+                first_429_at = now
+            attempt += 1
+            elapsed = now - first_429_at
+            remaining = timeout_budget - elapsed
+            detail = format_rate_limit_error_detail(exc)
+
+            if remaining <= 0.0:
+                err_msg = (
+                    f"Agent timed out after {elapsed:.1f}s (timeout={timeout_budget:.1f}s) "
+                    f"due to persistent HTTP 429 rate limit on {label} after {attempt} attempt(s) "
+                    f"(retrying every {interval:g}s): {detail}"
+                )
+                logger.error(err_msg)
+                raise ModelRateLimitError(err_msg) from exc
+
+            sleep_s = min(interval, remaining)
+            logger.warning(
+                "HTTP 429 rate limit on %s (attempt %d, %.1fs/%.1fs elapsed) — retrying in %.1fs: %s",
+                label,
+                attempt,
+                elapsed,
+                timeout_budget,
+                sleep_s,
+                detail,
+            )
+            progress_fields: dict[str, Any] = {
+                "detail": (
+                    f"Rate limited (HTTP 429) on {label} — retrying in {sleep_s:g}s "
+                    f"(attempt {attempt}, {elapsed:.0f}s / {timeout_budget:.0f}s)"
+                ),
+                "retry_attempt": attempt,
+                "rate_limit_error": detail,
+            }
+            if turn_count is not None:
+                progress_fields["turn_count"] = turn_count
+            emit_progress("rate_limited", **progress_fields)
+
+            if on_retry is not None:
+                try:
+                    on_retry(attempt, elapsed, sleep_s, exc)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            await asyncio.sleep(sleep_s)
+
+
 _REASONING_RANK: dict[str, int] = {
     "off": 0,
     "none": 0,
@@ -1022,7 +1167,9 @@ def build_chat_model(
         "base_url": resolved.base_url,
         "max_tokens": effective_max_tokens,
         "timeout": resolved.timeout_seconds,
-        "max_retries": resolved.max_retries,
+        # Handle HTTP 429 retries at the agent layer every 3 seconds with live progress heartbeats
+        # so the OpenAI SDK does not silently sleep behind hidden exponential backoff.
+        "max_retries": 0,
         "streaming": streaming,
     }
     if not omit_temp:
@@ -1149,12 +1296,24 @@ def _parse_models_payload(provider: str, payload: Any) -> list[dict[str, Any]]:
             display_name = None
         owned_by = str(item.get("owned_by") or item.get("organization") or "").strip() or None
 
+        top_provider = item.get("top_provider") if isinstance(item.get("top_provider"), dict) else {}
+        limits = item.get("limits") if isinstance(item.get("limits"), dict) else {}
         ctx_raw = (
             item.get("context_length")
+            or item.get("context_window")
+            or item.get("contextWindow")
             or item.get("max_context_length")
+            or item.get("max_model_len")
+            or item.get("context_size")
+            or item.get("max_input_tokens")
+            or item.get("max_context_tokens")
+            or item.get("n_ctx")
             or item.get("input_token_limit")
             or item.get("inputTokenLimit")
-            or (item.get("top_provider") or {}).get("context_length")
+            or top_provider.get("context_length")
+            or limits.get("context")
+            or limits.get("input")
+            or limits.get("context_length")
         )
         context_length: int | None = None
         if isinstance(ctx_raw, (int, float)) and ctx_raw > 0:
@@ -1162,10 +1321,16 @@ def _parse_models_payload(provider: str, payload: Any) -> list[dict[str, Any]]:
 
         out_raw = (
             item.get("max_output_tokens")
+            or item.get("maxOutputTokens")
             or item.get("max_completion_tokens")
+            or item.get("maxCompletionTokens")
             or item.get("output_token_limit")
             or item.get("outputTokenLimit")
-            or (item.get("top_provider") or {}).get("max_completion_tokens")
+            or top_provider.get("max_completion_tokens")
+            or top_provider.get("max_output_tokens")
+            or limits.get("output")
+            or limits.get("max_output_tokens")
+            or limits.get("max_completion_tokens")
         )
         max_output_tokens: int | None = None
         if isinstance(out_raw, (int, float)) and out_raw > 0:
@@ -1219,6 +1384,89 @@ def _parse_models_payload(provider: str, payload: Any) -> list[dict[str, Any]]:
     return selected
 
 
+def _is_non_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    )
+
+
+def _validate_outbound_provider_url(url: str, provider: str) -> tuple[bool, str | None]:
+    """Validate that a provider base URL is safe for server-side outbound HTTP requests."""
+    cleaned = (url or "").strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False, "Provide a valid http(s) Base URL to load models from this provider."
+    if parsed.username or parsed.password:
+        return False, "Provider Base URL must not contain embedded credentials."
+
+    host = parsed.hostname.lower().rstrip(".")
+    allow_loopback = canonicalize_provider(provider) in LOCAL_NO_KEY_PROVIDERS
+
+    if host in ("localhost",) or host.endswith(".localhost"):
+        if not allow_loopback:
+            return False, f"Loopback Base URL {host!r} is only allowed for local providers (ollama/vllm)."
+        return True, None
+
+    if host.endswith((".local", ".internal", ".localdomain")) or host == "metadata.google.internal":
+        return False, f"Blocked internal/metadata provider hostname: {host!r}."
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None:
+        if literal_ip.is_loopback and allow_loopback:
+            return True, None
+        if _is_non_public_ip(literal_ip):
+            return False, f"Blocked non-public provider IP address: {host!r}."
+        return True, None
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return True, None
+
+    for _family, _socktype, _proto, _canon, sockaddr in addr_infos:
+        try:
+            resolved_ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        if resolved_ip.is_loopback and allow_loopback:
+            continue
+        if _is_non_public_ip(resolved_ip):
+            return False, f"Provider hostname {host!r} resolves to a blocked non-public IP address."
+
+    return True, None
+
+
+def _normalized_origin(url: str) -> tuple[str, str, int] | None:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    return (parsed.scheme.lower(), parsed.hostname.lower().rstrip("."), parsed.port or default_port)
+
+
+def _is_server_key_allowed_for_url(provider: str, resolved_base: str) -> bool:
+    """Only attach stored server-side provider keys when targeting the provider's canonical origin."""
+    prov = canonicalize_provider(provider)
+    canonical_base = PROVIDER_BASE_URLS.get(prov)
+    if not canonical_base:
+        return False
+    target_origin = _normalized_origin(resolved_base)
+    canonical_origin = _normalized_origin(canonical_base)
+    return target_origin is not None and target_origin == canonical_origin
+
+
 async def list_provider_models(
     provider: str,
     *,
@@ -1232,9 +1480,10 @@ async def list_provider_models(
     prov = canonicalize_provider(provider)
     resolved_base = (base_url or PROVIDER_BASE_URLS.get(prov) or "").strip().rstrip("/")
     role_env_var = "WORKER_API_KEY" if role == "worker" else "PRIMARY_API_KEY"
-    resolved_key = (
-        api_key.strip()
-        if api_key and api_key.strip()
+    explicit_key = api_key.strip() if api_key and api_key.strip() else ""
+    server_env_key = (
+        ""
+        if explicit_key
         else _resolve_api_key(
             prov,
             role_env_var,
@@ -1242,6 +1491,25 @@ async def list_provider_models(
             allow_explicit_fallback=(prov == "custom"),
         )
     )
+
+    url_ok, url_err = _validate_outbound_provider_url(resolved_base, prov)
+    if not url_ok:
+        return {
+            "ok": False,
+            "provider": prov,
+            "base_url": resolved_base,
+            "api_key_configured": bool(explicit_key or server_env_key),
+            "source": "error",
+            "models": [],
+            "count": 0,
+            "error": url_err,
+        }
+
+    # Never forward stored server-side API keys to a custom/non-canonical base URL origin.
+    if not explicit_key and server_env_key and not _is_server_key_allowed_for_url(prov, resolved_base):
+        resolved_key = ""
+    else:
+        resolved_key = explicit_key or server_env_key
 
     result: dict[str, Any] = {
         "ok": False,
@@ -1254,17 +1522,17 @@ async def list_provider_models(
         "error": None,
     }
 
-    if not resolved_base or not resolved_base.startswith(("http://", "https://")):
-        result["error"] = "Provide a valid http(s) Base URL to load models from this provider."
-        return result
-
     headers = _build_provider_headers(prov, resolved_key)
     models_url = f"{resolved_base}/models"
 
     try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=False) as client:
             resp = await client.get(models_url, headers=headers)
             result["http_status"] = resp.status_code
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                result["error"] = f"Provider endpoint redirected (HTTP {resp.status_code}); redirects are blocked for security."
+                return result
 
             if resp.status_code == 200:
                 try:
@@ -1335,19 +1603,41 @@ async def probe_model_connectivity(
         "error": None,
     }
 
-    headers = _build_provider_headers(resolved.provider, resolved.api_key)
+    url_ok, url_err = _validate_outbound_provider_url(resolved.base_url, resolved.provider)
+    if not url_ok:
+        result["error"] = url_err
+        return result
+
+    effective_key = resolved.api_key
+    if (
+        effective_key
+        and resolved.provider not in LOCAL_NO_KEY_PROVIDERS
+        and resolved.provider != "custom"
+        and not _is_server_key_allowed_for_url(resolved.provider, resolved.base_url)
+    ):
+        result["error"] = (
+            f"Refusing to send stored '{resolved.provider}' API key to non-canonical base URL "
+            f"{resolved.base_url!r}. Use provider='custom' with an explicit key for custom endpoints."
+        )
+        return result
+
+    headers = _build_provider_headers(resolved.provider, effective_key)
     models_url = f"{resolved.base_url}/models"
     needs_key = resolved.provider not in LOCAL_NO_KEY_PROVIDERS
-    has_key = bool(resolved.api_key and resolved.api_key.strip())
+    has_key = bool(effective_key and effective_key.strip())
     env_hint = ", ".join(
         PROVIDER_ENV_KEY_MAP.get(resolved.provider, ("PRIMARY_API_KEY",))
     )
 
     try:
-        async with httpx.AsyncClient(timeout=min(resolved.timeout_seconds, 15.0), follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=min(resolved.timeout_seconds, 15.0), follow_redirects=False) as client:
             resp = await client.get(models_url, headers=headers)
             result["endpoint_reachable"] = True
             result["http_status"] = resp.status_code
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                result["error"] = f"Provider endpoint redirected (HTTP {resp.status_code}); redirects are blocked for security."
+                return result
 
             if resp.status_code == 200:
                 try:

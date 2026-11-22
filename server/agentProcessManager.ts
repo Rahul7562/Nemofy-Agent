@@ -13,13 +13,15 @@ export class AgentCoreProcessManager {
   private state: AgentCoreLifecycleState = 'idle';
   private lastError: string | null = null;
   private startPromise: Promise<void> | null = null;
+  private readonly getApiToken: () => string;
   readonly port: number;
   readonly baseUrl: string;
 
-  constructor(cwd?: string, port?: number) {
+  constructor(cwd?: string, port?: number, getApiToken?: () => string) {
     this.cwd = path.resolve(cwd || process.cwd());
     this.port = port || Number(process.env.AGENT_API_PORT || '8100');
     this.baseUrl = `http://127.0.0.1:${this.port}`;
+    this.getApiToken = getApiToken || (() => (process.env.AGENT_API_TOKEN || '').trim());
   }
 
   getStatus(): { state: AgentCoreLifecycleState; error: string | null } {
@@ -126,18 +128,65 @@ export class AgentCoreProcessManager {
     return this.venvPython;
   }
 
-  async isHealthy(): Promise<boolean> {
+  private async checkHealthAndAuth(): Promise<{ reachable: boolean; authenticated: boolean }> {
     try {
       const res = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok) {
-        this.state = 'ready';
-        this.lastError = null;
-        return true;
+      if (!res.ok) {
+        return { reachable: false, authenticated: false };
       }
-      return false;
+      const data = (await res.json().catch(() => ({}))) as { auth_configured?: boolean };
+      const token = this.getApiToken().trim();
+      if (!token) {
+        return { reachable: true, authenticated: Boolean(data.auth_configured) };
+      }
+      if (!data.auth_configured) {
+        return { reachable: true, authenticated: false };
+      }
+      const authRes = await fetch(`${this.baseUrl}/config/llm`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(1500),
+      });
+      return { reachable: true, authenticated: authRes.ok };
     } catch {
-      return false;
+      return { reachable: false, authenticated: false };
     }
+  }
+
+  private async stopStaleAgentProcessOnPort(): Promise<void> {
+    if (this.child) {
+      await this.stop();
+    }
+    try {
+      await execFileAsync('pkill', ['-TERM', '-f', `uvicorn agent_core\\.api:app.*--port ${this.port}`], {
+        timeout: 3000,
+      });
+    } catch {
+      // No matching process or already stopped
+    }
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const status = await this.checkHealthAndAuth();
+      if (!status.reachable) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    try {
+      await execFileAsync('pkill', ['-KILL', '-f', `uvicorn agent_core\\.api:app.*--port ${this.port}`], {
+        timeout: 2000,
+      });
+    } catch {
+      // ignore
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  async isHealthy(): Promise<boolean> {
+    const check = await this.checkHealthAndAuth();
+    if (check.reachable && check.authenticated) {
+      this.state = 'ready';
+      this.lastError = null;
+      return true;
+    }
+    return false;
   }
 
   private async waitForHealth(timeoutMs = 20_000): Promise<boolean> {
@@ -168,9 +217,18 @@ export class AgentCoreProcessManager {
 
     this.startPromise = (async () => {
       try {
-        if (await this.isHealthy()) {
+        const existing = await this.checkHealthAndAuth();
+        if (existing.reachable && existing.authenticated) {
+          this.state = 'ready';
+          this.lastError = null;
           console.log(`[agent-core] Connected to running Python Agent-Core at ${this.baseUrl}`);
           return;
+        }
+        if (existing.reachable && !existing.authenticated) {
+          console.log(
+            `[agent-core] Existing Python Agent-Core at ${this.baseUrl} is missing or mismatched AGENT_API_TOKEN — restarting cleanly...`,
+          );
+          await this.stopStaleAgentProcessOnPort();
         }
 
         const pythonBin = await this.ensurePythonEnvironment();
@@ -181,6 +239,7 @@ export class AgentCoreProcessManager {
         const pythonPath = [agentCoreDir, this.cwd, process.env.PYTHONPATH || '']
           .filter(Boolean)
           .join(path.delimiter);
+        const apiToken = this.getApiToken().trim();
 
         console.log(`[agent-core] Launching pure-Python Agent-Core FastAPI on ${this.baseUrl}...`);
         this.child = spawn(
@@ -193,6 +252,7 @@ export class AgentCoreProcessManager {
               PYTHONPATH: pythonPath,
               AGENT_API_HOST: '127.0.0.1',
               AGENT_API_PORT: String(this.port),
+              ...(apiToken ? { AGENT_API_TOKEN: apiToken } : {}),
               SKILLS_DIR: path.join(this.cwd, 'Skills'),
               MCP_CONFIG_PATH: path.join(this.cwd, 'MCPs', 'servers.json'),
               WORKSPACE_DIR: path.join(this.cwd, 'workspace'),

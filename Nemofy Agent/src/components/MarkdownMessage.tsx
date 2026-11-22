@@ -74,13 +74,14 @@ function renderInlineTokens(tokens: InlineToken[], isUser: boolean) {
             {tok.value}
           </code>
         );
-      case 'link':
+      case 'link': {
+        const isExternal = tok.href.startsWith('http') || tok.href.startsWith('//');
         return (
           <a
             key={idx}
             href={tok.href}
-            target={tok.href.startsWith('http') ? '_blank' : undefined}
-            rel={tok.href.startsWith('http') ? 'noopener noreferrer' : undefined}
+            target={isExternal ? '_blank' : undefined}
+            rel={isExternal ? 'noopener noreferrer' : undefined}
             className={`underline underline-offset-2 ${
               isUser ? 'text-white hover:text-white/80' : 'text-[var(--signal)] hover:opacity-80'
             }`}
@@ -88,6 +89,7 @@ function renderInlineTokens(tokens: InlineToken[], isUser: boolean) {
             {tok.label}
           </a>
         );
+      }
       default:
         return <Fragment key={idx}>{tok.value}</Fragment>;
     }

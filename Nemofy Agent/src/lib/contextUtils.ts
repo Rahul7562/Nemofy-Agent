@@ -17,6 +17,7 @@ export const MIN_MAX_OUTPUT_TOKENS = 256;
 // Mirrors Agent-Core/agent_core/context_manager.py _MODEL_CONTEXT_WINDOWS
 const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   // Google Gemini
+  ['gemini-2.5-flash-image', 32_768],
   ['gemini-1.5-pro', 2_000_000],
   ['gemini-1.5-flash', 1_000_000],
   ['gemini-2.5-pro', 1_048_576],
@@ -35,7 +36,11 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['llama3.3', 131_072],
   ['llama3.1', 131_072],
   // OpenAI GPT-5 / GPT-4.1 / GPT-4o / o-series
+  ['gpt-5.6', 1_050_000],
+  ['gpt-5.5', 1_050_000],
+  ['gpt-5.4', 1_050_000],
   ['gpt-5.2', 400_000],
+  ['gpt-5.1', 400_000],
   ['gpt-5', 400_000],
   ['gpt-4.1', 1_047_576],
   ['o4-mini', 200_000],
@@ -46,60 +51,97 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['gpt-4-turbo', 128_000],
   ['gpt-3.5', 16_385],
   // Anthropic Claude
+  ['claude-opus-4.8', 1_000_000],
+  ['claude-opus-4.7', 1_000_000],
+  ['claude-opus-4.6', 1_000_000],
+  ['claude-opus-4.5', 200_000],
+  ['claude-opus-4.1', 200_000],
   ['claude-opus-4', 200_000],
+  ['claude-sonnet-4.6', 1_000_000],
+  ['claude-sonnet-4.5', 1_000_000],
   ['claude-sonnet-4', 200_000],
   ['claude-haiku-4', 200_000],
-  ['claude-3-7', 200_000],
   ['claude-3.7', 200_000],
-  ['claude-3-5', 200_000],
   ['claude-3.5', 200_000],
   ['claude-3', 200_000],
   ['claude', 200_000],
   // Moonshot Kimi
-  ['kimi-k3', 256_000],
-  ['kimi-k2.5', 256_000],
+  ['kimi-k3', 1_048_576],
+  ['kimi-k2.7', 262_144],
+  ['kimi-k2.6', 262_144],
+  ['kimi-k2.5', 262_144],
+  ['kimi-k2-thinking', 262_144],
   ['kimi-k2', 131_072],
   ['kimi', 131_072],
   // NVIDIA Nemotron
-  ['nemotron-3.5', 131_072],
-  ['nemotron-3-ultra', 131_072],
-  ['nemotron-3-super', 131_072],
+  ['nemotron-3.5-content-safety', 131_072],
+  ['nemotron-3.5', 1_048_576],
+  ['nemotron-3-ultra-550b-a55b:free', 1_000_000],
+  ['nemotron-3-ultra', 262_144],
+  ['nemotron-3-super', 262_144],
+  ['nemotron-3-nano-omni', 256_000],
   ['nemotron-3-nano', 131_072],
   ['nemotron', 131_072],
   // DeepSeek
-  ['deepseek-v4', 128_000],
+  ['deepseek-v4', 1_048_576],
+  ['deepseek-r1-0528', 163_840],
+  ['deepseek-v3.2', 163_840],
+  ['deepseek-v3.1', 163_840],
   ['deepseek-v3', 128_000],
   ['deepseek-r1', 128_000],
   ['deepseek-chat', 128_000],
   ['deepseek-reasoner', 128_000],
   ['deepseek', 128_000],
   // Zhipu GLM
-  ['glm-5', 128_000],
-  ['glm-4.5', 128_000],
+  ['glm-5', 1_048_576],
+  ['glm-4.7', 204_800],
+  ['glm-4.6', 204_800],
+  ['glm-4.5', 131_072],
   ['glm-4', 128_000],
+  // MiniMax
+  ['minimax-m3', 1_048_576],
+  ['minimax-m2.7', 196_608],
+  ['minimax-m2.5', 198_000],
+  ['minimax-m2', 196_608],
+  ['minimax', 196_608],
   // Qwen
+  ['qwen3.8-27b', 1_024_000],
+  ['qwen3.8', 1_000_000],
+  ['qwen3.5', 262_144],
+  ['qwen3-coder', 262_144],
+  ['qwen3-max', 262_144],
+  ['qwen3-next', 262_144],
   ['qwen3', 131_072],
   ['qwen2.5', 131_072],
   ['qwq', 131_072],
   ['qwen', 131_072],
   // xAI Grok
+  ['grok-4.20', 2_000_000],
+  ['grok-4.3', 1_000_000],
+  ['grok-4.7', 500_000],
+  ['grok-4.6', 500_000],
+  ['grok-4.5', 500_000],
   ['grok-4', 256_000],
   ['grok-3', 131_072],
   ['grok-2', 131_072],
   ['grok', 131_072],
   // Mistral
-  ['mistral-large-4', 256_000],
+  ['mistral-large-4', 1_048_576],
+  ['mistral-large-2512', 262_144],
+  ['mistral-large-2407', 131_072],
   ['mistral-large', 128_000],
   ['mistral-small-3', 128_000],
   ['pixtral', 128_000],
   ['codestral', 256_000],
   ['mistral', 128_000],
+  // Upstage Solar
+  ['solar-pro4', 524_288],
   // Baidu ERNIE
   ['ernie-5', 128_000],
   ['ernie-4', 128_000],
   ['ernie', 128_000],
   // Gemma / Phi
-  ['gemma-4', 128_000],
+  ['gemma-4', 262_144],
   ['gemma-3', 128_000],
   ['gemma', 32_768],
   ['phi-4', 128_000],
@@ -159,6 +201,7 @@ export const CONTEXT_CATEGORY_META: ReadonlyArray<{
 // Mirrors Agent-Core/agent_core/context_manager.py _MODEL_MAX_OUTPUT_TOKENS
 const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   // Google Gemini
+  ['gemini-2.5-flash-image', 8_192],
   ['gemini-2.5-pro', 65_536],
   ['gemini-2.5-flash', 65_536],
   ['gemini-3', 65_536],
@@ -167,6 +210,9 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['gemini-1.5', 8_192],
   ['gemini', 65_536],
   // OpenAI GPT-5 / o-series / GPT-4.1 / GPT-4o
+  ['gpt-5.6', 128_000],
+  ['gpt-5.5', 128_000],
+  ['gpt-5.4', 128_000],
   ['gpt-5.2', 128_000],
   ['gpt-5', 128_000],
   ['o4-mini', 100_000],
@@ -178,76 +224,121 @@ const MODEL_MAX_OUTPUT_TOKENS: ReadonlyArray<readonly [string, number]> = [
   ['gpt-4-turbo', 4_096],
   ['gpt-3.5', 4_096],
   // Anthropic Claude
-  ['claude-opus-4-6', 128_000],
+  ['claude-opus-4.8', 128_000],
+  ['claude-opus-4.7', 128_000],
   ['claude-opus-4.6', 128_000],
-  ['claude-sonnet-4-6', 64_000],
-  ['claude-sonnet-4.6', 64_000],
+  ['claude-opus-4.5', 64_000],
   ['claude-opus-4', 32_000],
+  ['claude-sonnet-4.6', 128_000],
+  ['claude-sonnet-4.5', 64_000],
   ['claude-sonnet-4', 64_000],
   ['claude-haiku-4', 64_000],
-  ['claude-3-7', 64_000],
   ['claude-3.7', 64_000],
-  ['claude-3-5', 8_192],
   ['claude-3.5', 8_192],
   ['claude-3', 4_096],
   ['claude', 64_000],
   // DeepSeek
-  ['deepseek-v4', 32_768],
+  ['deepseek-v4', 131_072],
   ['deepseek-r1', 32_768],
   ['deepseek-reasoner', 32_768],
   ['deepseek-v3', 8_192],
   ['deepseek-chat', 8_192],
   ['deepseek', 16_384],
   // Moonshot Kimi
-  ['kimi-k3', 32_768],
-  ['kimi-k2.5', 32_768],
-  ['kimi-k2', 16_384],
-  ['kimi', 16_384],
+  ['kimi-k3', 131_072],
+  ['kimi-k2.7', 131_072],
+  ['kimi-k2.6', 131_072],
+  ['kimi-k2.5', 65_536],
+  ['kimi-k2-thinking', 98_304],
+  ['kimi-k2', 32_768],
+  ['kimi', 32_768],
   // NVIDIA Nemotron
-  ['nemotron-3.5', 32_768],
-  ['nemotron-3-ultra', 32_768],
-  ['nemotron-3-super', 32_768],
+  ['nemotron-3.5-content-safety', 32_768],
+  ['nemotron-3.5', 131_072],
+  ['nemotron-3-ultra', 65_536],
+  ['nemotron-3-super', 65_536],
+  ['nemotron-3-nano-omni', 65_536],
   ['nemotron-3-nano', 32_768],
-  ['nemotron', 16_384],
+  ['nemotron', 32_768],
+  // MiniMax
+  ['minimax-m3', 131_072],
+  ['minimax-m2.7', 131_072],
+  ['minimax-m2.5', 32_768],
+  ['minimax', 32_768],
   // Qwen
+  ['qwen3.8', 131_072],
+  ['qwen3.5', 65_536],
+  ['qwen3-coder', 65_536],
+  ['qwen3-max', 65_536],
+  ['qwen3-next', 65_536],
   ['qwen3', 32_768],
   ['qwq', 32_768],
   ['qwen2.5', 8_192],
   ['qwen', 16_384],
   // xAI Grok
-  ['grok-4', 32_768],
+  ['grok-4.20', 128_000],
+  ['grok-4.3', 128_000],
+  ['grok-4.7', 128_000],
+  ['grok-4.6', 128_000],
+  ['grok-4.5', 128_000],
+  ['grok-4', 64_000],
   ['grok-3', 32_768],
   ['grok-2', 16_384],
   ['grok', 16_384],
   // Meta Llama 4 & 3
-  ['llama-4', 16_384],
+  ['llama-4', 32_768],
   ['llama-3.3', 8_192],
   ['llama-3.2', 8_192],
   ['llama-3.1', 8_192],
   ['llama3.3', 8_192],
   ['llama3.1', 8_192],
   // Mistral
-  ['mistral-large-4', 32_768],
+  ['mistral-large-4', 262_144],
+  ['mistral-large-2512', 131_072],
   ['codestral', 32_768],
-  ['mistral-large', 16_384],
+  ['mistral-large', 32_768],
   ['mistral-small-3', 16_384],
   ['pixtral', 16_384],
   ['mistral', 16_384],
   // Zhipu GLM
-  ['glm-5', 16_384],
-  ['glm-4.5', 16_384],
+  ['glm-5', 131_072],
+  ['glm-4.7', 131_072],
+  ['glm-4.6', 131_072],
+  ['glm-4.5', 32_768],
   ['glm-4', 8_192],
+  // Upstage Solar
+  ['solar-pro4', 131_072],
   // Baidu ERNIE
   ['ernie-5', 16_384],
   ['ernie-4', 8_192],
   ['ernie', 8_192],
   // Gemma / Phi
-  ['gemma-4', 8_192],
+  ['gemma-4', 32_768],
   ['gemma-3', 8_192],
   ['gemma', 8_192],
   ['phi-4', 16_384],
   ['phi-3.5', 8_192],
 ];
+
+function buildModelMatchCandidates(rawModel: string): string[] {
+  const clean = rawModel.trim().toLowerCase();
+  if (!clean) return [];
+  const normalizeVersion = (s: string) =>
+    s
+      .replace(/v(\d+)p(\d+)/g, '$1.$2')
+      .replace(/(\d)-(\d)(?=$|[-_/:])/g, '$1.$2');
+  const bareWithTag = clean.split('/').pop() || clean;
+  const bareNoTag = bareWithTag.split(':')[0] || bareWithTag;
+  const rawList = [
+    clean,
+    normalizeVersion(clean),
+    bareWithTag,
+    normalizeVersion(bareWithTag),
+    bareNoTag,
+    normalizeVersion(bareNoTag),
+  ];
+  return Array.from(new Set(rawList.filter(Boolean)));
+}
 
 export function resolveModelContextWindow(
   provider?: string | null,
@@ -262,14 +353,11 @@ export function resolveModelContextWindow(
     return { contextWindow: Math.round(explicitContextWindow), source: 'provider_catalog' };
   }
 
-  const cleanModel = (model || '').trim().toLowerCase();
-  if (cleanModel) {
-    const bare = cleanModel.split('/').pop()?.split(':')[0] || cleanModel;
-    for (const target of [cleanModel, bare]) {
-      for (const [pattern, limit] of MODEL_CONTEXT_WINDOWS) {
-        if (target.includes(pattern)) {
-          return { contextWindow: limit, source: 'model_registry' };
-        }
+  const candidates = buildModelMatchCandidates(model || '');
+  if (candidates.length > 0) {
+    for (const [pattern, limit] of MODEL_CONTEXT_WINDOWS) {
+      if (candidates.some((target) => target.includes(pattern))) {
+        return { contextWindow: limit, source: 'model_registry' };
       }
     }
   }
@@ -295,14 +383,11 @@ export function resolveModelMaxOutputTokens(
     return { maxOutputTokens: Math.round(explicitMaxOutputTokens), source: 'provider_catalog' };
   }
 
-  const cleanModel = (model || '').trim().toLowerCase();
-  if (cleanModel) {
-    const bare = cleanModel.split('/').pop()?.split(':')[0] || cleanModel;
-    for (const target of [cleanModel, bare]) {
-      for (const [pattern, limit] of MODEL_MAX_OUTPUT_TOKENS) {
-        if (target.includes(pattern)) {
-          return { maxOutputTokens: limit, source: 'model_registry' };
-        }
+  const candidates = buildModelMatchCandidates(model || '');
+  if (candidates.length > 0) {
+    for (const [pattern, limit] of MODEL_MAX_OUTPUT_TOKENS) {
+      if (candidates.some((target) => target.includes(pattern))) {
+        return { maxOutputTokens: limit, source: 'model_registry' };
       }
     }
   }

@@ -72,6 +72,10 @@ def test_resolve_model_context_window_is_model_specific() -> None:
     assert src == "model_registry"
 
     win, src = resolve_model_context_window("anthropic", "claude-sonnet-4-6")
+    assert win == 1_000_000
+    assert src == "model_registry"
+
+    win, src = resolve_model_context_window("anthropic", "claude-opus-4-5")
     assert win == 200_000
     assert src == "model_registry"
 
@@ -80,7 +84,11 @@ def test_resolve_model_context_window_is_model_specific() -> None:
     assert src == "model_registry"
 
     win, src = resolve_model_context_window("river_ai", "deepseek-ai/DeepSeek-V4.1-Flash")
-    assert win == 128_000
+    assert win == 1_048_576
+    assert src == "model_registry"
+
+    win, src = resolve_model_context_window("nvidia", "minimaxai/minimax-m3.1-flash")
+    assert win == 1_048_576
     assert src == "model_registry"
 
     # Explicit live catalog context_length always wins (including 1M+ windows)
@@ -103,7 +111,7 @@ def test_resolve_model_max_output_tokens_is_model_specific() -> None:
     assert src == "model_registry"
 
     out, src = resolve_model_max_output_tokens("river_ai", "moonshotai/Kimi-K3.1-Pro")
-    assert out == 32_768
+    assert out == 131_072
     assert src == "model_registry"
 
     out, src = resolve_model_max_output_tokens("deepseek", "deepseek-chat")
@@ -180,8 +188,8 @@ def test_compute_context_usage_categorizes_and_calibrates() -> None:
         messages=msgs,
         compacted_summary="Earlier summary memory.",
     )
-    assert usage["context_window"] == 200_000
-    assert usage["max_output_tokens"] == 64_000
+    assert usage["context_window"] == 1_000_000
+    assert usage["max_output_tokens"] == 128_000
     assert usage["max_output_tokens_source"] == "model_registry"
     assert usage["auto_compact_threshold_percent"] == 80
     assert usage["used_tokens"] > 0

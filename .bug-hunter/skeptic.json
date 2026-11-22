@@ -1,0 +1,102 @@
+[
+  {
+    "bugId": "BUG-1",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server/authStore.ts:21-22 and 78-88: DEFAULT_PASSWORD falls back to a hardcoded literal when NEMOFY_ADMIN_PASSWORD is unset and is seeded into data/auth.json on first boot; .env.example omits NEMOFY_ADMIN_PASSWORD, and Nemofy Agent/src/lib/authValidation.ts:3-4 embeds the corresponding standalone credential digest. No startup guard refuses default credentials."
+  },
+  {
+    "bugId": "BUG-2",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server.ts:264-268: POST /api/auth/logout has neither requireSession nor isSameOriginMutation and invokes DELETE /config/secrets on Agent-Core (Agent-Core/agent_core/api.py:455-460), clearing app.state.profile_secrets and popping provider keys from os.environ. While new chat runs re-hydrate secrets via syncProfileSecretsToCore (server.ts:510, 725), unauthenticated or repeated requests still disrupt active in-flight runs and mutate global process secrets."
+  },
+  {
+    "bugId": "BUG-3",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server.ts:1252-1300 and server/providerCatalog.ts:80-103, 288-311, 391-450: both /api/settings/models and /api/settings/probe pass caller-supplied base_url and decrypted profileSecrets directly into fetch without blocking loopback, private RFC1918, or metadata IP ranges, and attach decrypted vault API keys in Authorization or x-api-key headers when api_key is omitted."
+  },
+  {
+    "bugId": "BUG-4",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server/configStore.ts:524-538, 641-708, 710-749: resolveWorkspacePath performs only lexical path.resolve checks without fs.realpathSync. While listWorkspaceTree uses Dirent helpers that skip symlinks, readWorkspaceFile, writeWorkspaceFile, and listWorkspaceDirectory follow symlinks inside workspace/ to targets outside workspace/, unlike Agent-Core/agent_core/sandbox.py:174-196 which does check symlinks."
+  },
+  {
+    "bugId": "BUG-5",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server.ts:462-596 and 677-775 plus server/configStore.ts:1036-1048: threads is loaded from disk before awaiting callAgentCore (up to 120s in /api/chat/send and 15s in /api/chat/jobs/start), and store.saveThreads(threads) writes back the stale pre-await snapshot without reloading or locking, silently overwriting concurrent thread creations or message updates."
+  },
+  {
+    "bugId": "BUG-6",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server/authStore.ts:194-205 and server.ts:96, 150, 222: parseCookieHeader calls decodeURIComponent on every cookie value without try/catch. Any malformed percent-encoding in any cookie throws an uncaught synchronous URIError on /api/auth/me and all requireSession endpoints, returning HTTP 500."
+  },
+  {
+    "bugId": "BUG-7",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server/authStore.ts:121-167 and server.ts:264-268: session tokens are stateless HMAC-signed payloads validated only against signature, expiry (24h), and record.updatedAt. Logout only clears the client cookie and never rotates sessionSecret, bumps version, or records token revocation, so previously issued tokens remain accepted until natural expiration."
+  },
+  {
+    "bugId": "BUG-8",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in server.ts:480-497 and 695-712: both POST /api/chat/send and POST /api/chat/jobs/start append userMsg and persist via store.saveThreads(threads) before checking if llmCfg.primary.model.trim() is empty and returning HTTP 400, leaving orphaned or duplicated user messages on disk."
+  },
+  {
+    "bugId": "BUG-9",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Agent-Core/agent_core/api.py:316-327, 384-420 and server/agentProcessManager.ts:188-201: Agent-Core binds to 127.0.0.1:8100 without overriding CORS_ALLOW_ORIGINS, so CORSMiddleware uses allow_origins=['*'] with allow_credentials=True. While authenticated routes require Bearer/X-API-Key headers rather than cookies (limiting cross-origin impact on protected routes), unauthenticated GET /health is readable cross-origin and exposes local paths and runtime metadata."
+  },
+  {
+    "bugId": "BUG-10",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified mathematically in Agent-Core/agent_core/context_manager.py:558-597 and 686-691: on any history ending in 2+ parallel ToolMessages where candidate lands inside that trailing ToolMessage run (for example n=4 with [Human, AI(tc1,tc2), Tool(tc1), Tool(tc2)]), the while loop stops at candidate = n - 1, line 588 checks only messages[candidate - 1] (which is Tool(tc1), not AIMessage), and returns n - 1, leaving remaining = [Tool(tc2)] orphaned without its AIMessage."
+  },
+  {
+    "bugId": "BUG-11",
+    "response": "ACCEPT",
+    "analysisSummary": "Core defect verified in Agent-Core/agent_core/models.py:1222-1350 and Agent-Core/agent_core/api.py:518-552, with two minor precision notes on Hunter's description: the actual FastAPI routes are POST /models/list (api.py:518) and POST /models/probe (api.py:531), both authenticated by AGENT_API_TOKEN (and not proxied by Express /api/settings/models), and resolve_model_spec_with_override (models.py:549) does enforce http(s):// on /models/probe. Nevertheless, neither function blocks private/loopback/metadata IPs, disables redirect following, or prevents server-side env API keys from being transmitted to caller-supplied base_url hosts."
+  },
+  {
+    "bugId": "BUG-12",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Agent-Core/agent_core/graph.py:2110-2219 and Agent-Core/agent_core/guardrails.py:367-463: act_node executes all tool_calls sequentially inside a single LangGraph node without @task isolation or persisted per-call completion state. When a later call invokes langgraph.types.interrupt() and raises GraphInterrupt (re-raised at graph.py:2192), resuming with Command(resume=...) replays act_node from line 2110, re-executing earlier tool calls and their side effects."
+  },
+  {
+    "bugId": "BUG-13",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Agent-Core/agent_core/guardrails.py:44-79 and 132-147: classify_tool_call checks bash_exec against only 10 regexes in DESTRUCTIVE_BASH_PATTERNS and classifies all unmatched shell commands as SAFE. Alternative file-deletion primitives, redirection truncation, and outbound HTTP mutation flags not matched by those regexes bypass human-in-the-loop approval."
+  },
+  {
+    "bugId": "BUG-14",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Agent-Core/agent_core/tools/local.py:58-106 and Agent-Core/agent_core/guardrails.py:26: _validate_web_url validates only literal strings and literal IP addresses (skipping DNS resolution on ValueError at lines 78-79), and fetch_webpage_markdown uses httpx.AsyncClient(follow_redirects=True, max_redirects=5) without re-validating redirect target hosts. Because web_fetch is explicitly SAFE, it executes without HITL approval."
+  },
+  {
+    "bugId": "BUG-15",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Agent-Core/agent_core/sandbox.py:44-49, 251-258, and 471-516: _check_local_command_boundaries checks only 4 static regexes, and _exec_local_isolated executes bash -c directly on the host OS under the same OS user with no filesystem namespace, mount isolation, or chroot. Although _sanitized_sandbox_env strips sensitive environment variables (lines 218-248), host files owned by the app user such as ../data/auth.json and ../data/vaults/*.vault.json remain directly accessible."
+  },
+  {
+    "bugId": "BUG-16",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in MCPs/manager.py:28-33, 68-114, Agent-Core/agent_core/api.py:575-588, and server/configStore.ts:1019-1031: neither MCPServerConfig, server/configStore.ts saveMCPServers, nor load_mcp_tools_from_configs validates URL scheme or blocks loopback, private RFC1918, or metadata addresses before initiating outbound MCP HTTP/SSE requests and returning connection error diagnostics in warnings."
+  },
+  {
+    "bugId": "BUG-17",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Agent-Core/agent_core/subagents.py:428-435, 473, and 498-508: worker_graph = builder.compile() is compiled without a checkpointer while propagating GraphInterrupt out of worker_act and run_isolated_subagent. When the parent graph resumes after HITL approval, spawn_subagent re-invokes worker_graph.ainvoke(initial_worker_state) from turn_count=0, re-running earlier worker turns and tool calls instead of resuming at the paused call."
+  },
+  {
+    "bugId": "BUG-18",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Nemofy Agent/src/components/FilesystemView.tsx:146-166 and server/configStore.ts:739-749: creating a new file calls saveWorkspaceFile(clean, '') without checking whether clean already exists on the client or enforcing exclusive file creation on the server, silently truncating any pre-existing file at that path to 0 bytes."
+  },
+  {
+    "bugId": "BUG-19",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Nemofy Agent/src/components/SettingsView.tsx:880-922 and Nemofy Agent/src/lib/apiClient.ts:886-917: handleDeleteSkill, handleAddMcpServer, handleToggleMcp, and handleDeleteMcp lack try/catch wrappers, so failed saveMCPServers requests produce unhandled promise rejections with no UI error message, and deleteSkillDocument ignores !res.ok so failed DELETE /api/skills/:name requests still display a success confirmation."
+  },
+  {
+    "bugId": "BUG-20",
+    "response": "ACCEPT",
+    "analysisSummary": "Verified in Nemofy Agent/src/lib/markdownRenderer.ts:289-290 and Nemofy Agent/src/components/MarkdownMessage.tsx:77-90: INLINE_PATTERN permits links starting with '//' (protocol-relative external URLs) because '\\/' matches the leading slash, while MarkdownMessage only checks tok.href.startsWith('http') for target='_blank' and rel='noopener noreferrer', causing protocol-relative external links to navigate the top-level window off-origin."
+  }
+]

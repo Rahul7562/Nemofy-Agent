@@ -75,10 +75,41 @@ export function formatPhaseLabel(phase?: string | null, lastEvent?: string | nul
   if (cleanPhase === 'plan_llm_done') {
     return 'Preparing next step';
   }
+  if (cleanPhase === 'rate_limited') {
+    return 'Rate limited (HTTP 429) — retrying every 3s';
+  }
+  if (cleanPhase === 'background_task') {
+    return 'Waiting for background task';
+  }
+  if (cleanPhase === 'resuming_approval') {
+    return 'Applying your approval decision';
+  }
+  if (cleanPhase === 'compacting_context') {
+    return 'Compacting conversation context';
+  }
+  if (cleanPhase === 'subagent_reason') {
+    return 'Sub-agent reasoning';
+  }
   if (cleanPhase === 'starting' || cleanPhase === 'staged') {
     return 'Starting Nemo';
   }
   return 'Nemo is working';
+}
+
+export const MAX_CONSECUTIVE_POLL_ERRORS = 5;
+
+export function shouldRetryPollError(
+  consecutiveErrors: number,
+  maxRetries = MAX_CONSECUTIVE_POLL_ERRORS,
+  isAbort = false,
+): boolean {
+  if (isAbort) return false;
+  return consecutiveErrors > 0 && consecutiveErrors <= maxRetries;
+}
+
+export function computePollRetryDelayMs(attempt: number): number {
+  const safeAttempt = Math.max(1, Math.floor(attempt));
+  return Math.min(4000, 800 + (safeAttempt - 1) * 700);
 }
 
 export function extractLatestThoughtLine(thinking?: string | null): string | null {

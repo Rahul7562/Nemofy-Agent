@@ -9,20 +9,79 @@ with pure-Python async transport support.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import socket
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MCP_CONFIG_PATH = Path(os.getenv("MCP_CONFIG_PATH", "./MCPs/servers.json"))
+
+
+def _is_blocked_mcp_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    )
+
+
+def validate_mcp_server_url(url: str, *, resolve_dns: bool = False) -> str:
+    """Validate that an MCP server URL uses http(s) and does not target internal/private hosts."""
+    cleaned = (url or "").strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("MCP server URL must be a valid http(s) URL.")
+    if parsed.username or parsed.password:
+        raise ValueError("MCP server URL must not contain embedded credentials.")
+
+    host = parsed.hostname.lower().rstrip(".")
+    if (
+        host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "metadata.google.internal")  # noqa: S104
+        or host.endswith((".localhost", ".local", ".internal", ".localdomain"))
+    ):
+        raise ValueError(f"MCP server URL cannot target internal/loopback host {host!r}.")
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None:
+        if _is_blocked_mcp_ip(literal_ip):
+            raise ValueError(f"MCP server URL cannot target private/internal IP {host!r}.")
+    elif resolve_dns:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            addr_infos = []
+        for _family, _socktype, _proto, _canon, sockaddr in addr_infos:
+            try:
+                resolved_ip = ipaddress.ip_address(sockaddr[0])
+            except ValueError:
+                continue
+            if _is_blocked_mcp_ip(resolved_ip):
+                raise ValueError(
+                    f"MCP server host {host!r} resolves to a blocked private/internal IP."
+                )
+
+    return cleaned
 
 
 class MCPServerConfig(BaseModel):
@@ -37,6 +96,11 @@ class MCPServerConfig(BaseModel):
     include_tools: list[str] | None = None
     exclude_tools: list[str] | None = None
     timeout_seconds: float = Field(default=30.0, ge=2.0, le=180.0)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        return validate_mcp_server_url(v, resolve_dns=False)
 
 
 def load_mcp_servers_config(config_path: Path | str | None = None) -> list[MCPServerConfig]:
@@ -78,6 +142,12 @@ async def load_mcp_tools_from_configs(
 
     for srv in servers:
         if not srv.enabled:
+            continue
+        try:
+            validate_mcp_server_url(srv.url, resolve_dns=True)
+        except ValueError as exc:
+            warnings.append(f"MCP server '{srv.name}' blocked: {exc}")
+            logger.warning("MCP server '%s' URL rejected: %s", srv.name, exc)
             continue
         headers = {"Accept": "application/json, text/event-stream", **dict(srv.headers)}
         if srv.bearer_token:

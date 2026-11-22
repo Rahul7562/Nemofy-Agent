@@ -1,0 +1,20 @@
+[
+  {
+    "bugId": "BUG-18",
+    "severity": "Medium",
+    "category": "data-integrity",
+    "file": "Nemofy Agent/src/components/FilesystemView.tsx",
+    "lines": "146-166",
+    "claim": "Creating a new workspace file silently truncates and overwrites any existing file at the same path to 0 bytes because neither FilesystemView nor the workspace file save endpoint checks whether the target file already exists.",
+    "evidence": "Nemofy Agent/src/components/FilesystemView.tsx:162-166 implements the 'New file' creation flow by calling saveWorkspaceFile(clean, '') directly without checking whether clean already exists in tree or passing a create-only flag. On the backend, PUT /api/filesystem/file calls writeWorkspaceFile in server/configStore.ts, which writes content directly via fs.writeFileSync without O_EXCL / exclusive creation semantics. After truncating an existing file, line 164 shows 'Created file /workspace/<clean>'.",
+    "runtimeTrigger": "A user opens the Workspace Filesystem view, clicks 'New file', and enters the relative path of an existing file (such as notes.md or src/app.py). handleCreateSubmit calls saveWorkspaceFile(clean, ''), silently wiping the existing file's contents to an empty string with no confirmation or conflict error.",
+    "crossReferences": [
+      "Nemofy Agent/src/lib/apiClient.ts:395-410",
+      "server/configStore.ts:739-749"
+    ],
+    "confidenceScore": 93,
+    "confidenceLabel": "high",
+    "stride": "N/A",
+    "cwe": "N/A"
+  }
+]

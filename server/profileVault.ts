@@ -249,7 +249,11 @@ export class ProfileSecretVaultStore {
     return items.sort((a, b) => a.provider_label.localeCompare(b.provider_label));
   }
 
-  setSecrets(username: string, updates: Record<string, string>): string[] {
+  setSecrets(
+    username: string,
+    updates: Record<string, string>,
+    options?: { resetIfUnreadable?: boolean },
+  ): string[] {
     const cleanUpdates: Record<string, string> = {};
     for (const [rawKey, rawVal] of Object.entries(updates)) {
       const envVar = rawKey.trim().toUpperCase();
@@ -264,7 +268,19 @@ export class ProfileSecretVaultStore {
     const keys = Object.keys(cleanUpdates);
     if (keys.length === 0) return [];
 
-    const payload = this.readVaultPayload(username);
+    let payload: DecryptedVaultPayload;
+    try {
+      payload = this.readVaultPayload(username);
+    } catch (err) {
+      if (!options?.resetIfUnreadable) {
+        throw err;
+      }
+      const { safeUser } = this.resolveVaultPath(username);
+      console.warn(
+        `[profile-vault] Existing vault for '${safeUser}' could not be decrypted with current key; re-initializing encrypted vault.`,
+      );
+      payload = { version: 1, username: safeUser, secrets: {} };
+    }
     const now = new Date().toISOString();
     for (const [envVar, val] of Object.entries(cleanUpdates)) {
       payload.secrets[envVar] = { value: val, updatedAt: now };
@@ -273,12 +289,26 @@ export class ProfileSecretVaultStore {
     return keys;
   }
 
-  deleteSecret(username: string, envVarRaw: string): boolean {
+  deleteSecret(
+    username: string,
+    envVarRaw: string,
+    options?: { resetIfUnreadable?: boolean },
+  ): boolean {
     const envVar = (envVarRaw || '').trim().toUpperCase();
     if (!ALLOWED_PROFILE_SECRET_KEYS.has(envVar)) {
       throw new Error(`Unsupported API key variable: ${envVar}`);
     }
-    const payload = this.readVaultPayload(username);
+    let payload: DecryptedVaultPayload;
+    try {
+      payload = this.readVaultPayload(username);
+    } catch (err) {
+      if (!options?.resetIfUnreadable) {
+        throw err;
+      }
+      const { safeUser } = this.resolveVaultPath(username);
+      this.writeVaultPayload({ version: 1, username: safeUser, secrets: {} });
+      return false;
+    }
     if (!(envVar in payload.secrets)) {
       return false;
     }

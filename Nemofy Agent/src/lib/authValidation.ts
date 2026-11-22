@@ -1,7 +1,4 @@
 export const DEFAULT_ADMIN_USERNAME = 'admin';
-// SHA-256 of "nemofy:v1:admin:<default-password>" used only when running statically without a backend server.
-export const DEFAULT_STANDALONE_CREDENTIAL_DIGEST =
-  'e688a54ea5f2746cf997de26ca3e9929cdeab248f408705c719228f4543f6279';
 
 export interface ValidationResult {
   valid: boolean;
@@ -14,6 +11,27 @@ export function validateLoginInput(username: string, password: string): Validati
   }
   if (!password) {
     return { valid: false, error: 'Please enter your password.' };
+  }
+  return { valid: true };
+}
+
+export function validateInitialSetup(
+  username: string,
+  password: string,
+  confirmPassword: string,
+): ValidationResult {
+  const cleanUser = username.trim();
+  if (!cleanUser) {
+    return { valid: false, error: 'Please enter an administrator username.' };
+  }
+  if (!/^[a-zA-Z0-9._-]{2,32}$/.test(cleanUser)) {
+    return { valid: false, error: 'Username must be 2–32 characters (letters, numbers, ., _, -).' };
+  }
+  if (password.length < 8) {
+    return { valid: false, error: 'Password must be at least 8 characters.' };
+  }
+  if (password !== confirmPassword) {
+    return { valid: false, error: 'Password and confirmation do not match.' };
   }
   return { valid: true };
 }

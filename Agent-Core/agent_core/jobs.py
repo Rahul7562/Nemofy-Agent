@@ -8,7 +8,8 @@ import os
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -26,6 +27,34 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 current_progress_callback: ContextVar[ProgressCallback | None] = ContextVar(
     "current_progress_callback", default=None
 )
+current_job: ContextVar[AgentJob | None] = ContextVar("current_job", default=None)
+
+
+def get_current_job() -> AgentJob | None:
+    """Return the active AgentJob bound to the current async context, if any."""
+    return current_job.get()
+
+
+def get_active_timeout_seconds(default: float = DEFAULT_STALL_TIMEOUT_SECONDS) -> float:
+    """Return the active job's timeout budget, falling back to ``default`` outside async jobs."""
+    job = current_job.get()
+    if job is not None and job.stall_timeout_seconds > 0:
+        return float(job.stall_timeout_seconds)
+    return float(default)
+
+
+def _is_pid_alive(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def emit_progress(phase: str, **fields: Any) -> None:
@@ -37,6 +66,35 @@ def emit_progress(phase: str, **fields: Any) -> None:
         cb({"phase": phase, **fields})
     except Exception:  # noqa: BLE001
         logger.debug("Progress callback raised an exception", exc_info=True)
+
+
+@contextmanager
+def track_active_task(
+    kind: str,
+    label: str,
+    *,
+    task_id: str | None = None,
+    pid: int | None = None,
+    expected_seconds: float | None = None,
+    liveness_check: Callable[[], bool] | None = None,
+) -> Iterator[str]:
+    """Register an active tool/subagent/background process/timer on the current job so the stall watchdog keeps it alive."""
+    tid = task_id or f"{kind}-{uuid.uuid4().hex[:10]}"
+    job = current_job.get()
+    if job is not None:
+        job.register_active_task(
+            tid,
+            kind=kind,
+            label=label,
+            pid=pid,
+            expected_seconds=expected_seconds,
+            liveness_check=liveness_check,
+        )
+    try:
+        yield tid
+    finally:
+        if job is not None:
+            job.unregister_active_task(tid)
 
 
 class DynamicSkillSpec(BaseModel):
@@ -87,12 +145,84 @@ class AgentJob:
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     file_changes: list[dict[str, Any]] = field(default_factory=list)
     context_usage: dict[str, Any] | None = None
+    _active_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
     _update_event: asyncio.Event = field(default_factory=asyncio.Event)
     _runner_task: asyncio.Task[None] | None = None
     _watchdog_task: asyncio.Task[None] | None = None
 
     def signal_update(self) -> None:
         self._update_event.set()
+
+    def register_active_task(
+        self,
+        task_id: str,
+        *,
+        kind: str,
+        label: str,
+        pid: int | None = None,
+        expected_seconds: float | None = None,
+        liveness_check: Callable[[], bool] | None = None,
+    ) -> None:
+        now = time.monotonic()
+        self._active_tasks[task_id] = {
+            "id": task_id,
+            "kind": kind,
+            "label": str(label or kind)[:160],
+            "started_at_mono": now,
+            "pid": pid,
+            "expected_seconds": expected_seconds,
+            "liveness_check": liveness_check,
+        }
+        self.last_progress_at_mono = now
+        self.last_heartbeat_at_mono = now
+        self.signal_update()
+
+    def unregister_active_task(self, task_id: str) -> None:
+        if task_id in self._active_tasks:
+            self._active_tasks.pop(task_id, None)
+            now = time.monotonic()
+            # Grant a fresh progress timestamp when a long-running background task finishes
+            # so the subsequent LLM turn has a full stall timeout budget.
+            self.last_progress_at_mono = now
+            self.last_heartbeat_at_mono = now
+            self.signal_update()
+
+    def prune_dead_active_tasks(self) -> None:
+        dead_ids: list[str] = []
+        for tid, info in list(self._active_tasks.items()):
+            check = info.get("liveness_check")
+            alive = True
+            if callable(check):
+                try:
+                    alive = bool(check())
+                except Exception:  # noqa: BLE001
+                    alive = False
+            elif info.get("pid") is not None:
+                alive = _is_pid_alive(info.get("pid"))
+            if not alive:
+                dead_ids.append(tid)
+        for tid in dead_ids:
+            self._active_tasks.pop(tid, None)
+
+    def has_active_background_work(self) -> bool:
+        self.prune_dead_active_tasks()
+        return bool(self._active_tasks)
+
+    def get_active_tasks_summary(self) -> list[dict[str, Any]]:
+        self.prune_dead_active_tasks()
+        now = time.monotonic()
+        summary: list[dict[str, Any]] = []
+        for info in self._active_tasks.values():
+            entry: dict[str, Any] = {
+                "id": info["id"],
+                "kind": info["kind"],
+                "label": info["label"],
+                "elapsed_seconds": round(max(0.0, now - float(info["started_at_mono"])), 1),
+            }
+            if info.get("expected_seconds") is not None:
+                entry["expected_seconds"] = info["expected_seconds"]
+            summary.append(entry)
+        return summary
 
     def record_progress(self, event: dict[str, Any]) -> None:
         now = time.monotonic()
@@ -162,8 +292,16 @@ class AgentJob:
             else (detail if not thinking_delta and phase not in ("starting", "staged") else "")
         )
         if note_text:
-            last_text = self.activity_feed[-1]["text"] if self.activity_feed else None
-            if note_text != last_text:
+            last_entry = self.activity_feed[-1] if self.activity_feed else None
+            # Update repeating rate-limit or background-heartbeat entries in place so the feed stays tidy
+            if (
+                last_entry is not None
+                and phase in ("rate_limited", "background_task")
+                and last_entry.get("phase") == phase
+            ):
+                last_entry["text"] = note_text[:240]
+                last_entry["timestamp"] = datetime.now(UTC).isoformat()
+            elif last_entry is None or note_text != last_entry.get("text"):
                 self.activity_feed.append(
                     {
                         "id": f"act-{len(self.activity_feed) + 1}",
@@ -178,10 +316,15 @@ class AgentJob:
     def to_status_payload(self) -> dict[str, Any]:
         now = time.monotonic()
         end_ref = self.completed_at_mono if self.completed_at_mono is not None else now
+        active_tasks = self.get_active_tasks_summary()
         idle_seconds = (
-            max(0.0, now - self.last_progress_at_mono)
-            if self.status in ("running", "staged")
-            else 0.0
+            0.0
+            if active_tasks
+            else (
+                max(0.0, now - self.last_progress_at_mono)
+                if self.status in ("running", "staged")
+                else 0.0
+            )
         )
         thinking_parts = list(self.thinking_segments)
         if self.live_thinking_buffer.strip():
@@ -223,6 +366,7 @@ class AgentJob:
             "elapsed_seconds": round(max(0.0, end_ref - self.started_at_mono), 2),
             "idle_seconds": round(idle_seconds, 2),
             "stall_timeout_seconds": self.stall_timeout_seconds,
+            "active_tasks": active_tasks,
             "mcp_tools": list(self.mcp_tools),
             "dynamic_skills": list(self.dynamic_skills),
             "warnings": list(self.warnings),
@@ -315,6 +459,7 @@ class JobManager:
         job.record_progress({"phase": "starting", "detail": "LangGraph job started"})
 
         async def _run() -> None:
+            job_tok = current_job.set(job)
             try:
                 result = await runner(job)
                 if job.status in ("stalled", "cancelled"):
@@ -350,22 +495,46 @@ class JobManager:
                     job.completed_at_mono = time.monotonic()
                 job.signal_update()
             finally:
+                current_job.reset(job_tok)
                 if job._watchdog_task is not None and not job._watchdog_task.done():
                     job._watchdog_task.cancel()
 
         async def _watchdog() -> None:
             check_interval = min(1.0, max(0.05, job.stall_timeout_seconds / 4.0))
+            last_bg_heartbeat = time.monotonic()
             try:
                 while job.status == "running":
                     await asyncio.sleep(check_interval)
                     if job.status != "running":
                         break
-                    idle_s = time.monotonic() - job.last_progress_at_mono
+                    now_mono = time.monotonic()
+
+                    # Keep the agent alive whenever a real background task, timer,
+                    # running tool, or sub-agent is actively executing.
+                    if job.has_active_background_work():
+                        job.last_progress_at_mono = now_mono
+                        if (now_mono - last_bg_heartbeat) >= 5.0:
+                            last_bg_heartbeat = now_mono
+                            active_list = job.get_active_tasks_summary()
+                            if active_list:
+                                primary_task = active_list[0]
+                                extra_count = len(active_list) - 1
+                                suffix = f" (+{extra_count} more)" if extra_count > 0 else ""
+                                job.heartbeat_seq += 1
+                                job.last_heartbeat_at_mono = now_mono
+                                job.last_event = (
+                                    f"Running {primary_task['label']}{suffix} "
+                                    f"({primary_task['elapsed_seconds']:.0f}s elapsed)"
+                                )[:240]
+                                job.signal_update()
+                        continue
+
+                    idle_s = now_mono - job.last_progress_at_mono
                     if idle_s >= job.stall_timeout_seconds:
                         job.is_stalled = True
                         job.status = "stalled"
                         job.error = (
-                            f"Agent stalled: no forward progress for {idle_s:.1f}s "
+                            f"Agent stalled: no forward progress or active background tasks for {idle_s:.1f}s "
                             f"(limit={job.stall_timeout_seconds:.1f}s, phase={job.current_phase}, "
                             f"turn={job.turn_count}, last_event={job.last_event})."
                         )

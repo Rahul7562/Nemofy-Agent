@@ -206,6 +206,31 @@ function RoleConfigCard({
     });
   }
 
+  function handleCatalogLoaded(models: ProviderModelOption[]) {
+    const currentId = config.model.trim();
+    if (!currentId || models.length === 0) return;
+    const matched =
+      models.find((m) => m.id === currentId) ||
+      models.find((m) => m.id.toLowerCase() === currentId.toLowerCase());
+    if (!matched) return;
+    const nextCtx =
+      typeof matched.context_length === 'number' && matched.context_length > 0
+        ? Math.round(matched.context_length)
+        : config.context_window;
+    const nextOut =
+      typeof matched.max_output_tokens === 'number' && matched.max_output_tokens > 0
+        ? Math.round(matched.max_output_tokens)
+        : config.max_output_tokens;
+    if (nextCtx === config.context_window && nextOut === config.max_output_tokens) {
+      return;
+    }
+    onChange({
+      ...config,
+      context_window: nextCtx,
+      max_output_tokens: nextOut,
+    });
+  }
+
   const resolvedLimits = config.model.trim()
     ? resolveModelLimits(
         canonicalProvider,
@@ -327,6 +352,7 @@ function RoleConfigCard({
           value={config.model}
           onChange={handleModelChange}
           onSelectOption={handleSelectModelOption}
+          onCatalogLoaded={handleCatalogLoaded}
         />
       </div>
 
@@ -576,13 +602,13 @@ export function SettingsView({
   const [selectedSkillName, setSelectedSkillName] = useState<string | null>(null);
   const [skillDraftName, setSkillDraftName] = useState('');
   const [skillDraftContent, setSkillDraftContent] = useState('');
-  const [skillFeedback, setSkillFeedback] = useState<string | null>(null);
+  const [skillFeedback, setSkillFeedback] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
 
   const [mcpServers, setMcpServers] = useState<MCPServerItem[]>([]);
   const [newMcpName, setNewMcpName] = useState('');
   const [newMcpUrl, setNewMcpUrl] = useState('');
   const [newMcpTransport, setNewMcpTransport] = useState<'streamable_http' | 'sse'>('streamable_http');
-  const [mcpFeedback, setMcpFeedback] = useState<string | null>(null);
+  const [mcpFeedback, setMcpFeedback] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
 
   // Runtime & Remote URL State
   const [health, setHealth] = useState<AgentHealthResponse | null>(null);
@@ -871,27 +897,39 @@ export function SettingsView({
       setSkills(refreshed);
       setSelectedSkillName(saved.name);
       setSkillDraftName(saved.name);
-      setSkillFeedback(`Saved /Skills/${saved.filename}`);
+      setSkillFeedback({ type: 'ok', text: `Saved /Skills/${saved.filename}` });
     } catch (err) {
-      setSkillFeedback(err instanceof Error ? err.message : 'Unable to save skill.');
+      setSkillFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to save skill.',
+      });
     }
   }
 
   async function handleDeleteSkill(name: string) {
-    await deleteSkillDocument(name);
-    const refreshed = await fetchSkills();
-    setSkills(refreshed);
-    if (selectedSkillName === name) {
-      setSelectedSkillName(refreshed[0]?.name || null);
-      setSkillDraftName(refreshed[0]?.name || '');
-      setSkillDraftContent(refreshed[0]?.content || '');
+    setSkillFeedback(null);
+    try {
+      await deleteSkillDocument(name);
+      const refreshed = await fetchSkills();
+      setSkills(refreshed);
+      if (selectedSkillName === name) {
+        setSelectedSkillName(refreshed[0]?.name || null);
+        setSkillDraftName(refreshed[0]?.name || '');
+        setSkillDraftContent(refreshed[0]?.content || '');
+      }
+      setSkillFeedback({ type: 'ok', text: `Deleted skill "${name}"` });
+    } catch (err) {
+      setSkillFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to delete skill.',
+      });
     }
-    setSkillFeedback(`Deleted skill "${name}"`);
   }
 
   async function handleAddMcpServer(e: FormEvent) {
     e.preventDefault();
     if (!newMcpName.trim() || !newMcpUrl.trim()) return;
+    setMcpFeedback(null);
     const next: MCPServerItem[] = [
       ...mcpServers,
       {
@@ -902,23 +940,46 @@ export function SettingsView({
         timeout_seconds: 30,
       },
     ];
-    const saved = await saveMCPServers(next);
-    setMcpServers(saved);
-    setNewMcpName('');
-    setNewMcpUrl('');
-    setMcpFeedback('MCP server registry saved to /MCPs/servers.json.');
+    try {
+      const saved = await saveMCPServers(next);
+      setMcpServers(saved);
+      setNewMcpName('');
+      setNewMcpUrl('');
+      setMcpFeedback({ type: 'ok', text: 'MCP server registry saved to /MCPs/servers.json.' });
+    } catch (err) {
+      setMcpFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to save MCP server.',
+      });
+    }
   }
 
   async function handleToggleMcp(index: number) {
+    setMcpFeedback(null);
     const next = mcpServers.map((s, idx) => (idx === index ? { ...s, enabled: !s.enabled } : s));
-    const saved = await saveMCPServers(next);
-    setMcpServers(saved);
+    try {
+      const saved = await saveMCPServers(next);
+      setMcpServers(saved);
+    } catch (err) {
+      setMcpFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to update MCP server.',
+      });
+    }
   }
 
   async function handleDeleteMcp(index: number) {
+    setMcpFeedback(null);
     const next = mcpServers.filter((_, idx) => idx !== index);
-    const saved = await saveMCPServers(next);
-    setMcpServers(saved);
+    try {
+      const saved = await saveMCPServers(next);
+      setMcpServers(saved);
+    } catch (err) {
+      setMcpFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to remove MCP server.',
+      });
+    }
   }
 
   function handleSaveRemoteBackend(e: FormEvent) {
@@ -1584,7 +1645,12 @@ export function SettingsView({
                     />
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-xs text-[var(--jade)]">{skillFeedback || ''}</span>
+                    <span
+                      role={skillFeedback?.type === 'error' ? 'alert' : 'status'}
+                      className={`text-xs ${skillFeedback?.type === 'error' ? 'text-[var(--flare)] font-medium' : 'text-[var(--jade)]'}`}
+                    >
+                      {skillFeedback?.text || ''}
+                    </span>
                     <button
                       type="submit"
                       className="h-9 px-4 inline-flex items-center gap-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer"
@@ -1687,7 +1753,14 @@ export function SettingsView({
                   </button>
                 </div>
               </form>
-              {mcpFeedback && <p className="text-xs text-[var(--jade)]">{mcpFeedback}</p>}
+              {mcpFeedback && (
+                <p
+                  role={mcpFeedback.type === 'error' ? 'alert' : 'status'}
+                  className={`text-xs ${mcpFeedback.type === 'error' ? 'text-[var(--flare)] font-medium' : 'text-[var(--jade)]'}`}
+                >
+                  {mcpFeedback.text}
+                </p>
+              )}
             </section>
           </div>
         )}

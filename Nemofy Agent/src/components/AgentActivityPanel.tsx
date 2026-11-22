@@ -164,6 +164,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
 
   const thinking = isLive ? props.activity.thinking : props.thinking;
   const activityFeed = isLive ? props.activity.activityFeed || [] : [];
+  const activeTasks = isLive ? props.activity.activeTasks || [] : [];
   const toolEvents = isLive ? props.activity.toolEvents : props.toolEvents || [];
   const fileChanges = dedupeFileChanges(isLive ? props.activity.fileChanges : props.fileChanges);
 
@@ -258,8 +259,16 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
         >
           {isLive ? (
             <span className="relative flex h-2.5 w-2.5 shrink-0">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--signal)] opacity-60" />
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-[var(--signal)]" />
+              <span
+                className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-60 ${
+                  livePhase === 'rate_limited' ? 'bg-[var(--honey)]' : 'bg-[var(--signal)]'
+                }`}
+              />
+              <span
+                className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
+                  livePhase === 'rate_limited' ? 'bg-[var(--honey)]' : 'bg-[var(--signal)]'
+                }`}
+              />
             </span>
           ) : (
             <Brain className="w-3.5 h-3.5 text-[var(--signal)] shrink-0" />
@@ -421,6 +430,30 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                       <span className="truncate">
                         {formatPhaseLabel(props.activity.currentPhase, props.activity.lastEvent)}
                       </span>
+                    </div>
+                  )}
+
+                  {isLive && activeTasks.length > 0 && (
+                    <div
+                      data-testid="live-active-tasks"
+                      className="pt-1.5 border-t border-[var(--rule)]/60 space-y-1"
+                    >
+                      {activeTasks.slice(0, 3).map((task) => (
+                        <div
+                          key={task.id}
+                          className="flex items-center justify-between gap-2 text-[11px] text-[var(--ink-soft)]"
+                        >
+                          <span className="inline-flex items-center gap-1.5 min-w-0">
+                            <Loader2 className="w-3 h-3 text-[var(--jade)] animate-spin shrink-0" />
+                            <span className="font-mono truncate" title={task.label}>
+                              {task.label}
+                            </span>
+                          </span>
+                          <span className="font-mono text-[10px] text-[var(--ink-faint)] shrink-0">
+                            {formatElapsedSeconds(task.elapsed_seconds)}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>

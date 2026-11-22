@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 
 export type MediaModality = 'image' | 'video' | 'audio';
@@ -521,19 +522,63 @@ export class WorkspaceAndConfigStore {
   // ---------------------------------------------------------------------------
   // Workspace Filesystem (confined strictly inside ./workspace)
   // ---------------------------------------------------------------------------
+  private getWorkspaceRealDir(): string {
+    fs.mkdirSync(this.workspaceDir, { recursive: true });
+    return fs.realpathSync(this.workspaceDir);
+  }
+
   resolveWorkspacePath(relPath: string, allowRoot = false): string {
+    const wsReal = this.getWorkspaceRealDir();
     const clean = (relPath || '').trim().replace(/^\/workspace\/?/, '').replace(/^\/+/, '');
     if (!clean || clean === '.') {
-      if (allowRoot) return this.workspaceDir;
+      if (allowRoot) return wsReal;
       throw new Error('A file or folder path inside /workspace is required.');
     }
-    if (clean.includes('\0') || clean.split('/').includes('..')) {
+    const segments = clean.split(/[/\\]+/).filter(Boolean);
+    if (clean.includes('\0') || segments.includes('..')) {
       throw new Error('Path traversal outside /workspace is not allowed.');
     }
-    const target = path.resolve(this.workspaceDir, clean);
-    if (target !== this.workspaceDir && !target.startsWith(this.workspaceDir + path.sep)) {
+    const target = path.resolve(wsReal, ...segments);
+    if (target !== wsReal && !target.startsWith(wsReal + path.sep)) {
       throw new Error('Resolved path escapes /workspace.');
     }
+
+    // Walk every path segment to reject symbolic links escaping /workspace
+    let current = wsReal;
+    for (const seg of segments) {
+      current = path.join(current, seg);
+      if (fs.existsSync(current)) {
+        const lstat = fs.lstatSync(current);
+        if (lstat.isSymbolicLink()) {
+          const realTarget = fs.realpathSync(current);
+          if (realTarget !== wsReal && !realTarget.startsWith(wsReal + path.sep)) {
+            throw new Error('Symbolic link target escapes /workspace.');
+          }
+        }
+      } else {
+        // Also catch broken symlinks (existsSync is false, lstatSync succeeds)
+        try {
+          const lstat = fs.lstatSync(current);
+          if (lstat.isSymbolicLink()) {
+            throw new Error('Symbolic link target escapes /workspace.');
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.includes('Symbolic link')) {
+            throw err;
+          }
+        }
+        break;
+      }
+    }
+
+    if (fs.existsSync(target)) {
+      const realResolved = fs.realpathSync(target);
+      if (realResolved !== wsReal && !realResolved.startsWith(wsReal + path.sep)) {
+        throw new Error('Resolved path escapes /workspace.');
+      }
+      return realResolved;
+    }
+
     return target;
   }
 
@@ -736,13 +781,36 @@ export class WorkspaceAndConfigStore {
     };
   }
 
-  writeWorkspaceFile(relPath: string, content: string): { path: string; size: number; modifiedAt: string } {
+  writeWorkspaceFile(
+    relPath: string,
+    content: string,
+    options: { createOnly?: boolean } = {},
+  ): { path: string; size: number; modifiedAt: string } {
     const full = this.resolveWorkspacePath(relPath);
+    const wsReal = this.getWorkspaceRealDir();
     fs.mkdirSync(path.dirname(full), { recursive: true });
-    fs.writeFileSync(full, content, 'utf-8');
+    // Re-verify parent realpath after mkdirSync before writing
+    const parentReal = fs.realpathSync(path.dirname(full));
+    if (parentReal !== wsReal && !parentReal.startsWith(wsReal + path.sep)) {
+      throw new Error('Resolved parent path escapes /workspace.');
+    }
+    if (options.createOnly) {
+      try {
+        fs.writeFileSync(full, content, { encoding: 'utf-8', flag: 'wx' });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') {
+          const conflictErr = new Error(`File already exists: /workspace/${relPath}`) as NodeJS.ErrnoException;
+          conflictErr.code = 'EEXIST';
+          throw conflictErr;
+        }
+        throw err;
+      }
+    } else {
+      fs.writeFileSync(full, content, 'utf-8');
+    }
     const stat = fs.statSync(full);
     return {
-      path: path.relative(this.workspaceDir, full).replace(/\\/g, '/'),
+      path: path.relative(wsReal, full).replace(/\\/g, '/'),
       size: stat.size,
       modifiedAt: stat.mtime.toISOString(),
     };
@@ -1016,12 +1084,66 @@ export class WorkspaceAndConfigStore {
     }
   }
 
+  private static validateMcpServerUrl(rawUrl: string): string {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      throw new Error(`Invalid MCP server URL: ${rawUrl}`);
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error(`MCP server URL must use http:// or https://: ${rawUrl}`);
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error('MCP server URL must not contain embedded credentials.');
+    }
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (
+      !host ||
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal') ||
+      host === 'metadata.google.internal'
+    ) {
+      throw new Error(`MCP server URL targets a restricted or local host: ${host}`);
+    }
+    if (net.isIPv4(host)) {
+      const [a, b] = host.split('.').map(Number);
+      if (
+        a === 0 ||
+        a === 10 ||
+        a === 127 ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 100 && b >= 64 && b <= 127) ||
+        a >= 224
+      ) {
+        throw new Error(`MCP server URL targets a private, loopback, or metadata IP: ${host}`);
+      }
+    } else if (net.isIPv6(host)) {
+      const first = parseInt(host.split(':')[0] || '0', 16);
+      if (
+        host === '::' ||
+        host === '::1' ||
+        host.startsWith('::ffff:') ||
+        (first & 0xfe00) === 0xfc00 ||
+        (first & 0xffc0) === 0xfe80 ||
+        (first & 0xff00) === 0xff00
+      ) {
+        throw new Error(`MCP server URL targets a private, loopback, or metadata IP: ${host}`);
+      }
+    }
+    return rawUrl;
+  }
+
   saveMCPServers(servers: MCPServerItem[]): MCPServerItem[] {
     const clean = servers
       .filter((s) => s && typeof s.name === 'string' && s.name.trim() && typeof s.url === 'string' && s.url.trim())
       .map((s) => ({
         name: s.name.trim(),
-        url: s.url.trim(),
+        url: WorkspaceAndConfigStore.validateMcpServerUrl(s.url.trim()),
         transport: (s.transport === 'sse' ? 'sse' : 'streamable_http') as 'streamable_http' | 'sse',
         enabled: s.enabled !== false,
         timeout_seconds: Math.max(2, Math.min(180, Number(s.timeout_seconds) || 30)),
@@ -1044,6 +1166,16 @@ export class WorkspaceAndConfigStore {
   }
 
   saveThreads(threads: ChatThreadRecord[]): void {
-    fs.writeFileSync(this.threadsPath, JSON.stringify(threads, null, 2) + '\n', 'utf-8');
+    fs.mkdirSync(path.dirname(this.threadsPath), { recursive: true });
+    const tmpPath = `${this.threadsPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(threads, null, 2) + '\n', 'utf-8');
+    fs.renameSync(tmpPath, this.threadsPath);
+  }
+
+  updateThreads<T>(mutator: (threads: ChatThreadRecord[]) => T): T {
+    const fresh = this.listThreads();
+    const result = mutator(fresh);
+    this.saveThreads(fresh);
+    return result;
   }
 }

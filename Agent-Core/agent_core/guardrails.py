@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -76,7 +77,211 @@ DESTRUCTIVE_BASH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "External HTTP mutation via wget",
     ),
+    (
+        re.compile(r"\bfind\b[^\n]*(?:-delete|-exec|-execdir|-ok|-okdir)\b", re.IGNORECASE),
+        "Destructive or arbitrary execution via find",
+    ),
+    (
+        re.compile(r"\bcurl\b[^\n]*(?:-F\s|--form\b|-T\s)", re.IGNORECASE),
+        "External HTTP upload via curl",
+    ),
 )
+
+SAFE_READONLY_BASH_COMMANDS: frozenset[str] = frozenset(
+    {
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "pwd",
+        "echo",
+        "printf",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "diff",
+        "stat",
+        "file",
+        "which",
+        "whoami",
+        "id",
+        "uname",
+        "date",
+        "env",
+        "printenv",
+        "tree",
+        "du",
+        "df",
+        "ps",
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",
+        "md5sum",
+        "sha256sum",
+        "jq",
+        "true",
+        "false",
+        "test",
+        "find",
+        "sed",
+        "git",
+    }
+)
+
+SAFE_READONLY_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "describe", "tag"}
+)
+
+
+def _split_shell_segments(cmd: str) -> list[str] | None:
+    """Split a shell command on |, &&, ||, ; outside quotes. Returns None on unsafe metachars."""
+    segments: list[str] = []
+    buf: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(cmd)
+
+    while i < n:
+        ch = cmd[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            buf.append(ch)
+            i += 1
+            continue
+
+        if in_double:
+            if ch == "\\" and i + 1 < n:
+                buf.append(ch)
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == "`" or (ch == "$" and i + 1 < n and cmd[i + 1] == "("):
+                return None
+            if ch == '"':
+                in_double = False
+            buf.append(ch)
+            i += 1
+            continue
+
+        # Unquoted context
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(cmd[i + 1])
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in ("\n", "\r", "`", ">"):
+            return None
+        if ch == "$" and i + 1 < n and cmd[i + 1] == "(":
+            return None
+        if ch == "<" and i + 1 < n and cmd[i + 1] in ("(", ">"):
+            return None
+        if ch == "&":
+            if i + 1 < n and cmd[i + 1] == "&":
+                segments.append("".join(buf).strip())
+                buf = []
+                i += 2
+                continue
+            return None
+        if ch == "|":
+            if i + 1 < n and cmd[i + 1] == "|":
+                segments.append("".join(buf).strip())
+                buf = []
+                i += 2
+                continue
+            segments.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        if ch == ";":
+            segments.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    if in_single or in_double:
+        return None
+    tail = "".join(buf).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _is_readonly_safe_bash(cmd: str) -> tuple[bool, str]:
+    """Fail-closed check: return (True, reason) ONLY for strictly read-only shell commands."""
+    stripped = cmd.strip()
+    if not stripped:
+        return True, "Empty command."
+
+    segments = _split_shell_segments(stripped)
+    if not segments:
+        return (
+            False,
+            "Shell redirection, command substitution, background execution, or complex syntax requires approval.",
+        )
+
+    for seg in segments:
+        if not seg:
+            continue
+        try:
+            argv = shlex.split(seg)
+        except ValueError:
+            return False, "Unparseable shell quoting requires approval."
+        if not argv:
+            continue
+
+        binary = argv[0]
+        if "/" in binary:
+            if binary.startswith(("/bin/", "/usr/bin/")):
+                binary = binary.rsplit("/", 1)[-1]
+            else:
+                return False, f"Executing binary path '{argv[0]}' requires approval."
+
+        if binary not in SAFE_READONLY_BASH_COMMANDS:
+            return (
+                False,
+                f"Shell command '{binary}' may mutate files, execute code, or access the network and requires approval.",
+            )
+
+        args = argv[1:]
+        if binary == "sed":
+            for arg in args:
+                if arg == "--in-place" or arg.startswith("--in-place=") or re.match(r"^-[a-zA-Z]*i", arg):
+                    return False, "In-place file editing with sed requires approval."
+        elif binary == "find":
+            for arg in args:
+                if arg in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf", "-fprint0"):
+                    return False, f"find option '{arg}' can mutate files or run commands and requires approval."
+        elif binary == "git":
+            subcmd = next((a for a in args if not a.startswith("-")), "")
+            if subcmd not in SAFE_READONLY_GIT_SUBCOMMANDS:
+                return False, f"git subcommand '{subcmd or '(none)'}' requires approval."
+            for arg in args:
+                if arg in ("-c", "--config") or arg.startswith("--config="):
+                    return False, "git config override requires approval."
+
+    return True, "Read-only allowlisted sandbox shell inspection inside /workspace."
 
 
 @dataclass(frozen=True)
@@ -139,10 +344,18 @@ def classify_tool_call(
                     risk_reason=f"Destructive or mutating shell command detected: {reason}",
                     expected_effect=_describe_expected_effect(tool_name, args),
                 )
+        is_safe, reason = _is_readonly_safe_bash(cmd)
+        if not is_safe:
+            return ToolClassification(
+                tool_name=tool_name,
+                safety_level="SENSITIVE",
+                risk_reason=reason,
+                expected_effect=_describe_expected_effect(tool_name, args),
+            )
         return ToolClassification(
             tool_name=tool_name,
             safety_level="SAFE",
-            risk_reason="Non-destructive sandbox shell execution inside /workspace.",
+            risk_reason=reason,
             expected_effect=_describe_expected_effect(tool_name, args),
         )
 

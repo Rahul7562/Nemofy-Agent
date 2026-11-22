@@ -41,6 +41,10 @@ test('resolveModelContextWindow returns model-specific context limits and prefer
     source: 'model_registry',
   });
   assert.deepEqual(resolveModelContextWindow('anthropic', 'claude-opus-4-6'), {
+    contextWindow: 1_000_000,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('anthropic', 'claude-opus-4-5'), {
     contextWindow: 200_000,
     source: 'model_registry',
   });
@@ -48,8 +52,32 @@ test('resolveModelContextWindow returns model-specific context limits and prefer
     contextWindow: 400_000,
     source: 'model_registry',
   });
+  assert.deepEqual(resolveModelContextWindow('openai', 'gpt-5.6-luna'), {
+    contextWindow: 1_050_000,
+    source: 'model_registry',
+  });
   assert.deepEqual(resolveModelContextWindow('river_ai', 'deepseek-ai/DeepSeek-V4.1-Flash'), {
-    contextWindow: 128_000,
+    contextWindow: 1_048_576,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('nvidia', 'minimaxai/minimax-m3.1-flash'), {
+    contextWindow: 1_048_576,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('nvidia', 'mistralai/mistral-large-4-1t-a52b'), {
+    contextWindow: 1_048_576,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('nvidia', 'google/gemma-4-31b-it'), {
+    contextWindow: 262_144,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('river_ai', 'GLM-5.3'), {
+    contextWindow: 1_048_576,
+    source: 'model_registry',
+  });
+  assert.deepEqual(resolveModelContextWindow('river_ai', 'Qwen/Qwen3.8-27B-FP8'), {
+    contextWindow: 1_024_000,
     source: 'model_registry',
   });
   assert.deepEqual(resolveModelContextWindow('ollama', 'my-custom-local-model'), {
@@ -73,20 +101,20 @@ test('resolveModelMaxOutputTokens and resolveModelLimits return exact model-spec
   assert.equal(gpt52.contextWindow, 400_000);
   assert.equal(gpt52.maxOutputTokens, 128_000);
 
-  // Claude Opus 4.6 -> 200k total / 128k out
+  // Claude Opus 4.6 -> 1M total / 128k out
   const opus46 = resolveModelLimits('anthropic', 'claude-opus-4-6');
-  assert.equal(opus46.contextWindow, 200_000);
+  assert.equal(opus46.contextWindow, 1_000_000);
   assert.equal(opus46.maxOutputTokens, 128_000);
 
-  // Kimi K3 -> 256k total / 32,768 out
+  // Kimi K3 -> 1M total / 131,072 out
   const kimi = resolveModelLimits('river_ai', 'moonshotai/Kimi-K3.1-Pro');
-  assert.equal(kimi.contextWindow, 256_000);
-  assert.equal(kimi.maxOutputTokens, 32_768);
+  assert.equal(kimi.contextWindow, 1_048_576);
+  assert.equal(kimi.maxOutputTokens, 131_072);
 
-  // DeepSeek V4 -> 128k total / 32,768 out vs DeepSeek Chat -> 128k total / 8,192 out
+  // DeepSeek V4 -> 1M total / 131,072 out vs DeepSeek Chat -> 128k total / 8,192 out
   const dsv4 = resolveModelLimits('river_ai', 'deepseek-ai/DeepSeek-V4.1-Flash');
-  assert.equal(dsv4.contextWindow, 128_000);
-  assert.equal(dsv4.maxOutputTokens, 32_768);
+  assert.equal(dsv4.contextWindow, 1_048_576);
+  assert.equal(dsv4.maxOutputTokens, 131_072);
   assert.deepEqual(resolveModelMaxOutputTokens('deepseek', 'deepseek-chat'), {
     maxOutputTokens: 8_192,
     source: 'model_registry',
@@ -120,8 +148,8 @@ test('classifyContextUsage enforces strict 80% Auto-Compacting threshold and tie
 
 test('rescaleSnapshotForModel adapts saved thread usage dynamically when user switches Primary model', () => {
   const baseSnapshot: ContextUsageSnapshot = {
-    model: 'deepseek-ai/DeepSeek-V4.1-Flash',
-    provider: 'river_ai',
+    model: 'deepseek-chat',
+    provider: 'deepseek',
     context_window: 128_000,
     context_window_source: 'model_registry',
     used_tokens: 102_400, // 80.0% of 128k
@@ -148,8 +176,8 @@ test('rescaleSnapshotForModel adapts saved thread usage dynamically when user sw
   assert.equal(onGemini.classification.level, 'optimal');
   assert.equal(onGemini.categories.length, 7);
 
-  // Switch to 200k Claude Sonnet 4.6 -> 102.4k tokens is 51.2% Moderate, max output updates to 64,000
-  const onClaude = rescaleSnapshotForModel(baseSnapshot, 'anthropic', 'claude-sonnet-4-6');
+  // Switch to 200k Claude Haiku 4.5 -> 102.4k tokens is 51.2% Moderate, max output updates to 64,000
+  const onClaude = rescaleSnapshotForModel(baseSnapshot, 'anthropic', 'claude-haiku-4-5');
   assert.equal(onClaude.context_window, 200_000);
   assert.equal(onClaude.max_output_tokens, 64_000);
   assert.equal(onClaude.usage_percent, 51.2);
@@ -203,7 +231,7 @@ test('computeModelContextUsage estimates all 7 categories for threads without ba
     llmConfig: makeConfig('claude-opus-4-6', 'anthropic'),
   });
 
-  assert.equal(snap.context_window, 200_000);
+  assert.equal(snap.context_window, 1_000_000);
   assert.equal(snap.max_output_tokens, 128_000);
   assert.equal(snap.configured_max_tokens, 16_384);
   assert.equal(snap.categories.length, 7);

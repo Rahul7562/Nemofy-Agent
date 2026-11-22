@@ -44,7 +44,12 @@ from agent_core.context_manager import (
     utc_now_iso,
 )
 from agent_core.guardrails import execute_tool_with_guardrails, normalize_tool_arguments
-from agent_core.jobs import ProgressCallback, current_progress_callback, emit_progress
+from agent_core.jobs import (
+    ProgressCallback,
+    current_progress_callback,
+    emit_progress,
+    track_active_task,
+)
 from agent_core.models import (
     ModelConfigurationError,
     ModelOverride,
@@ -52,6 +57,7 @@ from agent_core.models import (
     build_chat_model,
     get_primary_model,
     get_worker_model,
+    invoke_with_rate_limit_retry,
     load_model_spec,
     resolve_accessory_model_spec,
     resolve_model_spec_with_override,
@@ -555,15 +561,20 @@ class AgentRuntime:
                     "error": resolve_err or "Accessory unavailable",
                 }
             else:
-                report = await run_accessory_media_subagent(
-                    modality=modality,
-                    attachments=mod_atts,
-                    user_task=user_prompt,
-                    model=acc_model_obj,
-                    provider_label=acc_provider,
-                    model_label=acc_model_name,
-                    allowed_uploads_dir=allowed_uploads_dir,
-                )
+                with track_active_task(
+                    "subagent",
+                    f"{modality.title()} Accessory ({acc_model_name})",
+                    task_id=ev_id,
+                ):
+                    report = await run_accessory_media_subagent(
+                        modality=modality,
+                        attachments=mod_atts,
+                        user_task=user_prompt,
+                        model=acc_model_obj,
+                        provider_label=acc_provider,
+                        model_label=acc_model_name,
+                        allowed_uploads_dir=allowed_uploads_dir,
+                    )
 
             done_event = {
                 "id": ev_id,
@@ -732,6 +743,19 @@ class AgentRuntime:
         act_tok = current_run_activity.set(run_activity)
         prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
         try:
+            decision_label = (
+                str(decision.get("decision") or "approve")
+                if isinstance(decision, dict)
+                else str(decision)
+            )
+            emit_progress(
+                "resuming_approval",
+                detail=(
+                    "Approval received — executing approved action..."
+                    if decision_label in ("approve", "edit")
+                    else "Rejection received — updating plan..."
+                ),
+            )
             config = self.make_config(thread_id)
             await self.graph.ainvoke(Command(resume=decision), config=config)
             result = await self.inspect_thread(thread_id)
@@ -1730,12 +1754,21 @@ def build_supervisor_graph(
             base_model_obj: Any,
             prompt_msgs: list[BaseMessage],
         ) -> AIMessage:
-            try:
-                reply = await _invoke_model_with_live_thinking(
-                    bound_candidate,
-                    prompt_msgs,
+            model_label = active_model_name or "primary model"
+
+            async def _invoke_once(target_bound: Any) -> AIMessage:
+                return await invoke_with_rate_limit_retry(
+                    lambda: _invoke_model_with_live_thinking(
+                        target_bound,
+                        prompt_msgs,
+                        turn_count=turn_count,
+                    ),
+                    label=model_label,
                     turn_count=turn_count,
                 )
+
+            try:
+                reply = await _invoke_once(bound_candidate)
             except GraphInterrupt:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1761,11 +1794,7 @@ def build_supervisor_graph(
                         if hasattr(fallback_model, "bind_tools")
                         else fallback_model
                     )
-                    reply = await _invoke_model_with_live_thinking(
-                        fallback_bound,
-                        prompt_msgs,
-                        turn_count=turn_count,
-                    )
+                    reply = await _invoke_once(fallback_bound)
                 else:
                     raise
             if not isinstance(reply, AIMessage):
@@ -2107,13 +2136,44 @@ def build_supervisor_graph(
             "error": None,
         }
 
+    def _find_pending_tool_calls(
+        messages: list[BaseMessage],
+    ) -> tuple[AIMessage | None, list[tuple[int, dict[str, Any]]], set[str]]:
+        last_ai_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], AIMessage):
+                last_ai_idx = i
+                break
+        if last_ai_idx < 0:
+            return None, [], set()
+        last_ai_msg = messages[last_ai_idx]
+        assert isinstance(last_ai_msg, AIMessage)
+        raw_tcs = list(getattr(last_ai_msg, "tool_calls", None) or [])
+        if not raw_tcs:
+            return last_ai_msg, [], set()
+        answered: set[str] = set()
+        for msg in messages[last_ai_idx + 1 :]:
+            if isinstance(msg, ToolMessage):
+                tid = getattr(msg, "tool_call_id", None)
+                if tid is not None:
+                    answered.add(str(tid))
+        pending: list[tuple[int, dict[str, Any]]] = []
+        for idx, tc in enumerate(raw_tcs):
+            tc_id = str(tc.get("id") or f"call-{idx}")
+            if tc_id not in answered:
+                pending.append((idx, tc))
+        return last_ai_msg, pending, answered
+
     async def act_node(state: AgentState) -> dict[str, Any]:
         messages = list(state.get("messages", []))
-        last_ai = _latest_ai_message(messages)
+        last_ai, pending_calls, answered_ids = _find_pending_tool_calls(messages)
         tool_calls = getattr(last_ai, "tool_calls", None) or [] if last_ai else []
 
         if not tool_calls:
             return {"last_observations": [], "pending_approval": None}
+
+        if not pending_calls:
+            return {"pending_approval": None}
 
         active_tools = _active_tools_map()
         active_mcp_names = _active_mcp_names()
@@ -2123,10 +2183,15 @@ def build_supervisor_graph(
         thread_id = str(state.get("thread_id") or "default")
         ws_dir = resolved_sandbox.get_session_workspace(thread_id)
 
+        # Execute exactly one pending tool call per LangGraph checkpoint step so a subsequent
+        # tool raising GraphInterrupt never replays already-completed earlier tools on resume.
         tool_messages: list[ToolMessage] = []
-        observations: list[dict[str, Any]] = []
+        observations: list[dict[str, Any]] = (
+            list(state.get("last_observations", [])) if answered_ids else []
+        )
+        is_final_pending_call = len(pending_calls) == 1
 
-        for idx, tc in enumerate(tool_calls):
+        for idx, tc in pending_calls[:1]:
             tc_name = str(tc.get("name", "")).strip()
             tc_args = normalize_tool_arguments(tc_name, tc.get("args"))
             tc_id = str(tc.get("id") or f"call-{idx}")
@@ -2182,13 +2247,19 @@ def build_supervisor_graph(
             )
 
             before_snap = _snapshot_workspace(ws_dir)
+            tool_task_label = f"{tc_name} ({args_summary})" if args_summary else tc_name
             try:
-                raw_output, audit = await execute_tool_with_guardrails(
-                    tool_obj,
-                    tc_args,
-                    is_mcp_tool=(tc_name in active_mcp_names),
-                    source="supervisor",
-                )
+                with track_active_task(
+                    "mcp" if tc_name in active_mcp_names else "tool",
+                    tool_task_label,
+                    task_id=f"tool-{tc_id}",
+                ):
+                    raw_output, audit = await execute_tool_with_guardrails(
+                        tool_obj,
+                        tc_args,
+                        is_mcp_tool=(tc_name in active_mcp_names),
+                        source="supervisor",
+                    )
             except GraphInterrupt:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -2302,7 +2373,7 @@ def build_supervisor_graph(
             if last_ai is not None
             else None
         )
-        if isinstance(dropped_invalid, list) and dropped_invalid and tool_messages:
+        if is_final_pending_call and isinstance(dropped_invalid, list) and dropped_invalid and tool_messages:
             note = (
                 "\n\n[SYSTEM NOTE: Additional tool call(s) in the same turn were skipped due to "
                 f"malformed JSON arguments: {', '.join(str(x) for x in dropped_invalid)}. "
@@ -2449,6 +2520,14 @@ def build_supervisor_graph(
             "messages": [AIMessage(content=summary)],
         }
 
+    def route_after_act(state: AgentState) -> Literal["act", "observe"]:
+        _last_ai, pending_calls, _answered = _find_pending_tool_calls(
+            list(state.get("messages", []))
+        )
+        if pending_calls:
+            return "act"
+        return "observe"
+
     def route_after_reflect(state: AgentState) -> Literal["plan", "response"]:
         if state.get("next_action") == "continue":
             return "plan"
@@ -2463,7 +2542,11 @@ def build_supervisor_graph(
 
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "act")
-    builder.add_edge("act", "observe")
+    builder.add_conditional_edges(
+        "act",
+        route_after_act,
+        {"act": "act", "observe": "observe"},
+    )
     builder.add_edge("observe", "reflect")
     builder.add_conditional_edges(
         "reflect",

@@ -111,11 +111,15 @@ async def test_bash_command_timeout_and_host_escape_blocking(
     assert res.timed_out is True
     assert res.exit_code == 124
 
-    # Host escape command blocked
+    # Host escape, traversal, sensitive file, and symlink commands blocked
     with pytest.raises(SandboxSecurityError):
         await mgr.exec_command("cat /etc/passwd")
     with pytest.raises(SandboxSecurityError):
         await mgr.exec_command("ls /var/run/docker.sock")
+    with pytest.raises(SandboxSecurityError):
+        await mgr.exec_command("cat ../data/auth.json")
+    with pytest.raises(SandboxSecurityError):
+        await mgr.exec_command("ln -s /etc/hosts leak.txt")
 
     # Secrets stripped from subprocess environment
     env_res = await mgr.exec_command("env")
