@@ -39,7 +39,7 @@ function renderInlineTokens(tokens: InlineToken[], isUser: boolean) {
     switch (tok.type) {
       case 'bold':
         return (
-          <strong key={idx} className="font-semibold">
+          <strong key={idx} className="font-semibold text-[var(--ink)]">
             {tok.value}
           </strong>
         );
@@ -51,7 +51,7 @@ function renderInlineTokens(tokens: InlineToken[], isUser: boolean) {
         );
       case 'boldItalic':
         return (
-          <strong key={idx} className="font-semibold italic">
+          <strong key={idx} className="font-semibold italic text-[var(--ink)]">
             {tok.value}
           </strong>
         );
@@ -65,10 +65,8 @@ function renderInlineTokens(tokens: InlineToken[], isUser: boolean) {
         return (
           <code
             key={idx}
-            className={`px-1.5 py-0.5 rounded font-mono text-[12px] ${
-              isUser
-                ? 'bg-white/20 text-white'
-                : 'bg-[var(--paper-sunk)] border border-[var(--rule)] text-[var(--signal)]'
+            className={`px-1.5 py-0.5 rounded font-mono text-[12.5px] border border-[var(--rule)] text-[var(--signal)] ${
+              isUser ? 'bg-[var(--paper)]' : 'bg-[var(--paper-sunk)]'
             }`}
           >
             {tok.value}
@@ -82,9 +80,7 @@ function renderInlineTokens(tokens: InlineToken[], isUser: boolean) {
             href={tok.href}
             target={isExternal ? '_blank' : undefined}
             rel={isExternal ? 'noopener noreferrer' : undefined}
-            className={`underline underline-offset-2 ${
-              isUser ? 'text-white hover:text-white/80' : 'text-[var(--signal)] hover:opacity-80'
-            }`}
+            className="underline underline-offset-2 text-[var(--signal)] hover:opacity-80"
           >
             {tok.label}
           </a>
@@ -121,18 +117,16 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
     case 'heading': {
       const sizeClass =
         block.level === 1
-          ? 'text-lg font-semibold mt-4 mb-2'
+          ? 'text-lg font-semibold mt-5 mb-2'
           : block.level === 2
-            ? 'text-base font-semibold mt-3.5 mb-1.5'
+            ? 'text-base font-semibold mt-4 mb-1.5'
             : block.level === 3
-              ? 'text-sm font-semibold mt-3 mb-1'
-              : 'text-xs font-semibold uppercase tracking-wide mt-2.5 mb-1';
+              ? 'text-[15px] font-semibold mt-3.5 mb-1'
+              : 'text-xs font-semibold uppercase tracking-wide mt-3 mb-1';
       return (
         <div
           key={idx}
-          className={`font-display tracking-tight ${sizeClass} ${
-            isUser ? 'text-white' : 'text-[var(--ink)]'
-          }`}
+          className={`font-display tracking-tight text-[var(--ink)] first:mt-0 ${sizeClass}`}
         >
           <InlineText text={block.text} isUser={isUser} />
         </div>
@@ -141,27 +135,20 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
 
     case 'paragraph':
       return (
-        <p key={idx} className="leading-relaxed my-2 first:mt-0 last:mb-0">
+        <p key={idx} className="leading-[1.68] my-2.5 first:mt-0 last:mb-0">
           <InlineText text={block.text} isUser={isUser} />
         </p>
       );
 
     case 'hr':
-      return (
-        <hr
-          key={idx}
-          className={`my-3.5 border-t ${isUser ? 'border-white/25' : 'border-[var(--rule)]'}`}
-        />
-      );
+      return <hr key={idx} className="my-4 border-t border-[var(--rule)]" />;
 
     case 'blockquote':
       return (
         <blockquote
           key={idx}
-          className={`my-2.5 pl-3.5 py-1 border-l-2 text-[13px] ${
-            isUser
-              ? 'border-white/50 text-white/90'
-              : 'border-[var(--signal)]/50 bg-[var(--paper-sunk)]/60 rounded-r-lg pr-3 text-[var(--ink-soft)]'
+          className={`my-3 px-4 py-2.5 rounded-xl border border-[var(--rule)] text-[13.5px] text-[var(--ink-soft)] ${
+            isUser ? 'bg-[var(--paper)]/70' : 'bg-[var(--paper-sunk)]/65'
           }`}
         >
           {block.lines.map((line, i) => (
@@ -178,7 +165,7 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
       return (
         <ListTag
           key={idx}
-          className={`my-2 space-y-1.5 ${
+          className={`my-2.5 space-y-1.5 ${
             hasCheckboxes
               ? 'list-none pl-0'
               : block.ordered
@@ -187,13 +174,13 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
           }`}
         >
           {block.items.map((item, i) => (
-            <li key={i} className="leading-relaxed">
+            <li key={i} className="leading-[1.65]">
               {item.checked !== undefined ? (
                 <span className="inline-flex items-start gap-2">
                   {item.checked ? (
-                    <CheckSquare className="w-4 h-4 text-[var(--jade)] shrink-0 mt-0.5" />
+                    <CheckSquare className="w-4 h-4 text-[var(--jade)] shrink-0 mt-1" />
                   ) : (
-                    <Square className="w-4 h-4 text-[var(--ink-faint)] shrink-0 mt-0.5" />
+                    <Square className="w-4 h-4 text-[var(--ink-faint)] shrink-0 mt-1" />
                   )}
                   <span className={item.checked ? 'line-through opacity-75' : ''}>
                     <InlineText text={item.text} isUser={isUser} />
@@ -212,9 +199,9 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
       return (
         <div
           key={idx}
-          className="my-3 rounded-lg border border-[var(--rule)] bg-[var(--paper)] overflow-hidden"
+          className="my-3.5 rounded-xl border border-[var(--rule)] bg-[var(--paper)] overflow-hidden"
         >
-          <div className="px-3 py-1.5 bg-[var(--paper-sunk)] border-b border-[var(--rule)] flex items-center justify-between gap-2">
+          <div className="px-3.5 py-2 bg-[var(--paper-sunk)] border-b border-[var(--rule)] flex items-center justify-between gap-2">
             <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[var(--ink-soft)]">
               <TableIcon className="w-3.5 h-3.5 text-[var(--signal)]" />
               <span>
@@ -230,7 +217,7 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
                   {block.headers.map((header, hIdx) => (
                     <th
                       key={hIdx}
-                      className={`px-3 py-2 font-semibold text-[var(--ink)] whitespace-nowrap ${alignClass(
+                      className={`px-3.5 py-2 font-semibold text-[var(--ink)] whitespace-nowrap ${alignClass(
                         block.alignments[hIdx] || 'left',
                       )}`}
                     >
@@ -248,7 +235,7 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
                     {row.map((cell, cIdx) => (
                       <td
                         key={cIdx}
-                        className={`px-3 py-2 text-[var(--ink-soft)] align-top ${alignClass(
+                        className={`px-3.5 py-2 text-[var(--ink-soft)] align-top ${alignClass(
                           block.alignments[cIdx] || 'left',
                         )}`}
                       >
@@ -267,9 +254,9 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
       return (
         <div
           key={idx}
-          className="my-3 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] overflow-hidden"
+          className="my-3.5 rounded-xl border border-[var(--rule)] bg-[var(--paper-sunk)] overflow-hidden"
         >
-          <div className="px-3 py-1.5 border-b border-[var(--rule)] flex items-center justify-between gap-2">
+          <div className="px-3.5 py-2 border-b border-[var(--rule)] flex items-center justify-between gap-2">
             <span className="inline-flex items-center gap-1.5 text-[11px] font-mono font-medium text-[var(--ink-soft)]">
               <BarChart3 className="w-3.5 h-3.5 text-[var(--signal)]" />
               <span>{block.label}</span>
@@ -286,9 +273,9 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
       return (
         <div
           key={idx}
-          className="my-3 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] overflow-hidden"
+          className="my-3.5 rounded-xl border border-[var(--rule)] bg-[var(--paper-sunk)] overflow-hidden"
         >
-          <div className="px-3 py-1.5 border-b border-[var(--rule)] flex items-center justify-between gap-2">
+          <div className="px-3.5 py-2 border-b border-[var(--rule)] flex items-center justify-between gap-2">
             <span className="text-[11px] font-mono text-[var(--ink-faint)] uppercase">
               {block.language}
             </span>
@@ -304,5 +291,9 @@ function renderBlock(block: MarkdownBlock, idx: number, isUser: boolean) {
 
 export function MarkdownMessage({ content, isUser = false }: { content: string; isUser?: boolean }) {
   const blocks = parseMarkdownBlocks(content);
-  return <div className="text-sm break-words">{blocks.map((b, i) => renderBlock(b, i, isUser))}</div>;
+  return (
+    <div className={`${isUser ? 'text-sm' : 'text-[15px]'} break-words text-[var(--ink)]`}>
+      {blocks.map((b, i) => renderBlock(b, i, isUser))}
+    </div>
+  );
 }

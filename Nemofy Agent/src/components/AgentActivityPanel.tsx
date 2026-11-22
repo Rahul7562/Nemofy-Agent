@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   FileMinus2,
   FilePenLine,
   FilePlus2,
@@ -33,6 +34,7 @@ interface LiveActivityPanelProps {
   activity: LiveAgentActivity;
   prefs: ActivityUserPrefs;
   onUpdatePrefs: (patch: Partial<ActivityUserPrefs>) => void;
+  onOpenWorkspaceFile?: (path: string) => void;
 }
 
 interface CompletedActivityPanelProps {
@@ -42,11 +44,18 @@ interface CompletedActivityPanelProps {
   fileChanges?: FileChangeItem[];
   prefs: ActivityUserPrefs;
   onUpdatePrefs: (patch: Partial<ActivityUserPrefs>) => void;
+  onOpenWorkspaceFile?: (path: string) => void;
 }
 
 type AgentActivityPanelProps = LiveActivityPanelProps | CompletedActivityPanelProps;
 
-function FileChangeRow({ item }: { item: FileChangeItem }) {
+function FileChangeRow({
+  item,
+  onOpenWorkspaceFile,
+}: {
+  item: FileChangeItem;
+  onOpenWorkspaceFile?: (path: string) => void;
+}) {
   const isDir = item.kind === 'dir';
   let Icon = FilePlus2;
   let colorClass = 'text-[var(--jade)]';
@@ -66,23 +75,37 @@ function FileChangeRow({ item }: { item: FileChangeItem }) {
     badgeText = isDir ? '-folder' : '-deleted';
   }
 
+  const canOpen = Boolean(onOpenWorkspaceFile && !isDir && item.action !== 'deleted');
+
   return (
-    <li className="flex items-center justify-between gap-2 py-1 text-xs">
-      <div className="flex items-center gap-2 min-w-0">
+    <li className="flex items-center justify-between gap-2 py-1.5 text-xs">
+      <div className="flex items-center gap-2 min-w-0 flex-1">
         <Icon className={`w-3.5 h-3.5 shrink-0 ${colorClass}`} />
         <span className={`font-mono text-[10px] font-semibold uppercase shrink-0 ${colorClass}`}>
           {badgeText}
         </span>
-        <span
-          className={`font-mono text-[11px] truncate ${
-            item.action === 'deleted'
-              ? 'line-through text-[var(--ink-faint)]'
-              : 'text-[var(--ink)]'
-          }`}
-          title={`/workspace/${item.path}`}
-        >
-          /workspace/{item.path}
-        </span>
+        {canOpen ? (
+          <button
+            type="button"
+            onClick={() => onOpenWorkspaceFile?.(item.path)}
+            title={`Open /workspace/${item.path} in Workspace drawer`}
+            className="group inline-flex items-center gap-1.5 min-w-0 font-mono text-[11px] text-[var(--ink)] hover:text-[var(--signal)] transition-colors cursor-pointer text-left"
+          >
+            <span className="truncate">/workspace/{item.path}</span>
+            <ExternalLink className="w-3 h-3 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+          </button>
+        ) : (
+          <span
+            className={`font-mono text-[11px] truncate ${
+              item.action === 'deleted'
+                ? 'line-through text-[var(--ink-faint)]'
+                : 'text-[var(--ink)]'
+            }`}
+            title={`/workspace/${item.path}`}
+          >
+            /workspace/{item.path}
+          </span>
+        )}
       </div>
       {item.tool && (
         <span className="font-mono text-[10px] text-[var(--ink-faint)] shrink-0">
@@ -170,7 +193,6 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
 
   const summary = summarizeActivity({ thinking, toolEvents, fileChanges });
 
-  // Reset thinking scroll pin only when a brand-new live job begins
   useEffect(() => {
     if (isLive) {
       isThinkingPinnedRef.current = true;
@@ -178,7 +200,6 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
     }
   }, [isLive, liveJobId]);
 
-  // Only follow streamed thinking while the user remains at the bottom
   useEffect(() => {
     const el = thinkingScrollRef.current;
     if (isLive && thinking && el && isThinkingPinnedRef.current) {
@@ -221,25 +242,68 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
   const isActivelyThinking = isLive && (livePhase === 'thinking' || livePhase === 'plan_start');
   const latestThoughtSnippet = isActivelyThinking ? extractLatestThoughtLine(thinking) : null;
 
+  const completedSummaryParts = summary.summaryParts.map((p) => (p === 'Thinking' ? 'Thought' : p));
   const phaseTitle = isLive
     ? latestThoughtSnippet || formatPhaseLabel(props.activity.currentPhase, props.activity.lastEvent)
-    : summary.summaryParts.join(' · ') || 'Activity details';
+    : completedSummaryParts.join(' · ') || 'Activity details';
 
   const liveSubtitle = isLive ? summary.summaryParts.join(' · ') : '';
+
+  const clickableFiles = fileChanges.filter((ch) => ch.kind === 'file' && ch.action !== 'deleted');
+
+  // Compact single-line collapsible pill for completed runs when collapsed
+  if (!isLive && !expanded) {
+    return (
+      <div
+        data-testid="completed-agent-activity"
+        className="mb-3 flex flex-wrap items-center gap-2"
+      >
+        <button
+          type="button"
+          onClick={toggleMain}
+          aria-expanded={false}
+          aria-label="Expand agent activity"
+          className="inline-flex items-center gap-1.5 rounded-full border border-[var(--rule)] bg-[var(--paper-sunk)]/80 hover:bg-[var(--paper-sunk)] hover:border-[var(--rule-strong)] px-3 py-1 text-xs font-medium text-[var(--ink-soft)] hover:text-[var(--ink)] transition-colors cursor-pointer"
+        >
+          <Brain className="w-3.5 h-3.5 text-[var(--signal)] shrink-0" />
+          <span className="truncate max-w-[280px] sm:max-w-[420px]">{phaseTitle}</span>
+          <ChevronRight className="w-3.5 h-3.5 opacity-70 shrink-0" />
+        </button>
+
+        {props.onOpenWorkspaceFile &&
+          clickableFiles.slice(0, 3).map((ch) => (
+            <button
+              key={`${ch.action}-${ch.path}`}
+              type="button"
+              onClick={() => props.onOpenWorkspaceFile?.(ch.path)}
+              title={`Inspect /workspace/${ch.path}`}
+              className="inline-flex items-center gap-1.5 rounded-full border border-[var(--rule)] bg-[var(--paper)] hover:border-[var(--signal)]/60 hover:text-[var(--signal)] px-2.5 py-1 text-[11px] font-mono text-[var(--ink-soft)] transition-colors cursor-pointer max-w-[200px]"
+            >
+              {ch.action === 'created' ? (
+                <FilePlus2 className="w-3 h-3 text-[var(--jade)] shrink-0" />
+              ) : (
+                <FilePenLine className="w-3 h-3 text-[var(--honey)] shrink-0" />
+              )}
+              <span className="truncate">{ch.path.split('/').pop() || ch.path}</span>
+            </button>
+          ))}
+      </div>
+    );
+  }
 
   return (
     <div
       data-testid={isLive ? 'live-agent-activity' : 'completed-agent-activity'}
       className={
         isLive
-          ? 'w-full max-w-[92%] sm:max-w-[88%] rounded-xl border border-[var(--signal)]/35 border-l-2 border-l-[var(--signal)] bg-[var(--paper-raised)] shadow-sm overflow-hidden transition-all'
-          : 'mb-3 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)]/75 overflow-hidden'
+          ? 'w-full rounded-2xl border border-[var(--signal)]/30 bg-[var(--paper-raised)] shadow-sm overflow-hidden transition-all'
+          : 'mb-3.5 rounded-xl border border-[var(--rule)] bg-[var(--paper-sunk)]/65 overflow-hidden'
       }
     >
-      {/* Header Bar — always compact, easy to spot, and 1-click minimizable/extendable */}
+      {/* Header Bar */}
       <div
         className={`flex items-center justify-between gap-3 ${
-          isLive ? 'px-3.5 py-2.5 bg-[var(--blush)]/45' : 'px-3 py-1.5'
+          isLive ? 'px-4 py-2.5 bg-[var(--blush)]/45' : 'px-3.5 py-2'
         }`}
       >
         <button
@@ -251,9 +315,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
               ? expanded
                 ? 'Minimize live activity'
                 : 'Expand live activity'
-              : expanded
-                ? 'Minimize agent activity'
-                : 'Expand agent activity'
+              : 'Collapse agent activity'
           }
           className="flex-1 min-w-0 flex items-center gap-2 text-left cursor-pointer group"
         >
@@ -279,7 +341,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
               className={`truncate ${
                 isLive
                   ? 'text-xs font-semibold text-[var(--ink)]'
-                  : 'text-[11px] font-medium text-[var(--ink-soft)] group-hover:text-[var(--ink)]'
+                  : 'text-xs font-medium text-[var(--ink)]'
               }`}
             >
               {phaseTitle}
@@ -295,18 +357,18 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
 
         <div className="flex items-center gap-2 shrink-0">
           {isLive && (
-            <span className="font-mono text-[11px] text-[var(--ink-faint)]">
+            <span className="font-mono text-[11px] tabular-nums text-[var(--ink-faint)]">
               {formatElapsedSeconds(props.activity.elapsedSeconds)}
             </span>
           )}
           <button
             type="button"
             onClick={toggleMain}
-            aria-label={expanded ? 'Minimize activity panel' : 'Extend activity panel'}
+            aria-label={expanded ? 'Minimize activity panel' : 'Expand activity panel'}
             className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
               isLive
                 ? 'border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] text-[var(--ink-soft)] hover:text-[var(--ink)]'
-                : 'text-[var(--ink-faint)] hover:text-[var(--ink)]'
+                : 'text-[var(--ink-soft)] hover:text-[var(--ink)]'
             }`}
           >
             {isLive ? (
@@ -321,22 +383,17 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                   <span>Expand</span>
                 </>
               )
-            ) : expanded ? (
+            ) : (
               <>
                 <span>Hide</span>
                 <ChevronDown className="w-3.5 h-3.5" />
-              </>
-            ) : (
-              <>
-                <span>Details</span>
-                <ChevronRight className="w-3.5 h-3.5" />
               </>
             )}
           </button>
         </div>
       </div>
 
-      {/* Expandable Body with independently toggleable Thinking, Tools, and File/Dir sections */}
+      {/* Expandable Body */}
       {expanded && (
         <div className="divide-y divide-[var(--rule)] border-t border-[var(--rule)]">
           {/* 1. Thinking & Live Activity Section */}
@@ -392,10 +449,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                   )}
 
                   {isLive && !thinking && (
-                    <ul
-                      data-testid="live-activity-feed"
-                      className="space-y-1.5"
-                    >
+                    <ul data-testid="live-activity-feed" className="space-y-1.5">
                       {activityFeed.length > 0 ? (
                         activityFeed.slice(-6).map((item, idx, arr) => {
                           const isLatest = idx === arr.length - 1;
@@ -449,7 +503,7 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
                               {task.label}
                             </span>
                           </span>
-                          <span className="font-mono text-[10px] text-[var(--ink-faint)] shrink-0">
+                          <span className="font-mono text-[10px] tabular-nums text-[var(--ink-faint)] shrink-0">
                             {formatElapsedSeconds(task.elapsed_seconds)}
                           </span>
                         </div>
@@ -516,7 +570,11 @@ export function AgentActivityPanel(props: AgentActivityPanelProps) {
               {props.prefs.showFilesSection && (
                 <ul className="px-3.5 pb-2 max-h-52 overflow-y-auto scrollbar-none divide-y divide-[var(--rule)]/50">
                   {fileChanges.map((ch, idx) => (
-                    <FileChangeRow key={`${ch.kind}-${ch.action}-${ch.path}-${idx}`} item={ch} />
+                    <FileChangeRow
+                      key={`${ch.kind}-${ch.action}-${ch.path}-${idx}`}
+                      item={ch}
+                      onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+                    />
                   ))}
                 </ul>
               )}

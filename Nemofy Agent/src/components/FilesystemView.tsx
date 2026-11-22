@@ -1,4 +1,5 @@
 import {
+  ArrowLeft,
   ChevronDown,
   ChevronRight,
   FileCode2,
@@ -30,6 +31,15 @@ import {
 } from '../lib/filesystemUtils.ts';
 import type { WorkspaceNode } from '../types/agent.ts';
 
+interface FilesystemViewProps {
+  /** Compact mode optimizes layout for the right-hand Workspace split drawer */
+  compact?: boolean;
+  /** Optional relative file path inside /workspace to open automatically */
+  initialSelectedPath?: string | null;
+  /** Increment to trigger a workspace tree refresh (e.g. after agent file changes) */
+  refreshKey?: number;
+}
+
 function mergeFolderChildren(
   nodes: WorkspaceNode[],
   folderPath: string,
@@ -56,7 +66,11 @@ function mergeFolderChildren(
   });
 }
 
-export function FilesystemView() {
+export function FilesystemView({
+  compact = false,
+  initialSelectedPath = null,
+  refreshKey = 0,
+}: FilesystemViewProps) {
   const [tree, setTree] = useState<WorkspaceNode[]>([]);
   const [loadingTree, setLoadingTree] = useState(true);
   const [loadingFolders, setLoadingFolders] = useState<Record<string, boolean>>({});
@@ -93,20 +107,16 @@ export function FilesystemView() {
 
   useEffect(() => {
     void refreshTree();
-  }, [refreshTree]);
+  }, [refreshTree, refreshKey]);
 
-  const filteredTree = useMemo(
-    () => filterWorkspaceTree(tree, searchQuery),
-    [tree, searchQuery],
-  );
-  const counts = useMemo(() => countWorkspaceItems(tree), [tree]);
-
-  async function handleSelectFile(filePath: string) {
+  const handleSelectFile = useCallback(async (filePath: string) => {
+    const clean = normalizeWorkspacePath(filePath);
+    if (!clean) return;
     setFeedback(null);
     setLoadingFile(true);
     try {
-      const data = await readWorkspaceFile(filePath);
-      setSelectedPath(filePath);
+      const data = await readWorkspaceFile(clean);
+      setSelectedPath(clean);
       setFileContent(data.content);
       setSavedContent(data.content);
       setFileMeta({ size: data.size, modifiedAt: data.modifiedAt });
@@ -118,7 +128,34 @@ export function FilesystemView() {
     } finally {
       setLoadingFile(false);
     }
-  }
+  }, []);
+
+  // Automatically open requested file path when clicked from AgentActivityPanel file chips
+  useEffect(() => {
+    if (!initialSelectedPath) return;
+    const clean = normalizeWorkspacePath(initialSelectedPath);
+    if (!clean) return;
+    // Expand parent folders along the path
+    const parts = clean.split('/').slice(0, -1);
+    if (parts.length > 0) {
+      setExpandedFolders((prev) => {
+        const next = { ...prev };
+        let acc = '';
+        for (const p of parts) {
+          acc = acc ? `${acc}/${p}` : p;
+          next[acc] = true;
+        }
+        return next;
+      });
+    }
+    void handleSelectFile(clean);
+  }, [initialSelectedPath, handleSelectFile]);
+
+  const filteredTree = useMemo(
+    () => filterWorkspaceTree(tree, searchQuery),
+    [tree, searchQuery],
+  );
+  const counts = useMemo(() => countWorkspaceItems(tree), [tree]);
 
   async function handleSaveFile() {
     if (!selectedPath || saving) return;
@@ -234,7 +271,7 @@ export function FilesystemView() {
         return (
           <div key={node.path}>
             <div
-              className="group flex items-center justify-between gap-1 rounded-md px-2 py-1.5 text-xs text-[var(--ink-soft)] hover:bg-[var(--paper-sunk)] hover:text-[var(--ink)]"
+              className="group flex items-center justify-between gap-1 rounded-lg px-2 py-1.5 text-xs text-[var(--ink-soft)] hover:bg-[var(--paper-sunk)] hover:text-[var(--ink)]"
               style={{ paddingLeft: `${8 + depth * 14}px` }}
             >
               <button
@@ -290,7 +327,7 @@ export function FilesystemView() {
       return (
         <div
           key={node.path}
-          className={`group flex items-center justify-between gap-1 rounded-md px-2 py-1.5 text-xs transition-colors ${
+          className={`group flex items-center justify-between gap-1 rounded-lg px-2 py-1.5 text-xs transition-colors ${
             active
               ? 'bg-[var(--blush)] text-[var(--signal)] font-medium'
               : 'text-[var(--ink-soft)] hover:bg-[var(--paper-sunk)] hover:text-[var(--ink)]'
@@ -305,7 +342,7 @@ export function FilesystemView() {
             <FileCode2 className="w-3.5 h-3.5 shrink-0 opacity-80" />
             <span className="truncate font-mono text-[12px]">{node.name}</span>
           </button>
-          <span className="text-[10px] font-mono text-[var(--ink-faint)] shrink-0 group-hover:hidden">
+          <span className="text-[10px] font-mono tabular-nums text-[var(--ink-faint)] shrink-0 group-hover:hidden">
             {formatBytes(node.size)}
           </span>
           <button
@@ -321,6 +358,216 @@ export function FilesystemView() {
     });
   }
 
+  // Compact Drawer Layout: Clean single-column switcher between Workspace Tree and File Editor
+  if (compact) {
+    return (
+      <div className="flex flex-col h-full min-h-0 bg-[var(--paper)]">
+        {feedback && (
+          <div
+            role={feedback.type === 'error' ? 'alert' : 'status'}
+            className={`px-4 py-2 text-xs border-b border-[var(--rule)] shrink-0 ${
+              feedback.type === 'error'
+                ? 'bg-[var(--flare)]/10 text-[var(--flare)]'
+                : 'bg-[var(--jade)]/10 text-[var(--jade)]'
+            }`}
+          >
+            {feedback.text}
+          </div>
+        )}
+
+        {selectedPath ? (
+          <div className="flex-1 flex flex-col min-h-0">
+            <div className="px-3.5 py-2.5 border-b border-[var(--rule)] flex items-center justify-between gap-2 shrink-0 bg-[var(--paper-sunk)]/50">
+              <div className="flex items-center gap-2 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setSelectedPath(null)}
+                  aria-label="Back to workspace files"
+                  title="Back to files"
+                  className="h-7 w-7 inline-flex items-center justify-center rounded-lg border border-[var(--rule)] bg-[var(--paper)] text-[var(--ink-soft)] hover:text-[var(--ink)] hover:border-[var(--rule-strong)] transition-colors cursor-pointer shrink-0"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                </button>
+                <div className="min-w-0">
+                  <div className="font-mono text-xs font-semibold text-[var(--ink)] truncate" title={`/workspace/${selectedPath}`}>
+                    {selectedPath}
+                    {isDirty && <span className="ml-1.5 text-[11px] text-[var(--honey)]">●</span>}
+                  </div>
+                  <div className="text-[10px] text-[var(--ink-faint)] font-mono tabular-nums">
+                    {detectFileLanguage(selectedPath)}
+                    {fileMeta ? ` · ${formatBytes(fileMeta.size)}` : ''}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  disabled={!isDirty || saving}
+                  onClick={() => void handleSaveFile()}
+                  className="h-7 px-2.5 inline-flex items-center gap-1 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-40 text-white text-xs font-semibold transition-colors cursor-pointer"
+                >
+                  <Save className="w-3 h-3" />
+                  <span>{saving ? 'Saving' : 'Save'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDelete(selectedPath)}
+                  aria-label="Delete current file"
+                  title="Delete file"
+                  className="h-7 w-7 inline-flex items-center justify-center rounded-lg border border-[var(--rule)] bg-[var(--paper)] hover:border-[var(--flare)]/50 hover:text-[var(--flare)] text-[var(--ink-soft)] transition-colors cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 min-h-0 p-3 bg-[var(--paper-sunk)]/30">
+              {loadingFile ? (
+                <div className="p-4 text-xs text-[var(--ink-faint)] inline-flex items-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--signal)]" />
+                  <span>Reading file...</span>
+                </div>
+              ) : (
+                <textarea
+                  aria-label={`Editor for ${selectedPath}`}
+                  value={fileContent}
+                  onChange={(e) => setFileContent(e.target.value)}
+                  spellCheck={false}
+                  className="w-full h-full resize-none rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-3.5 font-mono text-xs text-[var(--ink)] leading-relaxed focus:outline-none focus:border-[var(--signal)]"
+                />
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col min-h-0">
+            <div className="p-3.5 border-b border-[var(--rule)] space-y-2.5 shrink-0">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-mono text-[var(--ink-faint)] tabular-nums">
+                  {counts.files} {counts.files === 1 ? 'file' : 'files'} · {counts.folders}{' '}
+                  {counts.folders === 1 ? 'folder' : 'folders'}
+                </p>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCreatingMode('file');
+                      setNewPathInput('');
+                    }}
+                    title="New file"
+                    aria-label="New file"
+                    className="p-1.5 rounded-lg border border-[var(--rule)] bg-[var(--paper-raised)] hover:border-[var(--rule-strong)] text-[var(--ink-soft)] hover:text-[var(--ink)] cursor-pointer"
+                  >
+                    <FilePlus2 className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCreatingMode('folder');
+                      setNewPathInput('');
+                    }}
+                    title="New folder"
+                    aria-label="New folder"
+                    className="p-1.5 rounded-lg border border-[var(--rule)] bg-[var(--paper-raised)] hover:border-[var(--rule-strong)] text-[var(--ink-soft)] hover:text-[var(--ink)] cursor-pointer"
+                  >
+                    <FolderPlus className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void refreshTree()}
+                    title="Refresh workspace"
+                    aria-label="Refresh workspace"
+                    className="p-1.5 rounded-lg border border-[var(--rule)] bg-[var(--paper-raised)] hover:border-[var(--rule-strong)] text-[var(--ink-soft)] hover:text-[var(--ink)] cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${loadingTree ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-[var(--ink-faint)] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <label htmlFor="workspace-search" className="sr-only">
+                  Filter workspace files
+                </label>
+                <input
+                  id="workspace-search"
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Filter /workspace files..."
+                  className="w-full h-8 pl-8 pr-2.5 rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)]/60 focus:bg-[var(--paper)] text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+                />
+              </div>
+
+              {creatingMode && (
+                <form onSubmit={handleCreateSubmit} className="space-y-2 pt-1">
+                  <label htmlFor="new-entry-path" className="block text-[11px] font-medium text-[var(--ink)]">
+                    {creatingMode === 'file' ? 'New file path' : 'New folder path'}
+                  </label>
+                  <input
+                    id="new-entry-path"
+                    type="text"
+                    autoFocus
+                    value={newPathInput}
+                    onChange={(e) => setNewPathInput(e.target.value)}
+                    placeholder={creatingMode === 'file' ? 'notes/summary.md' : 'scripts'}
+                    className="w-full h-8 px-2.5 rounded-lg border border-[var(--signal)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none"
+                  />
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="submit"
+                      className="px-2.5 py-1 rounded-lg bg-[var(--signal)] text-white text-xs font-medium cursor-pointer"
+                    >
+                      Create
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCreatingMode(null)}
+                      className="px-2.5 py-1 rounded-lg border border-[var(--rule)] text-xs text-[var(--ink-soft)] cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+
+            <div className="flex-1 overflow-y-auto scrollbar-none p-2 space-y-0.5">
+              {loadingTree ? (
+                <div className="p-3 text-xs text-[var(--ink-faint)]">Scanning /workspace...</div>
+              ) : filteredTree.length === 0 ? (
+                <div className="p-5 text-center space-y-3">
+                  <FileCode2 className="w-7 h-7 text-[var(--ink-faint)] mx-auto" />
+                  <p className="text-xs text-[var(--ink-soft)] leading-relaxed">
+                    {searchQuery
+                      ? 'No matching files in /workspace.'
+                      : 'Workspace is empty. Create a file or ask Nemo to write one.'}
+                  </p>
+                  {!searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCreatingMode('file');
+                        setNewPathInput('notes.md');
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-medium cursor-pointer"
+                    >
+                      <FilePlus2 className="w-3.5 h-3.5" />
+                      <span>Create new file</span>
+                    </button>
+                  )}
+                </div>
+              ) : (
+                renderTreeNodes(filteredTree)
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Standard Full-Width Layout
   return (
     <div className="flex flex-col md:flex-row h-full min-h-0 bg-[var(--paper)]">
       {/* Left Workspace Tree */}

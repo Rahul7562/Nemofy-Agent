@@ -1,19 +1,36 @@
-import { Menu } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ChatView } from './components/ChatView.tsx';
-import { FilesystemView } from './components/FilesystemView.tsx';
 import { LoginGate } from './components/LoginGate.tsx';
 import { NemofyLogo } from './components/NemofyLogo.tsx';
-import { SettingsView } from './components/SettingsView.tsx';
+import { SettingsModal } from './components/SettingsModal.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
+import { WorkspaceDrawer } from './components/WorkspaceDrawer.tsx';
+import { useChatThreads } from './hooks/useChatThreads.ts';
 import { checkAuthSession, fetchLLMSettings, logoutSession, saveLLMSettings } from './lib/apiClient.ts';
-import type { NavSection, PersistedLLMConfig, SettingsTab, ThemeMode } from './types/agent.ts';
+import { resolveModelLimits } from './lib/contextUtils.ts';
+import { canonicalizeProviderId } from './lib/llmPresets.ts';
+import { getThinkingProfile, normalizeThinkingLevel } from './lib/thinkingModes.ts';
+import type {
+  PersistedLLMConfig,
+  ProviderModelOption,
+  SettingsTab,
+  ThemeMode,
+} from './types/agent.ts';
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === 'undefined') return 'light';
   const saved = window.localStorage.getItem('nemofy_theme');
   if (saved === 'dark' || saved === 'light') return saved;
   return document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+}
+
+function getInitialSidebarCollapsed(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem('nemofy_sidebar_collapsed') === 'true';
+  } catch {
+    return false;
+  }
 }
 
 export function App() {
@@ -23,10 +40,30 @@ export function App() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [username, setUsername] = useState('admin');
 
-  const [activeSection, setActiveSection] = useState<NavSection>('chat');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(getInitialSidebarCollapsed);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+
+  const [workspaceDrawerOpen, setWorkspaceDrawerOpen] = useState(false);
+  const [workspaceTargetPath, setWorkspaceTargetPath] = useState<string | null>(null);
+  const [workspaceRefreshKey, setWorkspaceRefreshKey] = useState(0);
+
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('llm');
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
   const [llmConfig, setLlmConfig] = useState<PersistedLLMConfig | null>(null);
+
+  const {
+    threads,
+    activeThread,
+    activeThreadId,
+    setActiveThreadId,
+    loadingThreads,
+    threadsError,
+    createNewThread,
+    removeThread,
+    upsertThread,
+    updateThreadById,
+  } = useChatThreads(authenticated);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -41,6 +78,14 @@ export function App() {
       // ignore storage errors
     }
   }, [theme]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('nemofy_sidebar_collapsed', String(sidebarCollapsed));
+    } catch {
+      // ignore storage errors
+    }
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     let mounted = true;
@@ -77,11 +122,28 @@ export function App() {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   }
 
+  function openSettings(tab: SettingsTab = 'llm') {
+    setSettingsTab(tab);
+    setSettingsModalOpen(true);
+  }
+
+  const handleOpenWorkspaceFile = useCallback((path: string) => {
+    setWorkspaceTargetPath(path);
+    setWorkspaceDrawerOpen(true);
+    setWorkspaceRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleWorkspaceFilesChanged = useCallback(() => {
+    setWorkspaceRefreshKey((k) => k + 1);
+  }, []);
+
   async function handleLogout() {
     await logoutSession();
     setAuthenticated(false);
     setLlmConfig(null);
-    setActiveSection('chat');
+    setSettingsModalOpen(false);
+    setWorkspaceDrawerOpen(false);
+    setMobileSidebarOpen(false);
   }
 
   async function handlePrimaryThinkingChange(nextEffort: string) {
@@ -99,6 +161,56 @@ export function App() {
       setLlmConfig(saved.config);
     } catch {
       // Keep local optimistic selection; sendChatMessage still sends explicit reasoningEffort
+    }
+  }
+
+  async function handleQuickSwitchPrimaryModel(nextModel: string, option?: ProviderModelOption) {
+    if (!llmConfig) return;
+    const canonicalProvider = canonicalizeProviderId(llmConfig.primary.provider);
+    const trimmed = nextModel.trim();
+    const nextProfile = getThinkingProfile(canonicalProvider, nextModel);
+
+    const explicitCtx =
+      typeof option?.context_length === 'number' && option.context_length > 0
+        ? Math.round(option.context_length)
+        : undefined;
+    const explicitOut =
+      typeof option?.max_output_tokens === 'number' && option.max_output_tokens > 0
+        ? Math.round(option.max_output_tokens)
+        : undefined;
+
+    const resolved = trimmed
+      ? resolveModelLimits(canonicalProvider, trimmed, explicitCtx, explicitOut)
+      : null;
+
+    const nextMaxTokens = option
+      ? resolved?.maxOutputTokens ?? llmConfig.primary.max_tokens
+      : resolved && resolved.maxOutputTokensSource === 'model_registry'
+        ? resolved.maxOutputTokens
+        : llmConfig.primary.max_tokens;
+
+    const updated: PersistedLLMConfig = {
+      ...llmConfig,
+      primary: {
+        ...llmConfig.primary,
+        provider: canonicalProvider,
+        model: nextModel,
+        context_window: explicitCtx,
+        max_output_tokens: explicitOut,
+        max_tokens: nextMaxTokens,
+        reasoning_effort: normalizeThinkingLevel(nextProfile, llmConfig.primary.reasoning_effort),
+      },
+    };
+
+    setLlmConfig(updated);
+
+    // Only persist to server when a concrete non-empty model ID is chosen
+    if (!trimmed) return;
+    try {
+      const saved = await saveLLMSettings(updated);
+      setLlmConfig(saved.config);
+    } catch {
+      // Non-blocking; user can still save or inspect errors in Settings modal
     }
   }
 
@@ -129,65 +241,71 @@ export function App() {
   }
 
   return (
-    <div className="h-screen flex flex-col lg:flex-row bg-[var(--paper)] text-[var(--ink)] overflow-hidden">
-      {/* Mobile Header Bar */}
-      <header className="lg:hidden h-14 px-4 border-b border-[var(--rule)] bg-[var(--paper-sunk)] flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={() => setMobileMenuOpen(true)}
-            aria-label="Open navigation menu"
-            className="p-1.5 rounded-lg border border-[var(--rule)] bg-[var(--paper)] text-[var(--ink)] cursor-pointer"
-          >
-            <Menu className="w-4 h-4" />
-          </button>
-          <NemofyLogo size={22} />
-          <span className="font-display font-semibold text-sm text-[var(--ink)]">Nemofy Agent</span>
-        </div>
-        <span className="text-xs font-medium capitalize text-[var(--ink-soft)]">{activeSection}</span>
-      </header>
-
-      {/* Left Sidebar */}
+    <div className="h-screen flex bg-[var(--paper)] text-[var(--ink)] overflow-hidden">
+      {/* Unified Single Collapsible Left Sidebar */}
       <Sidebar
-        activeSection={activeSection}
-        onSelectSection={(section) => {
-          setActiveSection(section);
-          if (section === 'settings') setSettingsTab('llm');
-        }}
+        threads={threads}
+        activeThreadId={activeThreadId}
+        loadingThreads={loadingThreads}
+        onNewThread={() => void createNewThread()}
+        onSelectThread={(id) => setActiveThreadId(id)}
+        onDeleteThread={(id) => void removeThread(id)}
+        collapsed={sidebarCollapsed}
+        onCollapse={() => setSidebarCollapsed(true)}
+        onExpand={() => setSidebarCollapsed(false)}
+        mobileOpen={mobileSidebarOpen}
+        onCloseMobile={() => setMobileSidebarOpen(false)}
         theme={theme}
         onToggleTheme={toggleTheme}
         username={username}
+        onOpenSettings={() => openSettings('llm')}
         onLogout={() => void handleLogout()}
-        mobileOpen={mobileMenuOpen}
-        onCloseMobile={() => setMobileMenuOpen(false)}
       />
 
-      {/* Active Workspace View */}
-      <main className="flex-1 min-w-0 min-h-0 overflow-hidden">
-        {activeSection === 'chat' && (
-          <ChatView
-            llmConfig={llmConfig}
-            onPrimaryThinkingChange={(lvl) => void handlePrimaryThinkingChange(lvl)}
-            onOpenLLMSettings={() => {
-              setSettingsTab('llm');
-              setActiveSection('settings');
-            }}
-            onOpenAccessoriesSettings={() => {
-              setSettingsTab('accessories');
-              setActiveSection('settings');
-            }}
-          />
-        )}
-        {activeSection === 'filesystem' && <FilesystemView />}
-        {activeSection === 'settings' && (
-          <SettingsView
-            theme={theme}
-            onSetTheme={setTheme}
-            initialTab={settingsTab}
-            onLLMConfigSaved={(next) => setLlmConfig(next)}
-          />
-        )}
+      {/* Main Chat Canvas */}
+      <main className="flex-1 flex min-w-0 min-h-0 overflow-hidden">
+        <ChatView
+          activeThread={activeThread}
+          activeThreadId={activeThreadId}
+          threadsError={threadsError}
+          onCreateThread={createNewThread}
+          onUpsertThread={upsertThread}
+          onUpdateThreadById={updateThreadById}
+          llmConfig={llmConfig}
+          onQuickSwitchPrimaryModel={(model, opt) => void handleQuickSwitchPrimaryModel(model, opt)}
+          onPrimaryThinkingChange={(lvl) => void handlePrimaryThinkingChange(lvl)}
+          onOpenLLMSettings={() => openSettings('llm')}
+          onOpenAccessoriesSettings={() => openSettings('accessories')}
+          sidebarCollapsed={sidebarCollapsed}
+          onExpandSidebar={() => setSidebarCollapsed(false)}
+          onOpenMobileSidebar={() => setMobileSidebarOpen(true)}
+          workspaceOpen={workspaceDrawerOpen}
+          onToggleWorkspace={() => {
+            setWorkspaceDrawerOpen((v) => !v);
+            setWorkspaceRefreshKey((k) => k + 1);
+          }}
+          onOpenWorkspaceFile={handleOpenWorkspaceFile}
+          onWorkspaceFilesChanged={handleWorkspaceFilesChanged}
+        />
+
+        {/* Right-Hand Split Workspace Drawer */}
+        <WorkspaceDrawer
+          open={workspaceDrawerOpen}
+          onClose={() => setWorkspaceDrawerOpen(false)}
+          targetPath={workspaceTargetPath}
+          refreshKey={workspaceRefreshKey}
+        />
       </main>
+
+      {/* Centered Settings Modal Dialog */}
+      <SettingsModal
+        open={settingsModalOpen}
+        onClose={() => setSettingsModalOpen(false)}
+        theme={theme}
+        onSetTheme={setTheme}
+        initialTab={settingsTab}
+        onLLMConfigSaved={(next) => setLlmConfig(next)}
+      />
     </div>
   );
 }

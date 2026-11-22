@@ -75,6 +75,7 @@ interface SettingsViewProps {
   onSetTheme: (mode: ThemeMode) => void;
   onLLMConfigSaved: (config: PersistedLLMConfig) => void;
   initialTab?: SettingsTab;
+  embedded?: boolean;
 }
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; icon: typeof Cpu }> = [
@@ -492,7 +493,7 @@ function RoleConfigCard({
           {resolvedLimits && (
             <div className="mt-1 flex items-center justify-between gap-1.5 text-[10px] text-[var(--ink-faint)]">
               <span className="font-mono tabular-nums truncate">
-                Model max: {formatTokenCount(resolvedLimits.maxOutputTokens)}
+                Max: {formatTokenCount(resolvedLimits.maxOutputTokens)}
               </span>
               {config.max_tokens !== resolvedLimits.maxOutputTokens && (
                 <button
@@ -552,6 +553,7 @@ export function SettingsView({
   onSetTheme,
   onLLMConfigSaved,
   initialTab = 'llm',
+  embedded = false,
 }: SettingsViewProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
 
@@ -991,16 +993,18 @@ export function SettingsView({
 
   return (
     <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-none bg-[var(--paper)]">
-      <div className="max-w-5xl mx-auto px-5 sm:px-8 py-6 sm:py-8 space-y-6">
+      <div className={`max-w-5xl mx-auto ${embedded ? 'px-5 sm:px-6 py-5' : 'px-5 sm:px-8 py-6 sm:py-8'} space-y-6`}>
         {/* Header */}
-        <div>
-          <h1 className="font-display text-2xl font-semibold tracking-tight text-[var(--ink)]">
-            Settings
-          </h1>
-          <p className="mt-1 text-sm text-[var(--ink-soft)]">
-            Configure Main Agent &amp; Sub-Agent LLMs, administrator security, dynamic skills, and MCP servers.
-          </p>
-        </div>
+        {!embedded && (
+          <div>
+            <h1 className="font-display text-2xl font-semibold tracking-tight text-[var(--ink)]">
+              Settings
+            </h1>
+            <p className="mt-1 text-sm text-[var(--ink-soft)]">
+              Configure Main Agent &amp; Sub-Agent LLMs, administrator security, dynamic skills, and MCP servers.
+            </p>
+          </div>
+        )}
 
         {/* Sub-navigation Tabs */}
         <div
