@@ -52,9 +52,15 @@ from agent_core.tools.local import build_local_tools
 class TestUnsafeLocalBashAndReadFilePagination(unittest.IsolatedAsyncioTestCase):
     async def test_allow_unsafe_local_bash_enforced_and_togglable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            root_tmp = Path(tmp).resolve()
+            ws = root_tmp / "workspace"
+            ws.mkdir()
+            outside_file = root_tmp / "host_outside.txt"
+            outside_file.write_text("host-level-data\n", encoding="utf-8")
+
             # Production default backend='auto' without Docker available must enforce allow_unsafe_local_bash
             cfg = SandboxConfig(
-                workspace_dir=Path(tmp),
+                workspace_dir=ws,
                 backend="auto",
                 allow_unsafe_local_bash=False,
             )
@@ -62,21 +68,49 @@ class TestUnsafeLocalBashAndReadFilePagination(unittest.IsolatedAsyncioTestCase)
                 sandbox = SandboxManager(cfg)
             self.assertFalse(sandbox.allow_unsafe_local_bash)
 
-            # When disabled without Docker, local bash must be strictly refused
+            # When disabled without Docker, local bash must be strictly refused and file tools confined
             with self.assertRaises(SandboxSecurityError):
                 await sandbox.exec_command("echo blocked", session_id="s1")
+            with self.assertRaises(SandboxSecurityError):
+                sandbox.read_file(str(outside_file), session_id="s1")
 
-            # Live toggle ON via backend config setter -> command succeeds inside workspace
+            # Live toggle ON -> unrestricted host access while working inside /workspace
             self.assertTrue(sandbox.set_allow_unsafe_local_bash(True))
             self.assertTrue(sandbox.allow_unsafe_local_bash)
-            res = await sandbox.exec_command("echo allowed_ok", session_id="s1")
-            self.assertEqual(res.exit_code, 0)
-            self.assertIn("allowed_ok", res.stdout)
+            self.assertEqual(sandbox.active_backend, "host_unrestricted")
 
-            # Live toggle OFF -> immediately refused again
+            # Default working directory stays inside the workspace
+            pwd_res = await sandbox.exec_command("pwd", session_id="s1")
+            self.assertEqual(pwd_res.exit_code, 0)
+            self.assertEqual(Path(pwd_res.stdout.strip()).resolve(), ws)
+            self.assertEqual(pwd_res.backend, "host_unrestricted")
+
+            # Commands previously filtered by sandbox.py (host paths, .., /etc, /root, ln -s) are unrestricted
+            host_cmd = await sandbox.exec_command(
+                f"cat {outside_file} && ls -d /etc && ls -d /root 2>/dev/null || true",
+                session_id="s1",
+            )
+            self.assertEqual(host_cmd.exit_code, 0)
+            self.assertIn("host-level-data", host_cmd.stdout)
+            self.assertIn("/etc", host_cmd.stdout)
+
+            # File tools can read/write/edit/list host paths outside /workspace while relative paths use /workspace
+            self.assertIn("host-level-data", sandbox.read_file(str(outside_file), session_id="s1"))
+            paginated = sandbox.read_file_paginated(str(outside_file), session_id="s1")
+            self.assertEqual(paginated["path"], str(outside_file))
+            self.assertIn("host-level-data", paginated["formatted_output"])
+
+            sandbox.write_file("in_ws.txt", "inside-workspace", session_id="s1")
+            self.assertTrue((ws / "in_ws.txt").exists())
+            outside_entries = sandbox.list_dir(str(root_tmp), session_id="s1")
+            self.assertIn("host_outside.txt", outside_entries)
+
+            # Live toggle OFF -> immediately refused again and file tools re-confined
             self.assertFalse(sandbox.set_allow_unsafe_local_bash(False))
             with self.assertRaises(SandboxSecurityError):
                 await sandbox.exec_command("echo blocked_again", session_id="s1")
+            with self.assertRaises(SandboxSecurityError):
+                sandbox.read_file(str(outside_file), session_id="s1")
 
     def test_read_file_paginated_and_exempt_from_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

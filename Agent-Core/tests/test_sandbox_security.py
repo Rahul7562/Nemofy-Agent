@@ -96,33 +96,40 @@ def test_path_traversal_absolute_path_and_symlink_escapes_rejected(
 
 
 @pytest.mark.asyncio
-async def test_bash_command_timeout_and_host_escape_blocking(
+async def test_bash_command_timeout_and_unrestricted_host_access(
     tmp_workspace: Path,
 ) -> None:
     cfg = SandboxConfig(
         workspace_dir=tmp_workspace,
         backend="local_isolated",
         timeout_seconds=2,
+        allow_unsafe_local_bash=True,
     )
     mgr = SandboxManager(cfg)
 
-    # Timeout enforcement
+    # Timeout enforcement still works cleanly
     res = await mgr.exec_command("sleep 10", timeout=1)
     assert res.timed_out is True
     assert res.exit_code == 124
 
-    # Host escape, traversal, sensitive file, and symlink commands blocked
-    with pytest.raises(SandboxSecurityError):
-        await mgr.exec_command("cat /etc/passwd")
-    with pytest.raises(SandboxSecurityError):
-        await mgr.exec_command("ls /var/run/docker.sock")
-    with pytest.raises(SandboxSecurityError):
-        await mgr.exec_command("cat ../data/auth.json")
-    with pytest.raises(SandboxSecurityError):
-        await mgr.exec_command("ln -s /etc/hosts leak.txt")
+    # Default CWD stays inside workspace
+    pwd_res = await mgr.exec_command("pwd")
+    assert pwd_res.exit_code == 0
+    assert Path(pwd_res.stdout.strip()).resolve() == tmp_workspace.resolve()
 
-    # Secrets stripped from subprocess environment
-    env_res = await mgr.exec_command("env")
+    # All sandbox regex filters removed: host commands (e.g. /etc, .., ln -s) run without SandboxSecurityError
+    etc_res = await mgr.exec_command("ls -d /etc")
+    assert etc_res.exit_code == 0
+    assert "/etc" in etc_res.stdout
+
+    sym_res = await mgr.exec_command("ln -s /etc/hosts link_test.txt && test -L link_test.txt")
+    assert sym_res.exit_code == 0
+
+    # Sanitized env still applies when allow_unsafe_local_bash=False in local_isolated mode
+    safe_mgr = SandboxManager(
+        SandboxConfig(workspace_dir=tmp_workspace, backend="local_isolated", allow_unsafe_local_bash=False)
+    )
+    env_res = await safe_mgr.exec_command("env")
     assert "RIVER_AI_API" not in env_res.stdout
     assert "AGENT_API_TOKEN" not in env_res.stdout
     assert "OPENAI_API_KEY" not in env_res.stdout
@@ -311,13 +318,14 @@ async def test_local_sandbox_node_venv_path_rewrite_and_env_scrubbing(
     assert "lines.txt" in entries
     assert ".logs/" not in entries
 
-    # 6. Sensitive provider & vault secrets are stripped from subprocess env, and ../.env is blocked
+    # 6. Sensitive provider & vault secrets are stripped when allow_unsafe_local_bash=False
     env_res = await mgr.exec_command("env")
     assert "NVIDIA_API_KEY" not in env_res.stdout
     assert "VAULT_MASTER_KEY" not in env_res.stdout
-    with pytest.raises(SandboxSecurityError):
-        await mgr.exec_command("cat ../.env")
-    # Non-secret .env.example filename should not false-positive
+    # When allow_unsafe_local_bash=True, full host env is available and no command filters block commands
+    mgr.set_allow_unsafe_local_bash(True)
+    host_env_res = await mgr.exec_command("env")
+    assert "NVIDIA_API_KEY=nvapi-secret-test-999" in host_env_res.stdout
     ex_res = await mgr.exec_command("echo .env.example")
     assert ex_res.exit_code == 0
     assert ".env.example" in ex_res.stdout

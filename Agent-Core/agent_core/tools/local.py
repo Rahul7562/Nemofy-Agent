@@ -330,12 +330,12 @@ def build_local_tools(
 
     @tool("bash_exec")
     async def bash_exec(command: str, timeout: int | None = None) -> str:
-        """Execute a shell or Python command inside the isolated workspace sandbox.
+        """Execute a shell or Python command starting inside the workspace directory (/workspace).
 
         The command starts with the workspace root as its current working directory (CWD) and
-        sets the WORKSPACE environment variable to the workspace directory. Inside scripts/code
-        you write, prefer relative paths (e.g. 'data.txt') or os.environ.get('WORKSPACE', '.')
-        instead of hardcoding literal '/workspace/...' paths.
+        sets the WORKSPACE environment variable to the workspace directory. When
+        ALLOW_UNSAFE_LOCAL_BASH is enabled, commands have full unrestricted access to the host
+        machine (including /root and host binaries) while still starting in /workspace.
 
         Args:
             command: Shell command to run with working directory set to the workspace root (e.g. `python3 script.py`).
@@ -357,7 +357,11 @@ def build_local_tools(
         session_id = current_session_id.get()
         try:
             ws = sandbox.get_session_workspace(session_id)
-            resolved = resolve_workspace_path(path, ws)
+            resolved = resolve_workspace_path(
+                path,
+                ws,
+                allow_host_access=sandbox.allow_unsafe_local_bash,
+            )
             if resolved.is_file() and is_firecrawl_document_path(resolved):
                 vpath = to_virtual_workspace_path(resolved, ws)
                 parsed = asyncio.run(fc_client.parse_local_document(resolved))
@@ -390,7 +394,11 @@ def build_local_tools(
         session_id = current_session_id.get()
         try:
             ws = sandbox.get_session_workspace(session_id)
-            resolved = resolve_workspace_path(path, ws)
+            resolved = resolve_workspace_path(
+                path,
+                ws,
+                allow_host_access=sandbox.allow_unsafe_local_bash,
+            )
             if resolved.is_file() and is_firecrawl_document_path(resolved):
                 vpath = to_virtual_workspace_path(resolved, ws)
                 parsed = await fc_client.parse_local_document(resolved)
@@ -420,15 +428,16 @@ def build_local_tools(
         name="read_file",
         description=(
             "Read a UTF-8 text file or parse a PDF/Office document (.pdf, .docx, .doc, .xlsx, .xls, "
-            ".pptx, .ppt, .odt, .ods, .odp, .rtf, .epub) inside /workspace into numbered, paginated "
-            "Markdown via official Firecrawl Local. Returns explicit pagination metadata (lines shown, "
-            "total lines, has_more, next_start_line) without truncating mid-line."
+            ".pptx, .ppt, .odt, .ods, .odp, .rtf, .epub) into numbered, paginated Markdown via official "
+            "Firecrawl Local. Accepts relative paths, '/workspace/...', or absolute host paths (including "
+            "'/root/...') when ALLOW_UNSAFE_LOCAL_BASH is enabled. Returns explicit pagination metadata "
+            "(lines shown, total lines, has_more, next_start_line) without truncating mid-line."
         ),
     )
 
     @tool("write_file")
     def write_file(path: str, content: str) -> str:
-        """Create or overwrite a file strictly inside /workspace.
+        """Create or overwrite a file (defaults to /workspace; accepts host paths when ALLOW_UNSAFE_LOCAL_BASH is enabled).
 
         For very large files (>200 lines), prefer writing modular files or building in chunks
         with write_file + edit_file so tool-call JSON stays compact and never truncates.
@@ -436,7 +445,7 @@ def build_local_tools(
         rather than hardcoding '/workspace/...'.
 
         Args:
-            path: Target file path inside /workspace (e.g. 'main.py' or '/workspace/main.py').
+            path: Target file path (e.g. 'main.py', '/workspace/main.py', or host path when enabled).
             content: Full UTF-8 text content to write.
         """
         session_id = current_session_id.get()
@@ -447,10 +456,10 @@ def build_local_tools(
 
     @tool("edit_file")
     def edit_file(path: str, old_text: str, new_text: str) -> str:
-        """Replace a unique matching snippet inside an existing file in /workspace.
+        """Replace a unique matching snippet inside an existing file (defaults to /workspace; accepts host paths when ALLOW_UNSAFE_LOCAL_BASH is enabled).
 
         Args:
-            path: Existing file path inside /workspace.
+            path: Existing file path (relative to /workspace, '/workspace/...', or host path when enabled).
             old_text: Exact unique substring to replace.
             new_text: Replacement text.
         """
@@ -462,10 +471,10 @@ def build_local_tools(
 
     @tool("list_dir")
     def list_dir(path: str = "/workspace") -> str:
-        """List files and subdirectories inside /workspace.
+        """List files and subdirectories (defaults to '/workspace'; accepts host paths such as '/root' when ALLOW_UNSAFE_LOCAL_BASH is enabled).
 
         Args:
-            path: Directory path inside /workspace (defaults to '/workspace').
+            path: Directory path to list (defaults to '/workspace').
         """
         session_id = current_session_id.get()
         try:

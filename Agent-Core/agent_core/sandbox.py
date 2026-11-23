@@ -42,16 +42,6 @@ SENSITIVE_ENV_PREFIXES = (
     "GOOGLE_API",
 )
 
-_LOCAL_ESCAPE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"/var/run/docker\.sock", re.IGNORECASE),
-    re.compile(r"(?:^|[\s\"'`;|&=<>])/(?:etc|proc|sys|root|boot|var|home|opt|srv|mnt|media|app)(?:/|[\s\"'`;|&<>]|$)", re.IGNORECASE),
-    re.compile(r"(?:^|[\s/\\.\"'`=;|&<>])\.\.(?:[/\\]|$|[\s\"'`;|&<>])"),
-    re.compile(r"(?:^|[\s\"'`;|&=/])\.env(?:[\.\w*?\[\]]*)?(?=$|[\s\"'`;|&<>])", re.IGNORECASE),
-    re.compile(r"(?:data/)?(?:auth\.json|llm_config\.json|threads\.json|checkpoints\.db|vaults(?:/|\b))", re.IGNORECASE),
-    re.compile(r"(?:^|[\s\"'`;|&=/])server(?:\.ts|/[\w.-]+)", re.IGNORECASE),
-    re.compile(r"\bln\s+[^\n]*(?:-s\b|--symbolic\b)", re.IGNORECASE),
-)
-
 _WORKSPACE_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_./-])/workspace(?=/|[\s\"'`;|&<>):]|$)"
 )
@@ -155,8 +145,18 @@ def resolve_workspace_path(
     workspace_root: Path,
     *,
     allow_root: bool = False,
+    allow_host_access: bool = False,
 ) -> Path:
-    """Resolve and strictly confine a requested path inside ``workspace_root``."""
+    """Resolve a requested path relative to ``workspace_root`` or across the full host filesystem.
+
+    When ``allow_host_access`` is ``True`` (``ALLOW_UNSAFE_LOCAL_BASH=true``),
+    any host path (including ``/root``, ``/etc``, ``~``, ``..`` traversal, and
+    symlinks) is permitted while relative paths and ``/workspace/...`` continue
+    to resolve inside ``workspace_root``.
+
+    When ``allow_host_access`` is ``False``, the path is strictly confined
+    inside ``workspace_root``.
+    """
     ws_real = workspace_root.resolve()
     ws_real.mkdir(parents=True, exist_ok=True)
     ws_prefix = str(ws_real)
@@ -169,6 +169,17 @@ def resolve_workspace_path(
         if allow_root:
             return ws_real
         raise SandboxSecurityError("A specific file path inside /workspace is required.")
+
+    if allow_host_access:
+        if raw.startswith("/workspace/"):
+            rel_str = raw[len("/workspace/") :]
+            return (ws_real / rel_str).resolve()
+        if raw.startswith("~"):
+            return Path(os.path.expanduser(raw)).resolve()
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            return candidate.resolve()
+        return (ws_real / raw).resolve()
 
     if raw.startswith("/workspace/"):
         rel_str = raw[len("/workspace/") :]
@@ -213,9 +224,13 @@ def resolve_workspace_path(
 
 
 def to_virtual_workspace_path(real_path: Path, workspace_root: Path) -> str:
-    """Convert a host path inside ``workspace_root`` into ``/workspace/...`` display form."""
+    """Convert a host path inside ``workspace_root`` into ``/workspace/...`` display form, or return the real absolute host path when outside."""
     ws_real = workspace_root.resolve()
-    rel = real_path.resolve().relative_to(ws_real)
+    resolved = real_path.resolve()
+    try:
+        rel = resolved.relative_to(ws_real)
+    except ValueError:
+        return str(resolved)
     rel_posix = rel.as_posix()
     return "/workspace" if rel_posix == "." else f"/workspace/{rel_posix}"
 
@@ -229,6 +244,19 @@ def _parse_memory_bytes(spec: str) -> int:
     unit = match.group(2)
     mult = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[unit]
     return value * mult
+
+
+def _prepend_venv_path(env: dict[str, str]) -> None:
+    """Ensure the active Python interpreter's bin dir (e.g. .venv/bin) is first on PATH."""
+    py_bin = os.path.abspath(os.path.dirname(sys.executable))
+    existing_path = env.get("PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    path_parts = [p for p in existing_path.split(os.pathsep) if p]
+    if py_bin not in path_parts:
+        env["PATH"] = os.pathsep.join([py_bin, *path_parts])
+    else:
+        env["PATH"] = existing_path
+    if sys.prefix != sys.base_prefix:
+        env["VIRTUAL_ENV"] = os.path.abspath(sys.prefix)
 
 
 def _sanitized_sandbox_env(workspace_root: Path) -> dict[str, str]:
@@ -245,18 +273,7 @@ def _sanitized_sandbox_env(workspace_root: Path) -> dict[str, str]:
             continue
         safe[k] = v
 
-    # Ensure the active Python interpreter's bin dir (e.g. .venv/bin) is first on PATH.
-    # Avoid .resolve() on sys.executable because venv binaries symlink to /usr/bin/python3.
-    py_bin = os.path.abspath(os.path.dirname(sys.executable))
-    existing_path = safe.get("PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    path_parts = [p for p in existing_path.split(os.pathsep) if p]
-    if py_bin not in path_parts:
-        safe["PATH"] = os.pathsep.join([py_bin, *path_parts])
-    else:
-        safe["PATH"] = existing_path
-    if sys.prefix != sys.base_prefix:
-        safe["VIRTUAL_ENV"] = os.path.abspath(sys.prefix)
-
+    _prepend_venv_path(safe)
     safe["HOME"] = str(workspace_root)
     safe["WORKSPACE"] = str(workspace_root)
     safe["PWD"] = str(workspace_root)
@@ -264,24 +281,14 @@ def _sanitized_sandbox_env(workspace_root: Path) -> dict[str, str]:
     return safe
 
 
-def _check_local_command_boundaries(command: str, workspace_root: Path | None = None) -> None:
-    """Block host escape reads/writes and traversal when running in local_isolated mode."""
-    for pattern in _LOCAL_ESCAPE_PATTERNS:
-        if pattern.search(command):
-            raise SandboxSecurityError(
-                "Command rejected by sandbox policy (restricted host path, traversal, or sensitive file pattern)."
-            )
-
-    if workspace_root is not None:
-        ws_str = str(workspace_root.resolve())
-        parent_str = str(workspace_root.resolve().parent)
-        # Reject commands referencing the parent application root directly
-        if parent_str and parent_str != "/" and parent_str in command:
-            stripped_ws = command.replace(ws_str, "")
-            if parent_str in stripped_ws:
-                raise SandboxSecurityError(
-                    "Command rejected by sandbox policy (references host directory outside /workspace)."
-                )
+def _host_unrestricted_env(workspace_root: Path) -> dict[str, str]:
+    """Return the full unrestricted host environment while setting WORKSPACE/PWD to the session workspace."""
+    env = dict(os.environ)
+    _prepend_venv_path(env)
+    env["WORKSPACE"] = str(workspace_root)
+    env["PWD"] = str(workspace_root)
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    return env
 
 
 class SandboxManager:
@@ -348,7 +355,9 @@ class SandboxManager:
                 raise SandboxExecutionError(self._docker_error) from exc
 
     @property
-    def active_backend(self) -> Literal["docker", "local_isolated"]:
+    def active_backend(self) -> Literal["docker", "local_isolated", "host_unrestricted"]:
+        if self.allow_unsafe_local_bash and self.config.backend != "docker":
+            return "host_unrestricted"
         return "docker" if self._docker_available else "local_isolated"
 
     def get_session_workspace(self, session_id: str = "default") -> Path:
@@ -441,7 +450,9 @@ class SandboxManager:
         )
 
         async with self._get_lock(session_id):
-            if self._docker_available:
+            if self._docker_available and not (
+                self.allow_unsafe_local_bash and self.config.backend != "docker"
+            ):
                 return await self._exec_docker(command, session_id, effective_timeout)
             return await self._exec_local_isolated(command, session_id, effective_timeout)
 
@@ -519,7 +530,6 @@ class SandboxManager:
         timeout: int,
     ) -> ExecResult:
         ws = self.get_session_workspace(session_id)
-        _check_local_command_boundaries(command, workspace_root=ws)
 
         if self.config.backend == "auto" and not self.allow_unsafe_local_bash:
             raise SandboxSecurityError(
@@ -528,12 +538,16 @@ class SandboxManager:
                 "(or set ALLOW_UNSAFE_LOCAL_BASH=true in .env) for explicit local opt-in."
             )
 
-        env = _sanitized_sandbox_env(ws)
+        unrestricted = bool(self.allow_unsafe_local_bash)
+        backend_label = "host_unrestricted" if unrestricted else "local_isolated"
+        env = _host_unrestricted_env(ws) if unrestricted else _sanitized_sandbox_env(ws)
         mem_bytes = _parse_memory_bytes(self.config.memory_limit)
         cpu_seconds = max(timeout + 2, 5)
 
         def _preexec() -> None:
             os.setsid()
+            if unrestricted:
+                return
             try:
                 resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
             except (ValueError, OSError):
@@ -626,7 +640,7 @@ class SandboxManager:
                 stdout=stdout_str,
                 stderr=stderr_str,
                 timed_out=False,
-                backend="local_isolated",
+                backend=backend_label,
                 session_id=session_id,
             )
         except asyncio.CancelledError:
@@ -639,7 +653,7 @@ class SandboxManager:
                 stdout="",
                 stderr=f"Command timed out after {timeout}s and process group was terminated.",
                 timed_out=True,
-                backend="local_isolated",
+                backend=backend_label,
                 session_id=session_id,
             )
 
@@ -652,7 +666,11 @@ class SandboxManager:
         end_line: int | None = None,
     ) -> str:
         ws = self.get_session_workspace(session_id)
-        resolved = resolve_workspace_path(path, ws)
+        resolved = resolve_workspace_path(
+            path,
+            ws,
+            allow_host_access=self.allow_unsafe_local_bash,
+        )
         if not resolved.exists():
             raise FileNotFoundError(f"File not found: {path}")
         if resolved.is_dir():
@@ -678,12 +696,16 @@ class SandboxManager:
         max_lines: int = 250,
         max_chars: int = 24_000,
     ) -> dict[str, Any]:
-        """Read a workspace file with deterministic line-range pagination and metadata.
+        """Read a file with deterministic line-range pagination and metadata.
 
         Never silently truncates mid-line or presents a partial read as complete.
         """
         ws = self.get_session_workspace(session_id)
-        resolved = resolve_workspace_path(path, ws)
+        resolved = resolve_workspace_path(
+            path,
+            ws,
+            allow_host_access=self.allow_unsafe_local_bash,
+        )
         if not resolved.exists():
             raise FileNotFoundError(f"File not found: {path}")
         if resolved.is_dir():
@@ -820,9 +842,17 @@ class SandboxManager:
 
     def write_file(self, path: str, content: str, *, session_id: str = "default") -> str:
         ws = self.get_session_workspace(session_id)
-        resolved = resolve_workspace_path(path, ws)
+        resolved = resolve_workspace_path(
+            path,
+            ws,
+            allow_host_access=self.allow_unsafe_local_bash,
+        )
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolve_workspace_path(path, ws)
+        resolve_workspace_path(
+            path,
+            ws,
+            allow_host_access=self.allow_unsafe_local_bash,
+        )
         resolved.write_text(content, encoding="utf-8")
         vpath = to_virtual_workspace_path(resolved, ws)
         return f"Wrote {len(content)} characters to {vpath}"
@@ -836,7 +866,11 @@ class SandboxManager:
         session_id: str = "default",
     ) -> str:
         ws = self.get_session_workspace(session_id)
-        resolved = resolve_workspace_path(path, ws)
+        resolved = resolve_workspace_path(
+            path,
+            ws,
+            allow_host_access=self.allow_unsafe_local_bash,
+        )
         if not resolved.exists():
             raise FileNotFoundError(f"Cannot edit non-existent file: {path}")
         if not old_text:
@@ -882,7 +916,12 @@ class SandboxManager:
         include_internal: bool = False,
     ) -> list[str]:
         ws = self.get_session_workspace(session_id)
-        resolved = resolve_workspace_path(path, ws, allow_root=True)
+        resolved = resolve_workspace_path(
+            path,
+            ws,
+            allow_root=True,
+            allow_host_access=self.allow_unsafe_local_bash,
+        )
         if not resolved.exists():
             raise FileNotFoundError(f"Directory not found: {path}")
         if not resolved.is_dir():

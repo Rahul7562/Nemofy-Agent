@@ -2433,7 +2433,9 @@ export function SettingsView({
                 <AlertTriangle className="w-4 h-4 text-[var(--flare)] shrink-0 mt-0.5" />
                 <div>
                   <span className="font-semibold text-[var(--flare)]">Security Warning:</span> Enabling{' '}
-                  <code className="font-mono text-[var(--ink)]">ALLOW_UNSAFE_LOCAL_BASH</code> permits the agent to run local host shell commands directly when Docker sandbox isolation is unavailable. Potentially dangerous commands could modify host files or expose local environment state. Leave this disabled unless you explicitly trust the workspace and prompts.
+                  <code className="font-mono text-[var(--ink)]">ALLOW_UNSAFE_LOCAL_BASH</code> grants the agent unrestricted access to the entire host machine (including{' '}
+                  <code className="font-mono text-[var(--ink)]">/root</code>, system directories, and all shell commands without sandbox filters) while still starting work inside{' '}
+                  <code className="font-mono text-[var(--ink)]">/workspace</code>. Execution safety relies on your guardrails approval mode. Leave this disabled unless you explicitly trust the workspace and prompts.
                 </div>
               </div>
 
@@ -2449,7 +2451,7 @@ export function SettingsView({
                     }
                   >
                     {llmConfig?.allow_unsafe_local_bash
-                      ? 'Enabled (Local Shell Permitted)'
+                      ? 'Enabled (Unrestricted Host Access)'
                       : 'Disabled (Safe Default)'}
                   </span>
                 </span>
