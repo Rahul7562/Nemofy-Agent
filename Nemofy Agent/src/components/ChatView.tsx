@@ -44,7 +44,9 @@ import type {
   ExecutionAccessMode,
   FileChangeItem,
   PersistedLLMConfig,
+  ProviderAvailability,
   ProviderModelOption,
+  ThreadSessionConfig,
 } from '../types/agent.ts';
 import { AgentActivityPanel } from './AgentActivityPanel.tsx';
 import { ChatComposer } from './ChatComposer.tsx';
@@ -74,11 +76,16 @@ interface ChatViewProps {
   }) => void;
   onCreateThread: (title?: string) => Promise<ChatThread | null>;
   llmConfig: PersistedLLMConfig | null;
+  sessionConfig: ThreadSessionConfig | null;
+  providers: Record<string, ProviderAvailability>;
+  onQuickSwitchSessionProvider: (nextProvider: string) => void;
   onQuickSwitchPrimaryModel: (
     nextModel: string,
     option?: ProviderModelOption,
     options?: { persist?: boolean },
   ) => void;
+  onSetManualContextWindow?: (manualWindow: number | null) => Promise<void> | void;
+  onRefreshContextMetadata?: () => Promise<void> | void;
   onPrimaryThinkingChange?: (level: ThinkingLevel) => void;
   accessMode: ExecutionAccessMode;
   onChangeAccessMode: (mode: ExecutionAccessMode) => void;
@@ -106,7 +113,12 @@ export function ChatView({
   onApprovalDecision,
   onCreateThread,
   llmConfig,
+  sessionConfig,
+  providers,
+  onQuickSwitchSessionProvider,
   onQuickSwitchPrimaryModel,
+  onSetManualContextWindow,
+  onRefreshContextMetadata,
   onPrimaryThinkingChange,
   accessMode,
   onChangeAccessMode,
@@ -137,9 +149,11 @@ export function ChatView({
   const { sending, stopping, resuming, liveActivity, error: runError } = threadRun;
   const { prompt, pendingAttachments, uploadingFiles } = threadDraft;
 
-  // Adaptive Thinking Mode & Multimodal Capability Detection
-  const primaryProvider = llmConfig?.primary.provider || 'river_ai';
-  const primaryModel = (llmConfig?.primary.model || '').trim();
+  // Adaptive Thinking Mode & Multimodal Capability Detection (strictly session-scoped!)
+  const primaryProvider = sessionConfig?.provider || llmConfig?.primary.provider || 'river_ai';
+  const primaryModel = (sessionConfig?.model ?? llmConfig?.primary.model ?? '').trim();
+  const effectiveReasoningEffort =
+    sessionConfig?.reasoning_effort ?? llmConfig?.primary.reasoning_effort;
   const hasPrimaryModel = primaryModel.length > 0;
   const primaryModalities = useMemo(
     () => detectModelInputModalities(primaryProvider, primaryModel),
@@ -154,12 +168,27 @@ export function ChatView({
     [primaryProvider, primaryModel],
   );
   const [selectedThinking, setSelectedThinking] = useState<ThinkingLevel>(() =>
-    normalizeThinkingLevel(thinkingProfile, llmConfig?.primary.reasoning_effort),
+    normalizeThinkingLevel(thinkingProfile, effectiveReasoningEffort),
   );
 
+  const threadForContext = useMemo(() => {
+    if (activeThread) {
+      return sessionConfig ? { ...activeThread, sessionConfig } : activeThread;
+    }
+    if (!sessionConfig) return null;
+    return {
+      id: '__draft__',
+      title: 'New Agent Session',
+      createdAt: '',
+      updatedAt: '',
+      messages: [],
+      sessionConfig,
+    } satisfies ChatThread;
+  }, [activeThread, sessionConfig]);
+
   const contextUsage = useMemo(
-    () => computeModelContextUsage({ thread: activeThread, liveActivity, llmConfig }),
-    [activeThread, liveActivity, llmConfig],
+    () => computeModelContextUsage({ thread: threadForContext, liveActivity, llmConfig }),
+    [threadForContext, liveActivity, llmConfig],
   );
 
   const workspaceChangesCount = useMemo(() => {
@@ -186,14 +215,14 @@ export function ChatView({
     });
   }
 
-  // Keep selected thinking mode synchronized & valid whenever active model or llmConfig changes
+  // Keep selected thinking mode synchronized & valid whenever active session's model or effort changes
   useEffect(() => {
     const nextLevel = normalizeThinkingLevel(
       thinkingProfile,
-      llmConfig?.primary.reasoning_effort ?? selectedThinking,
+      effectiveReasoningEffort ?? selectedThinking,
     );
     setSelectedThinking(nextLevel);
-  }, [thinkingProfile, llmConfig?.primary.reasoning_effort]);
+  }, [thinkingProfile, effectiveReasoningEffort]);
 
   // Close image lightbox on Escape
   useEffect(() => {
@@ -409,7 +438,12 @@ export function ChatView({
         onOpenMobileSidebar={onOpenMobileSidebar}
         onNewThread={() => void onCreateThread()}
         llmConfig={llmConfig}
+        sessionConfig={sessionConfig}
+        providers={providers}
+        onQuickSwitchSessionProvider={onQuickSwitchSessionProvider}
         onQuickSwitchPrimaryModel={onQuickSwitchPrimaryModel}
+        onSetManualContextWindow={onSetManualContextWindow}
+        onRefreshContextMetadata={onRefreshContextMetadata}
         onOpenLLMSettings={onOpenLLMSettings}
         contextUsage={contextUsage}
         workspaceOpen={workspaceOpen}

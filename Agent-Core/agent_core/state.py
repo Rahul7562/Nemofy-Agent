@@ -97,6 +97,19 @@ def _sanitize_filename_token(raw: str) -> str:
     return cleaned[:48] or "tool"
 
 
+_COMPACTION_EXEMPT_TOOLS: frozenset[str] = frozenset({"read_file"})
+
+
+def _is_compaction_exempt_tool(tool_name: str) -> bool:
+    clean = (tool_name or "").strip().lower()
+    if clean in _COMPACTION_EXEMPT_TOOLS:
+        return True
+    # Also exempt isolated sub-agent read_file wrappers (e.g. subagent_code_review_read_file)
+    if clean.endswith("_read_file"):
+        return True
+    return False
+
+
 def compact_tool_output(
     tool_name: str,
     raw_output: str,
@@ -104,7 +117,13 @@ def compact_tool_output(
     workspace_dir: Path | str | None = None,
     threshold: int | None = None,
 ) -> tuple[str, str | None]:
-    """Compact tool output exceeding the character threshold and archive the raw payload."""
+    """Compact tool output exceeding the character threshold and archive the raw payload.
+
+    ``read_file`` is intentionally exempt from destructive head/tail compaction because it
+    uses deterministic line-range pagination with explicit metadata and chunk bounds.
+    """
+    if _is_compaction_exempt_tool(tool_name):
+        return raw_output, None
     limit = DEFAULT_COMPACTION_THRESHOLD if threshold is None else threshold
     if len(raw_output) <= limit:
         return raw_output, None

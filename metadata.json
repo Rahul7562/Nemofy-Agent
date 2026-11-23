@@ -1,6 +1,8 @@
 {
-  "name": "n8n Workflow Automation",
-  "description": "Self-hosted n8n workflow automation engine connected directly to the devserver web port.",
+  "name": "Nemofy Agent",
+  "description": "Protected autonomous AI agent workspace with multi-provider LLM orchestration, per-session context isolation, sandboxed filesystem tools, and Firecrawl Local web research.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

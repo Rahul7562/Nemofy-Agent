@@ -60,9 +60,11 @@ from agent_core.models import (
     ModelOverride,
     ModelSpec,
     build_chat_model,
+    classify_model_error_category,
     get_primary_model,
     get_worker_model,
-    invoke_with_rate_limit_retry,
+    invoke_with_resilient_retry,
+    is_timeout_model_error,
     load_model_spec,
     resolve_accessory_model_spec,
     resolve_model_spec_with_override,
@@ -310,7 +312,15 @@ def _describe_model_instance(
             "max_tokens": spec.max_tokens,
             "reasoning_effort": spec.reasoning_effort,
             "context_window": spec.context_window,
+            "context_window_source": spec.context_window_source,
+            "manual_context_window": spec.manual_context_window,
             "max_output_tokens": spec.max_output_tokens,
+            "timeout_seconds": spec.timeout_seconds,
+            "connect_timeout_seconds": spec.connect_timeout_seconds,
+            "max_retries": spec.max_retries,
+            "fallback_on_timeout": spec.fallback_on_timeout,
+            "fallback_provider": spec.fallback_provider,
+            "fallback_model": spec.fallback_model,
         }
     if model_obj is None:
         return {"provider": "unknown", "model": "unknown", "base_url": ""}
@@ -1043,8 +1053,9 @@ async def _invoke_model_with_live_thinking(
             pending_delta = ""
             last_flush = now_t
 
+    stream_iter = bound_model.astream(input_messages)
     try:
-        async for chunk in bound_model.astream(input_messages):
+        async for chunk in stream_iter:
             chunk_meta = getattr(chunk, "response_metadata", None) or {}
             if isinstance(chunk_meta, dict):
                 chunk_fr = _normalize_finish_reason(
@@ -1119,7 +1130,7 @@ async def _invoke_model_with_live_thinking(
                         turn_count=turn_count,
                         detail=f"Preparing tool call: {t_name}",
                     )
-    except GraphInterrupt:
+    except (GraphInterrupt, asyncio.CancelledError):
         raise
     except (
         NotImplementedError,
@@ -1136,6 +1147,13 @@ async def _invoke_model_with_live_thinking(
         _flush_thinking(force=True)
         raw = await bound_model.ainvoke(input_messages)
         return raw if isinstance(raw, AIMessage) else AIMessage(content=str(getattr(raw, "content", "") or ""))
+    finally:
+        aclose = getattr(stream_iter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
 
     _flush_thinking(force=True)
 
@@ -1461,6 +1479,7 @@ def build_supervisor_graph(
     local_tools = build_local_tools(
         resolved_sandbox,
         allow_private_web_fetch=allow_private_web_fetch,
+        extract_model_factory=lambda: current_worker_model.get() or resolved_worker_model,
     )
     load_skill_tool = make_load_skill_tool(resolved_skills)
 
@@ -1631,6 +1650,14 @@ def build_supervisor_graph(
                 if isinstance(model_attr_ctx, int) and model_attr_ctx >= 512
                 else None
             )
+        explicit_ctx_source = (
+            str(active_primary_meta.get("context_window_source")).strip()
+            if active_primary_meta.get("context_window_source")
+            else None
+        )
+        manual_ctx_window = active_primary_meta.get("manual_context_window")
+        if not isinstance(manual_ctx_window, int) or manual_ctx_window < 512:
+            manual_ctx_window = None
         explicit_max_out = active_primary_meta.get("max_output_tokens")
         if not isinstance(explicit_max_out, int) or explicit_max_out < 256:
             model_attr_out = getattr(base_candidate, "max_output_tokens", None)
@@ -1642,11 +1669,17 @@ def build_supervisor_graph(
         configured_max_toks = active_primary_meta.get("max_tokens")
         if not isinstance(configured_max_toks, int) or configured_max_toks < 64:
             configured_max_toks = None
+        active_max_retries = active_primary_meta.get("max_retries")
+        if not isinstance(active_max_retries, int) or active_max_retries < 0:
+            active_max_retries = 2
+        active_read_timeout = active_primary_meta.get("timeout_seconds")
 
         pre_context_usage = compute_context_usage(
             provider=active_provider_name,
             model=active_model_name,
             explicit_context_window=explicit_ctx_window,
+            explicit_context_window_source=explicit_ctx_source,
+            manual_context_window=manual_ctx_window,
             explicit_max_output_tokens=explicit_max_out,
             configured_max_tokens=configured_max_toks,
             system_prompt_text=sys_prompt,
@@ -1710,6 +1743,8 @@ def build_supervisor_graph(
                     provider=active_provider_name,
                     model=active_model_name,
                     explicit_context_window=explicit_ctx_window,
+                    explicit_context_window_source=explicit_ctx_source,
+                    manual_context_window=manual_ctx_window,
                     explicit_max_output_tokens=explicit_max_out,
                     configured_max_tokens=configured_max_toks,
                     system_prompt_text=sys_prompt,
@@ -1781,19 +1816,23 @@ def build_supervisor_graph(
             model_label = active_model_name or "primary model"
 
             async def _invoke_once(target_bound: Any) -> AIMessage:
-                return await invoke_with_rate_limit_retry(
+                return await invoke_with_resilient_retry(
                     lambda: _invoke_model_with_live_thinking(
                         target_bound,
                         prompt_msgs,
                         turn_count=turn_count,
                     ),
                     label=model_label,
+                    provider=active_provider_name,
+                    model=active_model_name,
+                    stage="planning",
+                    max_transient_retries=active_max_retries,
                     turn_count=turn_count,
                 )
 
             try:
                 reply = await _invoke_once(bound_candidate)
-            except GraphInterrupt:
+            except (GraphInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:  # noqa: BLE001
                 err_lower = str(exc).lower()
@@ -1819,6 +1858,36 @@ def build_supervisor_graph(
                         else fallback_model
                     )
                     reply = await _invoke_once(fallback_bound)
+                elif is_timeout_model_error(exc) and bool(active_primary_meta.get("fallback_on_timeout")):
+                    fb_provider = str(active_primary_meta.get("fallback_provider") or "").strip()
+                    fb_model_name = str(active_primary_meta.get("fallback_model") or "").strip()
+                    if fb_provider and fb_model_name:
+                        logger.warning(
+                            "Primary model timed out during planning [provider=%s model=%s]; "
+                            "falling back to configured fallback [provider=%s model=%s].",
+                            active_provider_name,
+                            active_model_name,
+                            fb_provider,
+                            fb_model_name,
+                        )
+                        emit_progress(
+                            "thinking",
+                            turn_count=turn_count,
+                            detail=f"Primary model timed out — falling back to {fb_provider}/{fb_model_name}...",
+                        )
+                        fb_spec = resolve_model_spec_with_override(
+                            "primary",
+                            override={"provider": fb_provider, "model": fb_model_name},
+                        )
+                        fb_llm = build_chat_model("primary", spec=fb_spec, require_api_key=True)
+                        fb_bound: Any = (
+                            fb_llm.bind_tools(active_tool_list)
+                            if hasattr(fb_llm, "bind_tools")
+                            else fb_llm
+                        )
+                        reply = await _invoke_once(fb_bound)
+                    else:
+                        raise
                 else:
                     raise
             if not isinstance(reply, AIMessage):
@@ -1841,7 +1910,7 @@ def build_supervisor_graph(
                 base_candidate,
                 llm_input_messages,
             )
-        except GraphInterrupt:
+        except (GraphInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001
             # Runtime safety net: if the primary model unexpectedly rejects native multimodal blocks,
@@ -1885,10 +1954,15 @@ def build_supervisor_graph(
                         base_candidate,
                         llm_input_messages,
                     )
-                except GraphInterrupt:
+                except (GraphInterrupt, asyncio.CancelledError):
                     raise
                 except Exception as retry_exc:  # noqa: BLE001
-                    err_msg = f"Primary model error after Accessory fallback: {retry_exc}"
+                    err_cat = classify_model_error_category(retry_exc)
+                    err_msg = (
+                        f"Primary model error after Accessory fallback "
+                        f"[{err_cat} | provider={active_provider_name or 'unknown'} | "
+                        f"model={active_model_name or 'unknown'}]: {retry_exc}"
+                    )
                     logger.error(err_msg)
                     return {
                         "turn_count": turn_count,
@@ -1901,8 +1975,26 @@ def build_supervisor_graph(
                         "final_response": f"Agent stopped due to model error: {err_msg}",
                     }
             else:
-                err_msg = f"Primary model error during planning: {exc}"
-                logger.error(err_msg)
+                err_cat = classify_model_error_category(exc)
+                timeout_hint = (
+                    f" (read_timeout={active_read_timeout}s, retries={active_max_retries})"
+                    if is_timeout_model_error(exc) and active_read_timeout is not None
+                    else ""
+                )
+                err_msg = (
+                    f"Primary model error during planning "
+                    f"[{err_cat} | provider={active_provider_name or 'unknown'} | "
+                    f"model={active_model_name or 'unknown'}]{timeout_hint}: {exc}"
+                )
+                logger.error(
+                    "Planning failure [session=%s turn=%d category=%s provider=%s model=%s]: %s",
+                    current_session_id.get(),
+                    turn_count,
+                    err_cat,
+                    active_provider_name or "unknown",
+                    active_model_name or "unknown",
+                    exc,
+                )
                 return {
                     "turn_count": turn_count,
                     "plan": update_plan_step(
@@ -2086,6 +2178,8 @@ def build_supervisor_graph(
             provider=active_provider_name,
             model=active_model_name,
             explicit_context_window=explicit_ctx_window,
+            explicit_context_window_source=explicit_ctx_source,
+            manual_context_window=manual_ctx_window,
             explicit_max_output_tokens=explicit_max_out,
             configured_max_tokens=configured_max_toks,
             system_prompt_text=sys_prompt,

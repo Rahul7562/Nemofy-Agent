@@ -432,21 +432,187 @@ export function matchLiveModelOption(
   return null;
 }
 
+export type ContextWindowSource =
+  | 'manual'
+  | 'custom_provider_config'
+  | 'provider_catalog'
+  | 'provider_registry'
+  | 'reference_catalog'
+  | 'model_registry'
+  | 'unknown';
+
+// Provider-specific model context windows where hosting providers differ for the same model name.
+// Mirrors Agent-Core/agent_core/context_manager.py _PROVIDER_MODEL_CONTEXT_WINDOWS.
+const PROVIDER_MODEL_CONTEXT_WINDOWS: Readonly<Record<string, ReadonlyArray<readonly [string, number]>>> = {
+  groq: [
+    ['llama-3.3-70b-versatile', 131_072],
+    ['llama-3.1-8b-instant', 131_072],
+    ['llama-4-scout', 131_072],
+    ['llama-4-maverick', 131_072],
+    ['qwen-qwq-32b', 131_072],
+    ['deepseek-r1-distill', 131_072],
+    ['mixtral-8x7b-32768', 32_768],
+    ['gemma2-9b-it', 8_192],
+  ],
+  deepseek: [
+    ['deepseek-chat', 128_000],
+    ['deepseek-reasoner', 128_000],
+  ],
+  openrouter: [
+    ['deepseek-chat', 163_840],
+    ['deepseek-r1', 163_840],
+    ['llama-4-scout', 1_048_576],
+    ['llama-4-maverick', 1_048_576],
+  ],
+  together: [
+    ['llama-3.3-70b', 131_072],
+    ['llama-4-scout', 1_048_576],
+    ['llama-4-maverick', 1_048_576],
+    ['deepseek-r1', 163_840],
+    ['deepseek-v3', 131_072],
+  ],
+  fireworks: [
+    ['deepseek-r1', 163_840],
+    ['deepseek-v3.2', 163_840],
+    ['deepseek-v3.1', 163_840],
+    ['deepseek-v3', 128_000],
+    ['llama-4-scout', 1_048_576],
+    ['llama-4-maverick', 1_048_576],
+  ],
+  nvidia: [
+    ['llama-3.3-70b', 131_072],
+    ['deepseek-r1', 128_000],
+  ],
+};
+
+const PROVIDER_MODEL_MAX_OUTPUT_TOKENS: Readonly<Record<string, ReadonlyArray<readonly [string, number]>>> = {
+  groq: [
+    ['llama-3.3-70b-versatile', 32_768],
+    ['llama-3.1-8b-instant', 131_072],
+    ['llama-4-scout', 8_192],
+    ['llama-4-maverick', 8_192],
+    ['mixtral-8x7b-32768', 32_768],
+    ['gemma2-9b-it', 8_192],
+  ],
+  deepseek: [
+    ['deepseek-chat', 8_192],
+    ['deepseek-reasoner', 65_536],
+  ],
+};
+
+function isUnverifiedLocalOrCustomProvider(provider?: string | null): boolean {
+  const clean = (provider || '').trim().toLowerCase();
+  return (
+    clean === 'custom' ||
+    clean.startsWith('custom_') ||
+    clean === 'ollama' ||
+    clean === 'vllm' ||
+    clean === 'local'
+  );
+}
+
+export function deriveDetectionMode(
+  source: string | null | undefined,
+  contextWindow: number | null,
+): 'auto' | 'manual' | 'unknown' {
+  if (contextWindow === null || !source || source === 'unknown') return 'unknown';
+  if (source === 'manual') return 'manual';
+  return 'auto';
+}
+
+export function computeInputBudgetMetrics(params: {
+  contextWindow: number | null;
+  usedTokens: number;
+  maxOutputTokens: number | null;
+  configuredMaxTokens: number | null;
+}): {
+  reservedOutputTokens: number;
+  safetyBufferTokens: number;
+  usableInputWindow: number | null;
+  remainingInputBudget: number | null;
+  inputBudgetPercent: number | null;
+} {
+  const { contextWindow, usedTokens, maxOutputTokens, configuredMaxTokens } = params;
+  if (contextWindow === null || contextWindow < MIN_CONTEXT_WINDOW) {
+    return {
+      reservedOutputTokens: 0,
+      safetyBufferTokens: 0,
+      usableInputWindow: null,
+      remainingInputBudget: null,
+      inputBudgetPercent: null,
+    };
+  }
+
+  let rawOut = configuredMaxTokens ?? maxOutputTokens ?? Math.min(4_096, Math.floor(contextWindow / 4));
+  if (maxOutputTokens !== null && maxOutputTokens > 0) {
+    rawOut = Math.min(rawOut, maxOutputTokens);
+  }
+  const reservedOutputTokens = Math.max(0, Math.min(Math.round(rawOut), Math.floor(contextWindow * 0.5)));
+  const safetyBufferTokens = Math.min(2_048, Math.max(256, Math.floor(contextWindow * 0.02)));
+  const usableInputWindow = Math.max(256, contextWindow - reservedOutputTokens - safetyBufferTokens);
+  const remainingInputBudget = Math.max(0, usableInputWindow - Math.max(0, usedTokens));
+  const inputBudgetPercent = roundOneDecimal(
+    Math.min(100, (Math.max(0, usedTokens) / Math.max(1, usableInputWindow)) * 100),
+  );
+
+  return {
+    reservedOutputTokens,
+    safetyBufferTokens,
+    usableInputWindow,
+    remainingInputBudget,
+    inputBudgetPercent,
+  };
+}
+
 export function resolveModelContextWindow(
-  _provider?: string | null,
+  provider?: string | null,
   model?: string | null,
   explicitContextWindow?: number | null,
-): { contextWindow: number | null; source: 'provider_catalog' | 'model_registry' | 'unknown' } {
+  options?: {
+    manualContextWindow?: number | null;
+    explicitSource?: string | null;
+  },
+): { contextWindow: number | null; source: ContextWindowSource } {
+  const manual = options?.manualContextWindow;
+  if (typeof manual === 'number' && Number.isFinite(manual) && manual >= MIN_CONTEXT_WINDOW) {
+    return { contextWindow: Math.round(manual), source: 'manual' };
+  }
+
   if (
     typeof explicitContextWindow === 'number' &&
     Number.isFinite(explicitContextWindow) &&
     explicitContextWindow >= MIN_CONTEXT_WINDOW
   ) {
-    return { contextWindow: Math.round(explicitContextWindow), source: 'provider_catalog' };
+    const cleanSource = (options?.explicitSource || '').trim().toLowerCase();
+    const resolvedSource: ContextWindowSource =
+      cleanSource === 'manual' ||
+      cleanSource === 'custom_provider_config' ||
+      cleanSource === 'provider_catalog' ||
+      cleanSource === 'provider_registry' ||
+      cleanSource === 'reference_catalog' ||
+      cleanSource === 'model_registry'
+        ? cleanSource
+        : 'provider_catalog';
+    return { contextWindow: Math.round(explicitContextWindow), source: resolvedSource };
   }
 
+  // Never guess context windows for custom or local endpoints (Ollama/vLLM/custom_*)
+  // without verified provider metadata, custom provider config, or a manual override.
+  if (isUnverifiedLocalOrCustomProvider(provider)) {
+    return { contextWindow: null, source: 'unknown' };
+  }
+
+  const provKey = (provider || '').trim().toLowerCase();
   const candidates = buildModelMatchCandidates(model || '');
   if (candidates.length > 0) {
+    const provTable = PROVIDER_MODEL_CONTEXT_WINDOWS[provKey];
+    if (provTable) {
+      for (const [pattern, limit] of provTable) {
+        if (candidates.some((target) => target.includes(pattern))) {
+          return { contextWindow: limit, source: 'provider_registry' };
+        }
+      }
+    }
     for (const [pattern, limit] of MODEL_CONTEXT_WINDOWS) {
       if (candidates.some((target) => target.includes(pattern))) {
         return { contextWindow: limit, source: 'model_registry' };
@@ -459,10 +625,10 @@ export function resolveModelContextWindow(
 }
 
 export function resolveModelMaxOutputTokens(
-  _provider?: string | null,
+  provider?: string | null,
   model?: string | null,
   explicitMaxOutputTokens?: number | null,
-): { maxOutputTokens: number | null; source: 'provider_catalog' | 'model_registry' | 'unknown' } {
+): { maxOutputTokens: number | null; source: ContextWindowSource } {
   if (
     typeof explicitMaxOutputTokens === 'number' &&
     Number.isFinite(explicitMaxOutputTokens) &&
@@ -471,8 +637,21 @@ export function resolveModelMaxOutputTokens(
     return { maxOutputTokens: Math.round(explicitMaxOutputTokens), source: 'provider_catalog' };
   }
 
+  if (isUnverifiedLocalOrCustomProvider(provider)) {
+    return { maxOutputTokens: null, source: 'unknown' };
+  }
+
+  const provKey = (provider || '').trim().toLowerCase();
   const candidates = buildModelMatchCandidates(model || '');
   if (candidates.length > 0) {
+    const provTable = PROVIDER_MODEL_MAX_OUTPUT_TOKENS[provKey];
+    if (provTable) {
+      for (const [pattern, limit] of provTable) {
+        if (candidates.some((target) => target.includes(pattern))) {
+          return { maxOutputTokens: limit, source: 'provider_registry' };
+        }
+      }
+    }
     for (const [pattern, limit] of MODEL_MAX_OUTPUT_TOKENS) {
       if (candidates.some((target) => target.includes(pattern))) {
         return { maxOutputTokens: limit, source: 'model_registry' };
@@ -488,13 +667,17 @@ export function resolveModelLimits(
   model?: string | null,
   explicitContextWindow?: number | null,
   explicitMaxOutputTokens?: number | null,
+  options?: {
+    manualContextWindow?: number | null;
+    explicitSource?: string | null;
+  },
 ): {
   contextWindow: number | null;
-  contextWindowSource: 'provider_catalog' | 'model_registry' | 'unknown';
+  contextWindowSource: ContextWindowSource;
   maxOutputTokens: number | null;
-  maxOutputTokensSource: 'provider_catalog' | 'model_registry' | 'unknown';
+  maxOutputTokensSource: ContextWindowSource;
 } {
-  const ctx = resolveModelContextWindow(provider, model, explicitContextWindow);
+  const ctx = resolveModelContextWindow(provider, model, explicitContextWindow, options);
   const out = resolveModelMaxOutputTokens(provider, model, explicitMaxOutputTokens);
   // Output limit can never exceed total context window when both are known
   const clampedOut =
@@ -515,7 +698,7 @@ export function classifyContextUsage(usagePercent: number | null): ContextClassi
       level: 'unknown',
       label: 'Unknown Window',
       description:
-        'Context window metadata is unavailable for this model. Token usage is tracked without assuming a default limit.',
+        'Context window metadata could not be verified for this provider and model. Set a manual override or refresh provider metadata.',
     };
   }
   const pct = Math.max(0, usagePercent);
@@ -582,12 +765,20 @@ export function rescaleSnapshotForModel(
   explicitContextWindow?: number | null,
   explicitMaxOutputTokens?: number | null,
   configuredMaxTokens?: number | null,
+  options?: {
+    manualContextWindow?: number | null;
+    explicitSource?: string | null;
+  },
 ): ContextUsageSnapshot {
   const activeModel = (model || '').trim();
   const activeProvider = (provider || '').trim();
   const sameModel =
     activeModel.length > 0 &&
     snapshot.model.trim().toLowerCase() === activeModel.toLowerCase();
+  const sameProvider =
+    activeProvider.length === 0 ||
+    snapshot.provider.trim().toLowerCase() === activeProvider.toLowerCase();
+  const sameTarget = sameModel && sameProvider;
 
   let targetWindow: number | null =
     typeof snapshot.context_window === 'number' &&
@@ -597,19 +788,34 @@ export function rescaleSnapshotForModel(
       : null;
   let targetSource = snapshot.context_window_source || 'unknown';
 
-  if (
+  const manualCtx =
+    typeof options?.manualContextWindow === 'number' &&
+    Number.isFinite(options.manualContextWindow) &&
+    options.manualContextWindow >= MIN_CONTEXT_WINDOW
+      ? Math.round(options.manualContextWindow)
+      : null;
+
+  if (manualCtx !== null) {
+    targetWindow = manualCtx;
+    targetSource = 'manual';
+  } else if (
     typeof explicitContextWindow === 'number' &&
     Number.isFinite(explicitContextWindow) &&
     explicitContextWindow >= MIN_CONTEXT_WINDOW
   ) {
     targetWindow = Math.round(explicitContextWindow);
-    targetSource = 'provider_catalog';
-  } else if (!sameModel && activeModel) {
-    const resolved = resolveModelContextWindow(activeProvider, activeModel, explicitContextWindow);
+    targetSource = options?.explicitSource || 'provider_catalog';
+  } else if (!sameTarget && activeModel) {
+    const resolved = resolveModelContextWindow(activeProvider, activeModel, explicitContextWindow, options);
     targetWindow = resolved.contextWindow;
     targetSource = resolved.source;
   } else if (targetWindow === null) {
-    const resolved = resolveModelContextWindow(activeProvider, activeModel || snapshot.model, explicitContextWindow);
+    const resolved = resolveModelContextWindow(
+      activeProvider,
+      activeModel || snapshot.model,
+      explicitContextWindow,
+      options,
+    );
     targetWindow = resolved.contextWindow;
     targetSource = resolved.source;
   }
@@ -629,7 +835,7 @@ export function rescaleSnapshotForModel(
   ) {
     targetMaxOutput = Math.round(explicitMaxOutputTokens);
     targetMaxOutputSource = 'provider_catalog';
-  } else if (!sameModel || targetMaxOutput === null) {
+  } else if (!sameTarget || targetMaxOutput === null) {
     const resolvedOut = resolveModelMaxOutputTokens(
       activeProvider,
       activeModel || snapshot.model,
@@ -663,6 +869,13 @@ export function rescaleSnapshotForModel(
       ? roundOneDecimal(Math.min(100, (usedTokens / Math.max(1, targetWindow)) * 100))
       : null;
   const classification = classifyContextUsage(usagePercent);
+  const budget = computeInputBudgetMetrics({
+    contextWindow: targetWindow,
+    usedTokens,
+    maxOutputTokens: targetMaxOutput,
+    configuredMaxTokens: effectiveConfiguredMaxTokens,
+  });
+  const detectionMode = deriveDetectionMode(targetSource, targetWindow);
 
   const byKey = new Map<string, ContextCategoryBreakdown>();
   for (const cat of snapshot.categories || []) {
@@ -688,9 +901,17 @@ export function rescaleSnapshotForModel(
     provider: activeProvider || snapshot.provider,
     context_window: targetWindow,
     context_window_source: targetSource,
+    detection_mode: detectionMode,
+    is_manual_override: targetSource === 'manual',
+    manual_context_window: manualCtx,
     max_output_tokens: targetMaxOutput,
     max_output_tokens_source: targetMaxOutputSource,
     configured_max_tokens: effectiveConfiguredMaxTokens,
+    reserved_output_tokens: budget.reservedOutputTokens,
+    safety_buffer_tokens: budget.safetyBufferTokens,
+    usable_input_window: budget.usableInputWindow,
+    remaining_input_budget: budget.remainingInputBudget,
+    input_budget_percent: budget.inputBudgetPercent,
     used_tokens: usedTokens,
     free_tokens: freeTokens,
     usage_percent: usagePercent,
@@ -706,11 +927,31 @@ export function computeModelContextUsage(params: {
   llmConfig: PersistedLLMConfig | null;
 }): ContextUsageSnapshot {
   const { thread, liveActivity, llmConfig } = params;
-  const provider = llmConfig?.primary.provider || '';
-  const model = llmConfig?.primary.model || '';
-  const explicitWindow = llmConfig?.primary.context_window ?? null;
-  const explicitMaxOutput = llmConfig?.primary.max_output_tokens ?? null;
-  const configuredMaxTokens = llmConfig?.primary.max_tokens ?? null;
+  // Prefer the session's own persisted configuration over global defaults so
+  // changing another session or global settings never alters this session's budget.
+  const sessionCfg = thread?.sessionConfig;
+  const provider = sessionCfg?.provider || llmConfig?.primary.provider || '';
+  const model = sessionCfg?.model || llmConfig?.primary.model || '';
+  const manualWindow =
+    sessionCfg !== undefined
+      ? sessionCfg.manual_context_window ?? null
+      : llmConfig?.primary.manual_context_window ?? null;
+  const explicitWindow =
+    sessionCfg !== undefined
+      ? sessionCfg.context_window ?? null
+      : llmConfig?.primary.context_window ?? null;
+  const explicitSource =
+    sessionCfg !== undefined
+      ? sessionCfg.context_window_source ?? null
+      : llmConfig?.primary.context_window_source ?? null;
+  const explicitMaxOutput =
+    sessionCfg !== undefined
+      ? sessionCfg.max_output_tokens ?? null
+      : llmConfig?.primary.max_output_tokens ?? null;
+  const configuredMaxTokens =
+    sessionCfg !== undefined
+      ? sessionCfg.max_tokens ?? null
+      : llmConfig?.primary.max_tokens ?? null;
 
   if (liveActivity?.contextUsage) {
     return rescaleSnapshotForModel(
@@ -720,6 +961,7 @@ export function computeModelContextUsage(params: {
       explicitWindow,
       explicitMaxOutput,
       configuredMaxTokens,
+      { manualContextWindow: manualWindow, explicitSource },
     );
   }
   if (thread?.contextUsage) {
@@ -730,10 +972,14 @@ export function computeModelContextUsage(params: {
       explicitWindow,
       explicitMaxOutput,
       configuredMaxTokens,
+      { manualContextWindow: manualWindow, explicitSource },
     );
   }
 
-  const limits = resolveModelLimits(provider, model, explicitWindow, explicitMaxOutput);
+  const limits = resolveModelLimits(provider, model, explicitWindow, explicitMaxOutput, {
+    manualContextWindow: manualWindow,
+    explicitSource,
+  });
   const contextWindow = limits.contextWindow;
   const source = limits.contextWindowSource;
   const rawConfigured =
@@ -798,6 +1044,13 @@ export function computeModelContextUsage(params: {
       ? roundOneDecimal(Math.min(100, (usedTokens / Math.max(1, contextWindow)) * 100))
       : null;
   const classification = classifyContextUsage(usagePercent);
+  const budget = computeInputBudgetMetrics({
+    contextWindow,
+    usedTokens,
+    maxOutputTokens: limits.maxOutputTokens,
+    configuredMaxTokens: effectiveConfiguredMaxTokens,
+  });
+  const detectionMode = deriveDetectionMode(source, contextWindow);
 
   const categories: ContextCategoryBreakdown[] = CONTEXT_CATEGORY_META.map((meta) => {
     const toks = rawCounts[meta.key];
@@ -816,9 +1069,17 @@ export function computeModelContextUsage(params: {
     provider: provider.trim(),
     context_window: contextWindow,
     context_window_source: source,
+    detection_mode: detectionMode,
+    is_manual_override: source === 'manual',
+    manual_context_window: manualWindow,
     max_output_tokens: limits.maxOutputTokens,
     max_output_tokens_source: limits.maxOutputTokensSource,
     configured_max_tokens: effectiveConfiguredMaxTokens,
+    reserved_output_tokens: budget.reservedOutputTokens,
+    safety_buffer_tokens: budget.safetyBufferTokens,
+    usable_input_window: budget.usableInputWindow,
+    remaining_input_budget: budget.remainingInputBudget,
+    input_budget_percent: budget.inputBudgetPercent,
     used_tokens: usedTokens,
     free_tokens: freeTokens,
     usage_percent: usagePercent,

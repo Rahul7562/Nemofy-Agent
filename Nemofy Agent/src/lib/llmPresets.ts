@@ -1,8 +1,10 @@
 import type {
   AccessoriesConfig,
   AccessoryLLMConfig,
+  CustomProviderConfig,
   MediaModality,
   PersistedLLMConfig,
+  ProviderAvailability,
   ProviderModelOption,
   RoleLLMConfig,
 } from '../types/agent.ts';
@@ -159,20 +161,74 @@ export function canonicalizeProviderId(providerId: string): string {
   return PROVIDER_ALIASES[clean] || clean;
 }
 
+export function isCustomProviderId(providerId: string): boolean {
+  const clean = canonicalizeProviderId(providerId);
+  return clean.startsWith('custom_');
+}
+
 export function getProviderPreset(providerId: string): ProviderPreset | undefined {
   const canonical = canonicalizeProviderId(providerId);
   return LLM_PROVIDER_PRESETS.find((p) => p.id === canonical);
 }
 
+export function getProviderDisplayName(
+  providerId: string,
+  customProviders?: CustomProviderConfig[],
+  providers?: Record<string, ProviderAvailability>,
+): string {
+  const canonical = canonicalizeProviderId(providerId);
+  const custom = customProviders?.find((p) => p.id === canonical);
+  if (custom?.name) return custom.name;
+  const availName = providers?.[canonical]?.name;
+  if (availName) return availName;
+  return getProviderPreset(canonical)?.label || providerId;
+}
+
 export function applyProviderPreset(
   current: RoleLLMConfig,
   nextProviderId: string,
-  options?: { clearModelOnProviderSwitch?: boolean },
+  options?: {
+    clearModelOnProviderSwitch?: boolean;
+    customProviders?: CustomProviderConfig[];
+  },
 ): RoleLLMConfig {
   const canonicalNext = canonicalizeProviderId(nextProviderId);
+  const customProvider = options?.customProviders?.find((p) => p.id === canonicalNext);
+  if (customProvider) {
+    const isSameProvider = canonicalizeProviderId(current.provider) === customProvider.id;
+    const firstModel = customProvider.models[0];
+    const nextModel = isSameProvider
+      ? current.model || (options?.clearModelOnProviderSwitch ? '' : firstModel?.id || '')
+      : options?.clearModelOnProviderSwitch
+        ? ''
+        : firstModel?.id || '';
+    const matchedCustomModel = customProvider.models.find(
+      (m) => m.id.toLowerCase() === nextModel.trim().toLowerCase(),
+    );
+    const profile = getThinkingProfile(customProvider.id, nextModel);
+    return {
+      ...current,
+      provider: customProvider.id,
+      base_url: customProvider.base_url,
+      model: nextModel,
+      context_window: matchedCustomModel?.context_window ?? (isSameProvider ? current.context_window : null),
+      context_window_source: matchedCustomModel?.context_window ? 'custom_provider_config' : null,
+      manual_context_window: isSameProvider ? current.manual_context_window : null,
+      max_output_tokens: matchedCustomModel?.max_output_tokens ?? (isSameProvider ? current.max_output_tokens : null),
+      reasoning_effort: normalizeThinkingLevel(profile, current.reasoning_effort),
+    };
+  }
+
   const preset = getProviderPreset(canonicalNext);
   if (!preset) {
-    return { ...current, provider: canonicalNext, context_window: undefined, max_output_tokens: undefined };
+    return {
+      ...current,
+      provider: canonicalNext,
+      context_window: undefined,
+      context_window_source: null,
+      manual_context_window: null,
+      max_output_tokens: undefined,
+    };
   }
 
   const isSameProvider = canonicalizeProviderId(current.provider) === preset.id;
@@ -197,6 +253,8 @@ export function applyProviderPreset(
     base_url: nextBaseUrl,
     model: nextModel,
     context_window: isSameProvider ? current.context_window : undefined,
+    context_window_source: isSameProvider ? current.context_window_source : null,
+    manual_context_window: isSameProvider ? current.manual_context_window : null,
     max_output_tokens: isSameProvider ? current.max_output_tokens : undefined,
     reasoning_effort: normalizeThinkingLevel(profile, current.reasoning_effort),
   };

@@ -3,6 +3,7 @@ import { useEffect } from 'react';
 import type {
   ExecutionAccessMode,
   PersistedLLMConfig,
+  ProviderAvailability,
   SettingsTab,
   ThemeMode,
 } from '../types/agent.ts';
@@ -14,7 +15,10 @@ interface SettingsModalProps {
   theme: ThemeMode;
   onSetTheme: (mode: ThemeMode) => void;
   initialTab: SettingsTab;
-  onLLMConfigSaved: (config: PersistedLLMConfig) => void;
+  onLLMConfigSaved: (
+    config: PersistedLLMConfig,
+    providers?: Record<string, ProviderAvailability>,
+  ) => void;
   activePrimaryReasoningEffort?: string;
   activeAccessMode?: ExecutionAccessMode;
 }
@@ -48,7 +52,7 @@ export function SettingsModal({
       aria-modal="true"
       aria-label="Settings"
       data-testid="settings-modal"
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5"
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 lg:p-6"
     >
       {/* Backdrop Overlay */}
       <div
@@ -58,20 +62,24 @@ export function SettingsModal({
       />
 
       {/* Centered Dialog Container */}
-      <div className="relative z-10 max-w-4xl w-[94vw] h-[84vh] rounded-2xl border border-[var(--rule-strong)] bg-[var(--paper)] shadow-2xl flex flex-col overflow-hidden">
+      <div className="relative z-10 max-w-[1280px] w-[96vw] h-[90vh] rounded-2xl border border-[var(--rule-strong)] bg-[var(--paper)] shadow-2xl flex flex-col overflow-hidden">
         {/* Modal Header */}
-        <div className="h-14 px-5 sm:px-6 border-b border-[var(--rule)] flex items-center justify-between gap-3 shrink-0 bg-[var(--paper)]">
-          <div className="flex items-center gap-2.5 min-w-0">
+        <div className="h-16 px-6 sm:px-8 border-b border-[var(--rule)] flex items-center justify-between gap-4 shrink-0 bg-[var(--paper)]">
+          <div className="flex items-center gap-3 min-w-0">
             <Settings className="w-4 h-4 text-[var(--signal)] shrink-0" />
-            <h2 className="font-display text-base font-semibold tracking-tight text-[var(--ink)] truncate">
+            <h2 className="font-display text-lg font-semibold tracking-tight text-[var(--ink)] truncate">
               Settings
             </h2>
+            <span className="hidden sm:inline-block h-4 w-px bg-[var(--rule)] shrink-0" aria-hidden="true" />
+            <span className="hidden sm:inline text-xs text-[var(--ink-faint)] truncate">
+              Models, security, skills &amp; runtime
+            </span>
           </div>
           <button
             type="button"
             onClick={onClose}
             aria-label="Close settings"
-            className="h-8 w-8 inline-flex items-center justify-center rounded-lg text-[var(--ink-soft)] hover:text-[var(--ink)] hover:bg-[var(--paper-sunk)] transition-colors cursor-pointer shrink-0"
+            className="h-9 w-9 inline-flex items-center justify-center rounded-lg text-[var(--ink-soft)] hover:text-[var(--ink)] hover:bg-[var(--paper-sunk)] transition-colors cursor-pointer shrink-0"
           >
             <X className="w-4 h-4" />
           </button>

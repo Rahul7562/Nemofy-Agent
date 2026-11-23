@@ -1,6 +1,13 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
-import { normalizeProviderId, type RoleLLMConfig } from './configStore.ts';
+import {
+  deriveCustomProviderSecretKey,
+  isCustomProviderId,
+  normalizeProviderId,
+  type CustomProviderConfig,
+  type CustomProviderProtocol,
+  type RoleLLMConfig,
+} from './configStore.ts';
 import { resolveModelLimits } from '../Nemofy Agent/src/lib/contextUtils.ts';
 
 function isBlockedIpv4(ip: string): boolean {
@@ -113,8 +120,9 @@ function isStoredKeyAllowedForBaseUrl(
   hasExplicitKey: boolean,
 ): boolean {
   if (hasExplicitKey) return true;
+  if (isCustomProviderId(provider)) return true;
   const defaults = PROVIDER_CATALOG_DEFAULTS[provider];
-  if (!defaults || !defaults.baseUrl || provider === 'custom') return true;
+  if (!defaults || !defaults.baseUrl) return true;
   try {
     return new URL(baseUrl).origin === new URL(defaults.baseUrl).origin;
   } catch {
@@ -209,6 +217,17 @@ export function resolveProviderApiKey(
   if (explicit) return explicit;
 
   const prov = normalizeProviderId(provider);
+  if (prov.startsWith('custom_')) {
+    const customEnvVar = deriveCustomProviderSecretKey(prov);
+    const customVal = (env[customEnvVar] || '').trim();
+    if (customVal) return customVal;
+    if (prov === 'custom_legacy') {
+      const legacyVal = (env.PRIMARY_API_KEY || env.WORKER_API_KEY || '').trim();
+      if (legacyVal) return legacyVal;
+    }
+    return null;
+  }
+
   const info = PROVIDER_CATALOG_DEFAULTS[prov];
   if (prov !== 'custom' && info) {
     for (const envVar of info.envVars) {
@@ -558,6 +577,8 @@ export function enrichModelsWithReferenceMetadata(
   provider: string,
   referenceIndex: ReferenceModelIndex | null,
 ): ProviderModelCatalogItem[] {
+  const prov = normalizeProviderId(provider);
+  const skipCloudHeuristics = isCustomProviderId(prov) || prov === 'ollama' || prov === 'vllm';
   return models.map((item) => {
     let contextLength =
       typeof item.context_length === 'number' && item.context_length > 0
@@ -569,30 +590,51 @@ export function enrichModelsWithReferenceMetadata(
         : null;
     let inputModalities = item.input_modalities;
 
-    // 1. Fill missing values from live reference catalog (never overwriting provider-reported values)
-    if (!contextLength || !maxOutputTokens || !inputModalities?.length) {
-      const refMeta = lookupReferenceModelMetadata(item.id, referenceIndex);
-      if (refMeta) {
-        if (!contextLength && refMeta.context_length) {
-          contextLength = refMeta.context_length;
+    if (!skipCloudHeuristics) {
+      // 1. Check provider-specific registry first (handles same model differing across providers)
+      if (!contextLength || !maxOutputTokens) {
+        const provResolved = resolveModelLimits(prov, item.id, contextLength, maxOutputTokens);
+        if (!contextLength && provResolved.contextWindowSource === 'provider_registry' && provResolved.contextWindow) {
+          contextLength = provResolved.contextWindow;
         }
-        if (!maxOutputTokens && refMeta.max_output_tokens) {
-          maxOutputTokens = refMeta.max_output_tokens;
-        }
-        if (!inputModalities?.length && refMeta.input_modalities?.length) {
-          inputModalities = refMeta.input_modalities;
+        if (!maxOutputTokens && provResolved.maxOutputTokensSource === 'provider_registry' && provResolved.maxOutputTokens) {
+          maxOutputTokens = provResolved.maxOutputTokens;
         }
       }
-    }
 
-    // 2. Fill remaining gaps from built-in model registry ONLY when matched to a known model family
-    if (!contextLength || !maxOutputTokens) {
-      const resolved = resolveModelLimits(provider, item.id, contextLength, maxOutputTokens);
-      if (!contextLength && resolved.contextWindowSource === 'model_registry' && resolved.contextWindow) {
-        contextLength = resolved.contextWindow;
+      // 2. Fill missing values from live reference catalog (never overwriting provider-reported values)
+      if (!contextLength || !maxOutputTokens || !inputModalities?.length) {
+        const refMeta = lookupReferenceModelMetadata(item.id, referenceIndex);
+        if (refMeta) {
+          if (!contextLength && refMeta.context_length) {
+            contextLength = refMeta.context_length;
+          }
+          if (!maxOutputTokens && refMeta.max_output_tokens) {
+            maxOutputTokens = refMeta.max_output_tokens;
+          }
+          if (!inputModalities?.length && refMeta.input_modalities?.length) {
+            inputModalities = refMeta.input_modalities;
+          }
+        }
       }
-      if (!maxOutputTokens && resolved.maxOutputTokensSource === 'model_registry' && resolved.maxOutputTokens) {
-        maxOutputTokens = resolved.maxOutputTokens;
+
+      // 3. Fill remaining gaps from built-in model registry ONLY when matched to a known model family
+      if (!contextLength || !maxOutputTokens) {
+        const resolved = resolveModelLimits(prov, item.id, contextLength, maxOutputTokens);
+        if (
+          !contextLength &&
+          (resolved.contextWindowSource === 'provider_registry' || resolved.contextWindowSource === 'model_registry') &&
+          resolved.contextWindow
+        ) {
+          contextLength = resolved.contextWindow;
+        }
+        if (
+          !maxOutputTokens &&
+          (resolved.maxOutputTokensSource === 'provider_registry' || resolved.maxOutputTokensSource === 'model_registry') &&
+          resolved.maxOutputTokens
+        ) {
+          maxOutputTokens = resolved.maxOutputTokens;
+        }
       }
     }
 
@@ -610,7 +652,10 @@ export function enrichModelsWithReferenceMetadata(
 }
 
 export type ModelMetadataSource =
+  | 'manual'
+  | 'custom_provider_config'
   | 'provider_catalog'
+  | 'provider_registry'
   | 'reference_catalog'
   | 'model_registry'
   | 'unknown';
@@ -670,32 +715,41 @@ function findMatchingCatalogItem(
 }
 
 /**
- * Unified model metadata resolver used for BOTH manually entered model IDs and dropdown selections.
+ * Unified provider-aware model metadata resolver used for BOTH manually entered model IDs and dropdown selections.
  * Resolution priority:
- *  1. Explicit positive catalog values (when passed from a dropdown item)
- *  2. Live provider catalog (in-memory provided list, cached list, or on-demand provider query)
- *  3. OpenRouter reference metadata catalog (supports cross-provider aliases & normalized slugs)
- *  4. Built-in verified model registry (only genuine family matches)
- *  5. Explicit 'unknown' state (context_window: null) — NEVER stamps a fabricated 128K fallback.
+ *  1. Manual context-window override ('manual')
+ *  2. Custom provider per-model configuration ('custom_provider_config')
+ *  3. Explicit catalog values or live provider catalog ('provider_catalog')
+ *  4. Provider-specific verified registry ('provider_registry') for built-in cloud providers
+ *  5. OpenRouter reference metadata catalog ('reference_catalog') for built-in cloud providers
+ *  6. Built-in verified model registry ('model_registry') for built-in cloud providers
+ *  7. Explicit 'unknown' state (context_window: null) — NEVER stamps a fabricated default or guesses for local/custom endpoints.
  */
 export async function resolveModelMetadataUnified(params: {
   provider: string;
   model: string;
   base_url?: string;
   api_key?: string;
+  protocol?: CustomProviderProtocol;
+  customProvider?: CustomProviderConfig | null;
   role?: 'primary' | 'worker';
   env?: Record<string, string | undefined>;
+  manualContextWindow?: number | null;
   explicitContextWindow?: number | null;
   explicitMaxOutputTokens?: number | null;
   liveModels?: ProviderModelCatalogItem[];
   referenceIndex?: ReferenceModelIndex | null;
   allowLiveFetch?: boolean;
   allowReferenceFetch?: boolean;
+  forceRefresh?: boolean;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }): Promise<UnifiedModelResolutionResult> {
   const prov = normalizeProviderId(params.provider);
   const cleanModel = (params.model || '').trim();
+  const isUnverifiedCustomOrLocal = isCustomProviderId(prov) || prov === 'ollama' || prov === 'vllm';
+  const effectiveBaseUrl = (params.base_url || params.customProvider?.base_url || '').trim().replace(/\/+$/, '');
+
   if (!cleanModel) {
     return {
       resolved: false,
@@ -710,13 +764,18 @@ export async function resolveModelMetadataUnified(params: {
   }
 
   let matchedModel: string | null = null;
-  let contextWindow: number | null =
-    typeof params.explicitContextWindow === 'number' &&
-    Number.isFinite(params.explicitContextWindow) &&
-    params.explicitContextWindow >= 512
-      ? Math.round(params.explicitContextWindow)
-      : null;
-  let contextWindowSource: ModelMetadataSource = contextWindow ? 'provider_catalog' : 'unknown';
+  let contextWindow: number | null = null;
+  let contextWindowSource: ModelMetadataSource = 'unknown';
+
+  // 0. Manual override always takes highest precedence
+  if (
+    typeof params.manualContextWindow === 'number' &&
+    Number.isFinite(params.manualContextWindow) &&
+    params.manualContextWindow >= 512
+  ) {
+    contextWindow = Math.round(params.manualContextWindow);
+    contextWindowSource = 'manual';
+  }
 
   let maxOutputTokens: number | null =
     typeof params.explicitMaxOutputTokens === 'number' &&
@@ -725,6 +784,34 @@ export async function resolveModelMetadataUnified(params: {
       ? Math.round(params.explicitMaxOutputTokens)
       : null;
   let maxOutputTokensSource: ModelMetadataSource = maxOutputTokens ? 'provider_catalog' : 'unknown';
+
+  // 0.5. Custom provider per-model configuration metadata
+  if (params.customProvider && Array.isArray(params.customProvider.models)) {
+    const customMatch = params.customProvider.models.find(
+      (m) => m.id.trim().toLowerCase() === cleanModel.toLowerCase(),
+    );
+    if (customMatch) {
+      matchedModel = customMatch.id;
+      if (!contextWindow && typeof customMatch.context_window === 'number' && customMatch.context_window >= 512) {
+        contextWindow = Math.round(customMatch.context_window);
+        contextWindowSource = 'custom_provider_config';
+      }
+      if (!maxOutputTokens && typeof customMatch.max_output_tokens === 'number' && customMatch.max_output_tokens >= 256) {
+        maxOutputTokens = Math.round(customMatch.max_output_tokens);
+        maxOutputTokensSource = 'custom_provider_config';
+      }
+    }
+  }
+
+  if (
+    !contextWindow &&
+    typeof params.explicitContextWindow === 'number' &&
+    Number.isFinite(params.explicitContextWindow) &&
+    params.explicitContextWindow >= 512
+  ) {
+    contextWindow = Math.round(params.explicitContextWindow);
+    contextWindowSource = 'provider_catalog';
+  }
 
   const applyCatalogMatch = (models: ProviderModelCatalogItem[] | null | undefined): void => {
     if (!models || models.length === 0) return;
@@ -741,35 +828,39 @@ export async function resolveModelMetadataUnified(params: {
     }
   };
 
-  // 1. Check explicitly provided liveModels or cached live catalog for this provider
+  // 1. Check explicitly provided liveModels or cached live catalog for this provider (skip cache on forceRefresh)
   if (!contextWindow || !maxOutputTokens) {
     applyCatalogMatch(params.liveModels);
   }
-  if (!contextWindow || !maxOutputTokens) {
-    applyCatalogMatch(getCachedProviderModels(prov, params.base_url));
+  if ((!contextWindow || !maxOutputTokens) && !params.forceRefresh) {
+    applyCatalogMatch(getCachedProviderModels(prov, effectiveBaseUrl || undefined));
   }
 
   // 2. If still missing context window and live fetch is permitted, query the provider's live catalog
   if ((!contextWindow || !maxOutputTokens) && params.allowLiveFetch) {
     const defaults = PROVIDER_CATALOG_DEFAULTS[prov];
-    const resolvedBase = (params.base_url || defaults?.baseUrl || '').trim().replace(/\/+$/, '');
+    const resolvedBase = (effectiveBaseUrl || defaults?.baseUrl || '').trim().replace(/\/+$/, '');
     const apiKey = resolveProviderApiKey(
       prov,
       params.role === 'worker' ? 'worker' : 'primary',
       params.env || process.env,
       params.api_key,
     );
-    const canQueryWithoutKey = defaults?.requiresKey === false || prov === 'openrouter';
+    const canQueryWithoutKey =
+      defaults?.requiresKey === false || prov === 'openrouter' || isCustomProviderId(prov);
     if (resolvedBase && (apiKey || canQueryWithoutKey)) {
       const liveResult = await listProviderModelsDirect({
         provider: prov,
         base_url: resolvedBase,
         api_key: params.api_key,
+        protocol: params.protocol || params.customProvider?.protocol,
+        customProvider: params.customProvider,
         role: params.role === 'worker' ? 'worker' : 'primary',
         env: params.env,
         fetchImpl: params.fetchImpl,
         referenceIndex: params.referenceIndex,
         enableReferenceEnrichment: params.allowReferenceFetch,
+        forceRefresh: params.forceRefresh,
       });
       if (liveResult.ok && liveResult.models.length > 0) {
         applyCatalogMatch(liveResult.models);
@@ -777,37 +868,63 @@ export async function resolveModelMetadataUnified(params: {
     }
   }
 
-  // 3. Reference catalog lookup (supports cross-provider aliases & normalized slugs)
-  if (!contextWindow || !maxOutputTokens) {
-    let refIndex: ReferenceModelIndex | null = null;
-    if (params.referenceIndex !== undefined) {
-      refIndex = params.referenceIndex;
-    } else if (params.allowReferenceFetch !== false) {
-      refIndex = await getReferenceModelCatalog(params.fetchImpl || fetch, params.timeoutMs ?? 2_500);
-    }
-    const refMeta = lookupReferenceModelMetadata(cleanModel, refIndex);
-    if (refMeta) {
-      if (!contextWindow && refMeta.context_length && refMeta.context_length >= 512) {
-        contextWindow = Math.round(refMeta.context_length);
-        contextWindowSource = 'reference_catalog';
+  if (!isUnverifiedCustomOrLocal) {
+    // 3. Provider-specific verified registry first (handles same model name having different limits per provider)
+    if (!contextWindow || !maxOutputTokens) {
+      const provReg = resolveModelLimits(prov, cleanModel, contextWindow, maxOutputTokens);
+      if (!contextWindow && provReg.contextWindowSource === 'provider_registry' && provReg.contextWindow) {
+        contextWindow = provReg.contextWindow;
+        contextWindowSource = 'provider_registry';
       }
-      if (!maxOutputTokens && refMeta.max_output_tokens && refMeta.max_output_tokens >= 256) {
-        maxOutputTokens = Math.round(refMeta.max_output_tokens);
-        maxOutputTokensSource = 'reference_catalog';
+      if (!maxOutputTokens && provReg.maxOutputTokensSource === 'provider_registry' && provReg.maxOutputTokens) {
+        maxOutputTokens = provReg.maxOutputTokens;
+        maxOutputTokensSource = 'provider_registry';
       }
     }
-  }
 
-  // 4. Built-in verified model registry (only accepts genuine 'model_registry' hits, never 128K default)
-  if (!contextWindow || !maxOutputTokens) {
-    const reg = resolveModelLimits(prov, cleanModel, contextWindow, maxOutputTokens);
-    if (!contextWindow && reg.contextWindowSource === 'model_registry' && reg.contextWindow) {
-      contextWindow = reg.contextWindow;
-      contextWindowSource = 'model_registry';
+    // 4. Reference catalog lookup (supports cross-provider aliases & normalized slugs)
+    if (!contextWindow || !maxOutputTokens) {
+      let refIndex: ReferenceModelIndex | null = null;
+      if (params.referenceIndex !== undefined) {
+        refIndex = params.referenceIndex;
+      } else if (params.allowReferenceFetch !== false) {
+        if (params.forceRefresh) {
+          clearReferenceModelCatalogCache();
+        }
+        refIndex = await getReferenceModelCatalog(params.fetchImpl || fetch, params.timeoutMs ?? 2_500);
+      }
+      const refMeta = lookupReferenceModelMetadata(cleanModel, refIndex);
+      if (refMeta) {
+        if (!contextWindow && refMeta.context_length && refMeta.context_length >= 512) {
+          contextWindow = Math.round(refMeta.context_length);
+          contextWindowSource = 'reference_catalog';
+        }
+        if (!maxOutputTokens && refMeta.max_output_tokens && refMeta.max_output_tokens >= 256) {
+          maxOutputTokens = Math.round(refMeta.max_output_tokens);
+          maxOutputTokensSource = 'reference_catalog';
+        }
+      }
     }
-    if (!maxOutputTokens && reg.maxOutputTokensSource === 'model_registry' && reg.maxOutputTokens) {
-      maxOutputTokens = reg.maxOutputTokens;
-      maxOutputTokensSource = 'model_registry';
+
+    // 5. Built-in verified model registry (only accepts genuine matches, never 128K default)
+    if (!contextWindow || !maxOutputTokens) {
+      const reg = resolveModelLimits(prov, cleanModel, contextWindow, maxOutputTokens);
+      if (
+        !contextWindow &&
+        (reg.contextWindowSource === 'provider_registry' || reg.contextWindowSource === 'model_registry') &&
+        reg.contextWindow
+      ) {
+        contextWindow = reg.contextWindow;
+        contextWindowSource = reg.contextWindowSource;
+      }
+      if (
+        !maxOutputTokens &&
+        (reg.maxOutputTokensSource === 'provider_registry' || reg.maxOutputTokensSource === 'model_registry') &&
+        reg.maxOutputTokens
+      ) {
+        maxOutputTokens = reg.maxOutputTokens;
+        maxOutputTokensSource = reg.maxOutputTokensSource;
+      }
     }
   }
 
@@ -835,11 +952,19 @@ export async function resolveModelMetadataFromCatalog(params: {
   env?: Record<string, string | undefined>;
   explicitContextWindow?: number | null;
   explicitMaxOutputTokens?: number | null;
+  manualContextWindow?: number | null;
+  customProvider?: CustomProviderConfig | null;
+  forceRefresh?: boolean;
   referenceIndex?: ReferenceModelIndex | null;
   allowLiveFetch?: boolean;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
-}): Promise<{ context_window?: number; max_output_tokens?: number }> {
+}): Promise<{
+  context_window?: number;
+  max_output_tokens?: number;
+  context_window_source?: string;
+  max_output_tokens_source?: string;
+}> {
   const unified = await resolveModelMetadataUnified({
     provider: params.provider,
     model: params.model,
@@ -848,6 +973,9 @@ export async function resolveModelMetadataFromCatalog(params: {
     env: params.env,
     explicitContextWindow: params.explicitContextWindow,
     explicitMaxOutputTokens: params.explicitMaxOutputTokens,
+    manualContextWindow: params.manualContextWindow,
+    customProvider: params.customProvider,
+    forceRefresh: params.forceRefresh,
     referenceIndex: params.referenceIndex,
     allowLiveFetch: params.allowLiveFetch ?? false,
     fetchImpl: params.fetchImpl,
@@ -857,6 +985,8 @@ export async function resolveModelMetadataFromCatalog(params: {
   return {
     ...(unified.context_window ? { context_window: unified.context_window } : {}),
     ...(unified.max_output_tokens ? { max_output_tokens: unified.max_output_tokens } : {}),
+    ...(unified.context_window_source ? { context_window_source: unified.context_window_source } : {}),
+    ...(unified.max_output_tokens_source ? { max_output_tokens_source: unified.max_output_tokens_source } : {}),
   };
 }
 
@@ -1008,11 +1138,16 @@ export function parseModelsPayload(payload: unknown, provider: string): Provider
   return models;
 }
 
-function buildProviderHeaders(provider: string, apiKey: string | null): Record<string, string> {
+function buildProviderHeaders(
+  provider: string,
+  apiKey: string | null,
+  protocol?: CustomProviderProtocol,
+): Record<string, string> {
   const headers: Record<string, string> = { Accept: 'application/json' };
   const prov = normalizeProviderId(provider);
+  const useAnthropicHeaders = prov === 'anthropic' || protocol === 'anthropic_compatible';
   if (apiKey) {
-    if (prov === 'anthropic') {
+    if (useAnthropicHeaders) {
       headers['x-api-key'] = apiKey;
       headers['anthropic-version'] = '2023-06-01';
     } else {
@@ -1149,23 +1284,91 @@ async function enrichOllamaContextLengths(
   });
 }
 
+function buildConfiguredCustomModels(
+  customProvider?: CustomProviderConfig | null,
+): ProviderModelCatalogItem[] {
+  if (!customProvider || !Array.isArray(customProvider.models)) return [];
+  return customProvider.models
+    .filter((m) => m && typeof m.id === 'string' && m.id.trim())
+    .map((m) => ({
+      id: m.id.trim(),
+      ...(m.name ? { name: m.name } : {}),
+      ...(typeof m.context_window === 'number' && m.context_window >= 512
+        ? { context_length: Math.round(m.context_window) }
+        : {}),
+      ...(typeof m.max_output_tokens === 'number' && m.max_output_tokens >= 256
+        ? { max_output_tokens: Math.round(m.max_output_tokens) }
+        : {}),
+      source: 'preset' as const,
+    }));
+}
+
+function mergeWithCustomConfiguredModels(
+  liveModels: ProviderModelCatalogItem[],
+  customProvider?: CustomProviderConfig | null,
+): ProviderModelCatalogItem[] {
+  const configured = buildConfiguredCustomModels(customProvider);
+  if (configured.length === 0) return liveModels;
+  const byId = new Map<string, ProviderModelCatalogItem>();
+  for (const item of liveModels) {
+    byId.set(item.id.toLowerCase(), item);
+  }
+  for (const cfg of configured) {
+    const key = cfg.id.toLowerCase();
+    const existing = byId.get(key);
+    if (existing) {
+      byId.set(key, {
+        ...existing,
+        ...(cfg.name ? { name: cfg.name } : {}),
+        ...(cfg.context_length ? { context_length: cfg.context_length } : {}),
+        ...(cfg.max_output_tokens ? { max_output_tokens: cfg.max_output_tokens } : {}),
+      });
+    } else {
+      byId.set(key, cfg);
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => a.id.toLowerCase().localeCompare(b.id.toLowerCase()));
+}
+
 export async function listProviderModelsDirect(params: {
   provider: string;
   base_url?: string;
   api_key?: string;
+  protocol?: CustomProviderProtocol;
+  customProvider?: CustomProviderConfig | null;
   role?: 'primary' | 'worker';
   env?: Record<string, string | undefined>;
   fetchImpl?: typeof fetch;
   referenceIndex?: ReferenceModelIndex | null;
   enableReferenceEnrichment?: boolean;
+  forceRefresh?: boolean;
 }): Promise<ProviderModelsResult> {
   const prov = normalizeProviderId(params.provider);
   const role = params.role === 'worker' ? 'worker' : 'primary';
   const defaults = PROVIDER_CATALOG_DEFAULTS[prov];
-  const baseUrl = (params.base_url || defaults?.baseUrl || '').trim().replace(/\/+$/, '');
+  const baseUrl = (params.base_url || params.customProvider?.base_url || defaults?.baseUrl || '')
+    .trim()
+    .replace(/\/+$/, '');
+  const protocol = params.protocol || params.customProvider?.protocol;
   const fetchFn = params.fetchImpl || fetch;
+  const configuredCustomModels = buildConfiguredCustomModels(params.customProvider);
+
+  if (params.forceRefresh && baseUrl) {
+    liveCatalogCache.delete(liveCatalogCacheKey(prov, baseUrl));
+  }
 
   if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
+    if (configuredCustomModels.length > 0) {
+      return {
+        ok: true,
+        provider: prov,
+        base_url: baseUrl,
+        source: 'preset',
+        models: configuredCustomModels,
+        count: configuredCustomModels.length,
+        error: null,
+      };
+    }
     return {
       ok: false,
       provider: prov,
@@ -1208,7 +1411,7 @@ export async function listProviderModelsDirect(params: {
   }
 
   const apiKey = resolveProviderApiKey(prov, role, params.env || process.env, params.api_key);
-  const headers = buildProviderHeaders(prov, apiKey);
+  const headers = buildProviderHeaders(prov, apiKey, protocol);
 
   const finalizeModels = async (rawModels: ProviderModelCatalogItem[]): Promise<ProviderModelCatalogItem[]> => {
     if (prov === 'openrouter' && rawModels.length > 0) {
@@ -1220,7 +1423,8 @@ export async function listProviderModelsDirect(params: {
       working = await enrichOllamaContextLengths(working, baseUrl, fetchFn);
     }
 
-    const needsRef = working.some((m) => !m.context_length || !m.max_output_tokens);
+    const skipRef = isCustomProviderId(prov) || prov === 'ollama' || prov === 'vllm';
+    const needsRef = !skipRef && working.some((m) => !m.context_length || !m.max_output_tokens);
     let refIndex: ReferenceModelIndex | null = null;
     if (params.referenceIndex !== undefined) {
       refIndex = params.referenceIndex;
@@ -1229,10 +1433,14 @@ export async function listProviderModelsDirect(params: {
       prov !== 'openrouter' &&
       (params.enableReferenceEnrichment === true || !params.fetchImpl)
     ) {
+      if (params.forceRefresh) {
+        clearReferenceModelCatalogCache();
+      }
       refIndex = await getReferenceModelCatalog(fetchFn, 4_000);
     }
 
-    return enrichModelsWithReferenceMetadata(working, prov, refIndex);
+    const enriched = enrichModelsWithReferenceMetadata(working, prov, refIndex);
+    return mergeWithCustomConfiguredModels(enriched, params.customProvider);
   };
 
   try {
@@ -1313,6 +1521,18 @@ export async function listProviderModelsDirect(params: {
         ? `Add your ${expectedVars} to query live ${prov} models.`
         : extractErrorDetail(resp.status, bodyText, prov);
 
+    if (configuredCustomModels.length > 0) {
+      return {
+        ok: true,
+        provider: prov,
+        base_url: baseUrl,
+        source: 'preset',
+        models: configuredCustomModels,
+        count: configuredCustomModels.length,
+        error: null,
+      };
+    }
+
     return {
       ok: false,
       provider: prov,
@@ -1323,6 +1543,17 @@ export async function listProviderModelsDirect(params: {
       error: errorMsg,
     };
   } catch (err) {
+    if (configuredCustomModels.length > 0) {
+      return {
+        ok: true,
+        provider: prov,
+        base_url: baseUrl,
+        source: 'preset',
+        models: configuredCustomModels,
+        count: configuredCustomModels.length,
+        error: null,
+      };
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
@@ -1338,8 +1569,9 @@ export async function listProviderModelsDirect(params: {
 
 export async function probeProviderModelDirect(params: {
   role: 'primary' | 'worker';
-  override?: Partial<RoleLLMConfig> & { api_key?: string };
+  override?: Partial<RoleLLMConfig> & { api_key?: string; protocol?: CustomProviderProtocol };
   persistedRoleConfig: RoleLLMConfig;
+  customProvider?: CustomProviderConfig | null;
   apiKey?: string;
   env?: Record<string, string | undefined>;
   fetchImpl?: typeof fetch;
@@ -1350,12 +1582,14 @@ export async function probeProviderModelDirect(params: {
   const defaults = PROVIDER_CATALOG_DEFAULTS[prov];
   const baseUrl = (
     (typeof ov.base_url === 'string' && ov.base_url.trim()) ||
+    params.customProvider?.base_url ||
     defaults?.baseUrl ||
     params.persistedRoleConfig.base_url ||
     ''
   )
     .trim()
     .replace(/\/+$/, '');
+  const protocol = ov.protocol || params.customProvider?.protocol;
   const model = ((typeof ov.model === 'string' && ov.model.trim()) || params.persistedRoleConfig.model || '').trim();
   const explicitKey = (params.apiKey || ov.api_key || '').trim();
   const apiKey = resolveProviderApiKey(prov, role, params.env || process.env, explicitKey);
@@ -1395,7 +1629,7 @@ export async function probeProviderModelDirect(params: {
     return { ...baseResult, error: 'Model ID must not be empty.' };
   }
 
-  const requiresKey = defaults ? defaults.requiresKey : true;
+  const requiresKey = prov.startsWith('custom_') ? false : defaults ? defaults.requiresKey : true;
   if (requiresKey && !apiKey) {
     const envVar =
       prov === 'custom'
@@ -1409,7 +1643,7 @@ export async function probeProviderModelDirect(params: {
     };
   }
 
-  const headers = buildProviderHeaders(prov, apiKey);
+  const headers = buildProviderHeaders(prov, apiKey, protocol);
 
   try {
     // 1. Query /models to check reachability and whether the selected model is listed

@@ -139,34 +139,42 @@ class TestAuditFeatures(unittest.TestCase):
             self.assertEqual(audit1.get("auto_approved"), False)
             self.assertEqual(audit1.get("executed"), True)
 
-            # Now switch runtime access mode to 'full_access' mid-run (no restart!)
+            # Switching global runtime access mode MUST NOT mutate an already-bound session (Req 4 isolation)
             set_runtime_access_mode("full_access")
             self.assertEqual(get_runtime_access_mode(), "full_access")
-            self.assertEqual(get_effective_access_mode(), "full_access")
+            self.assertEqual(get_effective_access_mode(), "default")
 
-            # Sensitive tool MUST auto-approve without calling interrupt()
-            interrupt_calls.clear()
-            with patch("agent_core.guardrails.interrupt", side_effect=fake_interrupt):
-                out2, audit2 = asyncio.run(
-                    execute_tool_with_guardrails(tool, {"command": "echo auto"})
-                )
-            self.assertEqual(len(interrupt_calls), 0)
-            self.assertEqual(out2, "executed:echo auto")
-            self.assertEqual(audit2.get("access_mode"), "full_access")
-            self.assertEqual(audit2.get("approved"), True)
-            self.assertEqual(audit2.get("auto_approved"), True)
-            self.assertEqual(audit2.get("executed"), True)
+            # Explicitly rebinding this session to 'full_access' takes effect immediately (no restart!)
+            token_full = bind_run_access_mode("full_access")
+            try:
+                self.assertEqual(get_effective_access_mode(), "full_access")
 
-            # Security invariant: Full Access STILL enforces argument validation & sandbox checks!
-            with patch("agent_core.guardrails.interrupt", side_effect=fake_interrupt):
-                out_invalid, audit_invalid = asyncio.run(
-                    execute_tool_with_guardrails(tool, {"command": ""})
-                )
-            self.assertIn("error", str(out_invalid).lower())
-            self.assertEqual(audit_invalid.get("executed"), False)
-            self.assertTrue(audit_invalid.get("error"))
+                # Sensitive tool MUST auto-approve without calling interrupt()
+                interrupt_calls.clear()
+                with patch("agent_core.guardrails.interrupt", side_effect=fake_interrupt):
+                    out2, audit2 = asyncio.run(
+                        execute_tool_with_guardrails(tool, {"command": "echo auto"})
+                    )
+                self.assertEqual(len(interrupt_calls), 0)
+                self.assertEqual(out2, "executed:echo auto")
+                self.assertEqual(audit2.get("access_mode"), "full_access")
+                self.assertEqual(audit2.get("approved"), True)
+                self.assertEqual(audit2.get("auto_approved"), True)
+                self.assertEqual(audit2.get("executed"), True)
+
+                # Security invariant: Full Access STILL enforces argument validation & sandbox checks!
+                with patch("agent_core.guardrails.interrupt", side_effect=fake_interrupt):
+                    out_invalid, audit_invalid = asyncio.run(
+                        execute_tool_with_guardrails(tool, {"command": ""})
+                    )
+                self.assertIn("error", str(out_invalid).lower())
+                self.assertEqual(audit_invalid.get("executed"), False)
+                self.assertTrue(audit_invalid.get("error"))
+            finally:
+                current_access_mode.reset(token_full)
         finally:
             current_access_mode.reset(token)
+            set_runtime_access_mode("default")
 
     def test_context_window_detection_no_fake_128k_fallback(self) -> None:
         # Known models across providers resolve exact windows

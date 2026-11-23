@@ -23,13 +23,10 @@ from agent_core.multimodal import (
 )
 from agent_core.sandbox import SandboxConfig, SandboxManager
 from agent_core.subagents import ROLE_DEFAULT_TOOLS
+from agent_core.firecrawl import FirecrawlClient, FirecrawlConfig
 from agent_core.tools.local import (
-    _parse_ddg_html_results,
-    _parse_ddg_lite_results,
-    _unwrap_search_url,
+    _format_firecrawl_search_markdown,
     build_local_tools,
-    format_search_results_markdown,
-    search_web_results,
 )
 
 
@@ -61,72 +58,63 @@ class _RecordingChatModel(BaseChatModel):
 
 
 # ---------------------------------------------------------------------------
-# 1. web_search Tests
+# 1. Firecrawl Local v2 web_search Tests
 # ---------------------------------------------------------------------------
-def test_ddg_url_unwrapping_and_html_parsing() -> None:
-    raw_link = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.python.org%2F3%2F&rut=abc"
-    assert _unwrap_search_url(raw_link) == "https://docs.python.org/3/"
-    assert _unwrap_search_url("javascript:alert(1)") == ""
-
-    sample_html = """
-    <html><body>
-      <div class="result">
-        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fguide">Example Guide</a>
-        <a class="result__snippet">A concise guide to testing web search.</a>
-      </div>
-      <div class="result">
-        <a class="result__a" href="https://python.org">Python.org</a>
-        <div class="result__snippet">Official Python website.</div>
-      </div>
-    </body></html>
-    """
-    parsed = _parse_ddg_html_results(sample_html, max_results=5)
-    assert len(parsed) == 2
-    assert parsed[0]["title"] == "Example Guide"
-    assert parsed[0]["url"] == "https://example.com/guide"
-    assert "concise guide" in parsed[0]["snippet"]
-    assert parsed[1]["url"] == "https://python.org"
-
-    md = format_search_results_markdown("python guide", parsed, "duckduckgo")
+def test_firecrawl_search_markdown_formatting() -> None:
+    parsed = [
+        {
+            "title": "Example Guide",
+            "url": "https://example.com/guide",
+            "description": "A concise guide to testing web search.",
+            "markdown": "",
+        },
+        {
+            "title": "Python.org",
+            "url": "https://python.org",
+            "description": "Official Python website.",
+            "markdown": "",
+        },
+    ]
+    md = _format_firecrawl_search_markdown("python guide", parsed)
     assert "**Example Guide**" in md
     assert "https://example.com/guide" in md
     assert "web_fetch" in md
 
 
-def test_ddg_lite_fallback_parsing() -> None:
-    lite_html = """
-    <table>
-      <tr><td><a class="result-link" href="https://fastapi.tiangolo.com/">FastAPI</a></td></tr>
-      <tr><td class="result-snippet">Modern fast web framework for Python.</td></tr>
-    </table>
-    """
-    parsed = _parse_ddg_lite_results(lite_html, max_results=3)
-    assert len(parsed) == 1
-    assert parsed[0]["title"] == "FastAPI"
-    assert parsed[0]["url"] == "https://fastapi.tiangolo.com/"
-
-
 @pytest.mark.asyncio
-async def test_search_web_results_mocked_transport(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
-
+async def test_firecrawl_v2_search_mocked_transport(tmp_path: Path) -> None:
     def _handler(request: httpx.Request) -> httpx.Response:
-        if "html.duckduckgo.com" in str(request.url):
-            body = (
-                '<div class="result">'
-                '<a class="result__a" href="https://langgraph.dev/docs">LangGraph Docs</a>'
-                '<a class="result__snippet">Stateful agent graphs.</a>'
-                "</div>"
+        if request.url.path == "/v2/search" and request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "web": [
+                            {
+                                "url": "https://langgraph.dev/docs",
+                                "title": "LangGraph Docs",
+                                "description": "Stateful agent graphs.",
+                            }
+                        ]
+                    },
+                },
             )
-            return httpx.Response(200, text=body)
         return httpx.Response(404)
 
-    transport = httpx.MockTransport(_handler)
-    results, provider = await search_web_results("langgraph", max_results=3, transport=transport)
-    assert provider == "duckduckgo"
+    fc = FirecrawlClient(
+        FirecrawlConfig(api_url="http://127.0.0.1:3002", api_key="", max_retries=0),
+        transport=httpx.MockTransport(_handler),
+    )
+    results = await fc.search("langgraph", limit=3)
     assert len(results) == 1
     assert results[0]["url"] == "https://langgraph.dev/docs"
+
+    sandbox = SandboxManager(SandboxConfig(workspace_dir=tmp_path, backend="local_isolated"))
+    tools_map = {t.name: t for t in build_local_tools(sandbox, firecrawl_client=fc)}
+    rendered = await tools_map["web_search"].ainvoke({"query": "langgraph", "max_results": 3})
+    assert "source: firecrawl" in rendered
+    assert "https://langgraph.dev/docs" in rendered
 
 
 def test_web_search_registered_in_tools_guardrails_and_subagents(tmp_path: Path) -> None:

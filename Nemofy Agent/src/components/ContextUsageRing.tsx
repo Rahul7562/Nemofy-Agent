@@ -1,8 +1,9 @@
-import { Layers, X } from 'lucide-react';
+import { Layers, RefreshCw, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
   AUTO_COMPACT_THRESHOLD_PERCENT,
   CONTEXT_CATEGORY_META,
+  MIN_CONTEXT_WINDOW,
   formatTokenCount,
 } from '../lib/contextUtils.ts';
 import type { ContextClassificationLevel, ContextUsageSnapshot } from '../types/agent.ts';
@@ -11,6 +12,8 @@ interface ContextUsageRingProps {
   usage: ContextUsageSnapshot;
   modelConfigured: boolean;
   onOpenLLMSettings?: () => void;
+  onSetManualContextWindow?: (manualWindow: number | null) => Promise<void> | void;
+  onRefreshMetadata?: () => Promise<void> | void;
 }
 
 const CATEGORY_COLOR_BY_KEY = Object.fromEntries(
@@ -49,16 +52,22 @@ function getLevelTextClass(level: ContextClassificationLevel): string {
 
 function formatWindowSource(source: string): string {
   switch (source) {
+    case 'manual':
+      return 'Manual override';
+    case 'custom_provider_config':
+      return 'Custom provider';
     case 'provider_catalog':
-      return 'Provider catalog';
+      return 'Auto · Provider API';
+    case 'provider_registry':
+      return 'Auto · Provider catalog';
     case 'reference_catalog':
-      return 'Reference catalog';
+      return 'Auto · Reference catalog';
     case 'model_registry':
-      return 'Model registry';
+      return 'Auto · Model registry';
     case 'unknown':
-      return 'Unknown metadata';
+      return 'Unknown';
     default:
-      return 'Model metadata';
+      return 'Auto-detected';
   }
 }
 
@@ -66,10 +75,24 @@ export function ContextUsageRing({
   usage,
   modelConfigured,
   onOpenLLMSettings,
+  onSetManualContextWindow,
+  onRefreshMetadata,
 }: ContextUsageRingProps) {
   const [popupOpen, setPopupOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
+  const [manualDraft, setManualDraft] = useState('');
+  const [manualError, setManualError] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<'save' | 'refresh' | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setManualDraft(
+      typeof usage.manual_context_window === 'number' && usage.manual_context_window >= MIN_CONTEXT_WINDOW
+        ? String(usage.manual_context_window)
+        : '',
+    );
+    setManualError(null);
+  }, [usage.manual_context_window, usage.provider, usage.model]);
 
   useEffect(() => {
     if (!popupOpen) return;
@@ -104,6 +127,26 @@ export function ContextUsageRing({
   const strokeColor = getLevelColorVar(usage.classification.level);
   const levelTextClass = getLevelTextClass(usage.classification.level);
 
+  const isManual =
+    usage.is_manual_override === true || usage.context_window_source === 'manual';
+  const sourceLabel = formatWindowSource(usage.context_window_source);
+  const usableInput =
+    typeof usage.usable_input_window === 'number' && usage.usable_input_window > 0
+      ? usage.usable_input_window
+      : null;
+  const remainingInput =
+    typeof usage.remaining_input_budget === 'number' && usage.remaining_input_budget >= 0
+      ? usage.remaining_input_budget
+      : usage.free_tokens;
+  const reservedOut =
+    typeof usage.reserved_output_tokens === 'number' && usage.reserved_output_tokens > 0
+      ? usage.reserved_output_tokens
+      : 0;
+  const safetyBuffer =
+    typeof usage.safety_buffer_tokens === 'number' && usage.safety_buffer_tokens > 0
+      ? usage.safety_buffer_tokens
+      : 0;
+
   // SVG Ring geometry (36x36 viewBox, centered at 18,18, radius 13.5)
   const radius = 13.5;
   const circumference = 2 * Math.PI * radius;
@@ -122,8 +165,57 @@ export function ContextUsageRing({
   const showHoverTooltip = hovered && !popupOpen;
 
   const ariaSummary = hasKnownWindow && pct !== null
-    ? `Context usage ${pct.toFixed(1)}% (${usage.classification.label}), ${formatTokenCount(usage.used_tokens)} of ${formatTokenCount(usage.context_window!)} tokens. Click for category breakdown.`
-    : `Context window unknown (${formatTokenCount(usage.used_tokens)} tokens used). Click for category breakdown.`;
+    ? `Context usage ${pct.toFixed(1)}% (${usage.classification.label}), ${formatTokenCount(usage.used_tokens)} of ${formatTokenCount(usage.context_window!)} tokens (${sourceLabel}). Click for breakdown.`
+    : `Context window unknown (${formatTokenCount(usage.used_tokens)} tokens used). Click to view details or set a manual override.`;
+
+  async function handleApplyManualOverride() {
+    if (!onSetManualContextWindow) return;
+    const raw = manualDraft.trim();
+    if (!raw) {
+      setManualError(null);
+      setBusyAction('save');
+      try {
+        await onSetManualContextWindow(null);
+      } finally {
+        setBusyAction(null);
+      }
+      return;
+    }
+    const parsed = Number(raw.replace(/[_,]/g, ''));
+    if (!Number.isFinite(parsed) || parsed < MIN_CONTEXT_WINDOW || parsed > 20_000_000) {
+      setManualError(`Enter a token limit between ${MIN_CONTEXT_WINDOW} and 20,000,000.`);
+      return;
+    }
+    setManualError(null);
+    setBusyAction('save');
+    try {
+      await onSetManualContextWindow(Math.round(parsed));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleClearManualOverride() {
+    if (!onSetManualContextWindow) return;
+    setManualDraft('');
+    setManualError(null);
+    setBusyAction('save');
+    try {
+      await onSetManualContextWindow(null);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRefresh() {
+    if (!onRefreshMetadata) return;
+    setBusyAction('refresh');
+    try {
+      await onRefreshMetadata();
+    } finally {
+      setBusyAction(null);
+    }
+  }
 
   return (
     <div
@@ -203,7 +295,7 @@ export function ContextUsageRing({
         <div
           role="tooltip"
           data-testid="context-usage-hover-tooltip"
-          className="pointer-events-none absolute right-0 top-full mt-2 z-40 w-64 rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] shadow-lg p-3 space-y-1.5 text-left"
+          className="pointer-events-none absolute right-0 top-full mt-2 z-40 w-68 rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] shadow-lg p-3 space-y-1.5 text-left"
         >
           <div className="flex items-center justify-between gap-2">
             <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--ink-faint)]">
@@ -225,9 +317,13 @@ export function ContextUsageRing({
             </span>
           </div>
 
-          {hasKnownWindow && typeof usage.max_output_tokens === 'number' && usage.max_output_tokens > 0 && (
+          {hasKnownWindow && (
             <div className="font-mono text-[10px] tabular-nums text-[var(--ink-faint)]">
-              Window: {formatTokenCount(usage.context_window!)} total · {formatTokenCount(usage.max_output_tokens)} max out
+              {usableInput ? `${formatTokenCount(usableInput)} usable in` : ''}
+              {reservedOut > 0 ? ` · ${formatTokenCount(reservedOut)} reserved out` : ''}
+              {typeof usage.max_output_tokens === 'number' && usage.max_output_tokens > 0
+                ? ` · ${formatTokenCount(usage.max_output_tokens)} max out`
+                : ''}
             </div>
           )}
 
@@ -237,9 +333,9 @@ export function ContextUsageRing({
 
           <div className="pt-1 border-t border-[var(--rule)] flex items-center justify-between gap-2 text-[10px] text-[var(--ink-faint)]">
             <span className="truncate font-mono">
-              {modelConfigured && usage.model ? usage.model : 'No primary model'}
+              {modelConfigured && usage.model ? `${usage.provider} · ${usage.model}` : 'No primary model'}
             </span>
-            <span className="shrink-0">Click for breakdown</span>
+            <span className="shrink-0">{sourceLabel}</span>
           </div>
         </div>
       )}
@@ -250,7 +346,7 @@ export function ContextUsageRing({
           role="dialog"
           aria-label="Context usage breakdown"
           data-testid="context-usage-popup"
-          className="absolute right-0 top-full mt-2 z-40 w-[348px] max-w-[calc(100vw-2rem)] rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] shadow-xl overflow-hidden text-left"
+          className="absolute right-0 top-full mt-2 z-40 w-[364px] max-w-[calc(100vw-2rem)] rounded-xl border border-[var(--rule-strong)] bg-[var(--paper-raised)] shadow-xl overflow-hidden text-left"
         >
           {/* Popup Header */}
           <div className="px-4 py-3 border-b border-[var(--rule)] bg-[var(--paper-sunk)] flex items-start justify-between gap-2">
@@ -281,17 +377,43 @@ export function ContextUsageRing({
                   </button>
                 )}
                 <span>·</span>
-                <span className="shrink-0">{formatWindowSource(usage.context_window_source)}</span>
+                <span
+                  data-testid="context-window-source"
+                  className={`shrink-0 font-medium ${
+                    isManual
+                      ? 'text-[var(--signal)]'
+                      : hasKnownWindow
+                        ? 'text-[var(--jade)]'
+                        : 'text-[var(--honey)]'
+                  }`}
+                >
+                  {sourceLabel}
+                </span>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => setPopupOpen(false)}
-              aria-label="Close context breakdown"
-              className="p-1 rounded-md text-[var(--ink-faint)] hover:text-[var(--ink)] hover:bg-[var(--paper)] transition-colors cursor-pointer shrink-0"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-1 shrink-0">
+              {onRefreshMetadata && modelConfigured && (
+                <button
+                  type="button"
+                  data-testid="context-refresh-metadata"
+                  disabled={busyAction !== null}
+                  onClick={() => void handleRefresh()}
+                  title="Refresh model context-window metadata from provider"
+                  aria-label="Refresh model metadata"
+                  className="p-1 rounded-md text-[var(--ink-faint)] hover:text-[var(--signal)] hover:bg-[var(--paper)] disabled:opacity-50 transition-colors cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${busyAction === 'refresh' ? 'animate-spin' : ''}`} />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setPopupOpen(false)}
+                aria-label="Close context breakdown"
+                className="p-1 rounded-md text-[var(--ink-faint)] hover:text-[var(--ink)] hover:bg-[var(--paper)] transition-colors cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           {/* Usage Summary + Segmented Bar */}
@@ -310,12 +432,12 @@ export function ContextUsageRing({
               </span>
             </div>
 
-            {/* Model-Specific Input / Output / Total Specs */}
+            {/* Model-Specific Total / Usable Input / Reserved & Max Output Specs */}
             <div
               data-testid="context-model-limits"
               className="grid grid-cols-3 gap-2 pt-0.5 text-[10px] font-mono tabular-nums"
             >
-              <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1">
+              <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1.5">
                 <div className="text-[var(--ink-faint)] uppercase tracking-wide text-[9px] font-sans">
                   Total Window
                 </div>
@@ -323,17 +445,15 @@ export function ContextUsageRing({
                   {hasKnownWindow ? formatTokenCount(usage.context_window!) : 'Unknown'}
                 </div>
               </div>
-              <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1">
+              <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1.5">
                 <div className="text-[var(--ink-faint)] uppercase tracking-wide text-[9px] font-sans">
-                  Input Avail
+                  Usable Input
                 </div>
-                <div className="text-[var(--ink)] font-semibold mt-0.5">
-                  {hasKnownWindow && typeof usage.free_tokens === 'number'
-                    ? formatTokenCount(usage.free_tokens)
-                    : 'Unknown'}
+                <div className="text-[var(--ink)] font-semibold mt-0.5" data-testid="context-usable-input">
+                  {usableInput !== null ? formatTokenCount(usableInput) : 'Unknown'}
                 </div>
               </div>
-              <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1">
+              <div className="rounded-md bg-[var(--paper-sunk)] border border-[var(--rule)] px-2 py-1.5">
                 <div className="text-[var(--ink-faint)] uppercase tracking-wide text-[9px] font-sans">
                   Max Output
                 </div>
@@ -344,6 +464,17 @@ export function ContextUsageRing({
                 </div>
               </div>
             </div>
+
+            {hasKnownWindow && (reservedOut > 0 || safetyBuffer > 0) && (
+              <div className="flex items-center justify-between gap-2 text-[10px] font-mono tabular-nums text-[var(--ink-faint)]">
+                <span>
+                  Reserved: {formatTokenCount(reservedOut)} out + {formatTokenCount(safetyBuffer)} buffer
+                </span>
+                <span>
+                  {remainingInput !== null ? `${formatTokenCount(remainingInput)} in left` : ''}
+                </span>
+              </div>
+            )}
 
             {hasKnownWindow ? (
               <div className="relative pt-0.5 pb-3.5">
@@ -382,10 +513,68 @@ export function ContextUsageRing({
               </div>
             ) : (
               <p className="text-[11px] text-[var(--ink-soft)] leading-snug rounded-lg border border-[var(--rule)] bg-[var(--paper-sunk)] px-2.5 py-2">
-                No verified context-window limit was found for this model. Token counts are still tracked below without assuming a default 128k window.
+                Context window could not be verified from provider metadata. Token counts remain tracked without assuming a default limit. Set a manual override below if you know this model&apos;s limit.
               </p>
             )}
           </div>
+
+          {/* Per-Session Manual Context Window Override */}
+          {onSetManualContextWindow && (
+            <div className="px-4 py-2.5 border-b border-[var(--rule)] bg-[var(--paper-sunk)]/45 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor="session-manual-context-window"
+                  className="text-[11px] font-medium text-[var(--ink-soft)]"
+                >
+                  Manual Context Window Override (this session)
+                </label>
+                {isManual && (
+                  <button
+                    type="button"
+                    data-testid="clear-manual-context-window"
+                    disabled={busyAction !== null}
+                    onClick={() => void handleClearManualOverride()}
+                    className="text-[11px] font-medium text-[var(--signal)] hover:underline cursor-pointer"
+                  >
+                    Use Auto
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  id="session-manual-context-window"
+                  data-testid="manual-context-window-input"
+                  type="text"
+                  inputMode="numeric"
+                  value={manualDraft}
+                  onChange={(e) => {
+                    setManualDraft(e.target.value);
+                    setManualError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      void handleApplyManualOverride();
+                    }
+                  }}
+                  placeholder={hasKnownWindow ? `Auto: ${usage.context_window}` : 'e.g. 131072'}
+                  className="flex-1 h-8 px-2.5 rounded-md border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+                />
+                <button
+                  type="button"
+                  data-testid="apply-manual-context-window"
+                  disabled={busyAction !== null}
+                  onClick={() => void handleApplyManualOverride()}
+                  className="h-8 px-2.5 rounded-md border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] hover:text-[var(--signal)] text-xs font-medium text-[var(--ink)] disabled:opacity-50 transition-colors cursor-pointer shrink-0"
+                >
+                  {busyAction === 'save' ? 'Saving...' : 'Apply'}
+                </button>
+              </div>
+              {manualError && (
+                <p className="text-[10px] text-[var(--flare)]">{manualError}</p>
+              )}
+            </div>
+          )}
 
           {/* All Context Categories */}
           <div className="px-4 py-3 space-y-1.5">

@@ -14,10 +14,10 @@ from agent_core.sandbox import (
     SandboxSecurityError,
     resolve_workspace_path,
 )
+from agent_core.firecrawl import FirecrawlClient, FirecrawlConfig
 from agent_core.tools.local import (
     build_local_tools,
-    fetch_webpage_markdown,
-    html_to_clean_markdown,
+    validate_public_url,
 )
 
 
@@ -229,38 +229,38 @@ async def test_concurrent_session_isolation(tmp_workspace: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_clean_markdown_and_ssrf_protection() -> None:
-    sample_html = """
-    <html>
-      <head><title>LangGraph Spec</title><script>alert('xss')</script><style>body{color:red}</style></head>
-      <body>
-        <main>
-          <h1>Architecture Overview</h1>
-          <p>Strict separation between Brain, Hands, and SaaS Arm.</p>
-        </main>
-      </body>
-    </html>
-    """
-    md = html_to_clean_markdown(sample_html, base_url="https://example.org/spec")
-    assert "# LangGraph Spec" in md
-    assert "Architecture Overview" in md
-    assert "alert('xss')" not in md
-    assert "body{color:red}" not in md
+async def test_web_fetch_clean_markdown_and_ssrf_protection(tmp_workspace: Path) -> None:
+    def _fc_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/scrape":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "markdown": "# LangGraph Spec\nArchitecture Overview\nStrict separation between Brain, Hands, and SaaS Arm.",
+                        "metadata": {"title": "LangGraph Spec", "sourceURL": "https://example.org/spec", "statusCode": 200},
+                    },
+                },
+            )
+        return httpx.Response(404)
 
-    # Mock transport for deterministic HTTP test
-    transport = httpx.MockTransport(
-        lambda _req: httpx.Response(
-            200,
-            headers={"content-type": "text/html; charset=utf-8"},
-            text=sample_html,
-        )
+    fc_client = FirecrawlClient(
+        FirecrawlConfig(api_url="http://127.0.0.1:3002", api_key="", max_retries=0),
+        transport=httpx.MockTransport(_fc_handler),
     )
-    fetched = await fetch_webpage_markdown("https://example.org/spec", transport=transport)
+    sbx = SandboxManager(SandboxConfig(workspace_dir=tmp_workspace, backend="local_isolated"))
+    tools_map = {t.name: t for t in build_local_tools(sbx, firecrawl_client=fc_client)}
+
+    fetched = await tools_map["web_fetch"].ainvoke({"url": "https://example.org/spec"})
+    assert "LangGraph Spec" in fetched
     assert "Strict separation" in fetched
+    assert "via Firecrawl Local" in fetched
 
     # Loopback SSRF rejected by default
     with pytest.raises(SandboxSecurityError):
-        await fetch_webpage_markdown("http://127.0.0.1:5678/healthz")
+        validate_public_url("http://127.0.0.1:5678/healthz")
+    ssrf_out = await tools_map["web_fetch"].ainvoke({"url": "http://127.0.0.1:5678/healthz"})
+    assert "Access denied" in ssrf_out
 
 
 @pytest.mark.asyncio

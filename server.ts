@@ -6,29 +6,40 @@ import http from 'node:http';
 import path from 'node:path';
 import { AuthStore, parseCookieHeader } from './server/authStore.ts';
 import { AgentCoreProcessManager } from './server/agentProcessManager.ts';
+import { FirecrawlLocalProcessManager } from './server/firecrawlProcessManager.ts';
 import {
   WorkspaceAndConfigStore,
+  maskEnvSecret,
   normalizeAccessMode,
+  normalizeProviderId,
   validateMaxTurns,
   type AccessoryLLMConfig,
   type ChatAttachmentRecord,
   type ChatMessageRecord,
   type ChatThreadRecord,
   type ContextUsageSnapshot,
+  type CustomProviderConfig,
+  type CustomProviderModelConfig,
+  type CustomProviderProtocol,
   type ExecutionAccessMode,
   type FileChangeRecord,
   type MediaModality,
+  type PlanningTimeoutConfig,
+  type ThreadSessionConfig,
   type ToolEventRecord,
 } from './server/configStore.ts';
 import {
   listProviderModelsDirect,
   probeProviderModelDirect,
   resolveModelMetadataUnified,
+  resolveProviderApiKey,
+  validateOutboundProviderUrl,
 } from './server/providerCatalog.ts';
 import { ChatJobOrchestrator } from './server/jobOrchestrator.ts';
 import {
-  ALLOWED_PROFILE_SECRET_KEYS,
   ProfileSecretVaultStore,
+  deriveCustomProviderEnvVar,
+  isAllowedProfileSecretKey,
 } from './server/profileVault.ts';
 import { resolveServerListenConfig } from './server/serverConfig.ts';
 
@@ -38,7 +49,24 @@ const SESSION_COOKIE = 'nemofy_session';
 
 const authStore = new AuthStore();
 const store = new WorkspaceAndConfigStore(cwd);
-const agentManager = new AgentCoreProcessManager(cwd, undefined, () => authStore.getAgentApiToken());
+const agentManager = new AgentCoreProcessManager(
+  cwd,
+  undefined,
+  () => authStore.getAgentApiToken(),
+  () => {
+    const cfg = store.getLLMConfig();
+    return {
+      ALLOW_UNSAFE_LOCAL_BASH: String(cfg.allow_unsafe_local_bash),
+      ...(cfg.firecrawl_api_url ? { FIRECRAWL_API_URL: cfg.firecrawl_api_url } : {}),
+    };
+  },
+);
+const firecrawlManager = new FirecrawlLocalProcessManager(cwd, undefined, () => {
+  const cfg = store.getLLMConfig();
+  return {
+    ...(cfg.firecrawl_api_url ? { FIRECRAWL_API_URL: cfg.firecrawl_api_url } : {}),
+  };
+});
 const profileVault = new ProfileSecretVaultStore(
   path.join(cwd, 'data', 'vaults'),
   () => authStore.getVaultKeyMaterial(),
@@ -117,6 +145,8 @@ async function enrichRoleLimits<
     model: string;
     base_url?: string;
     context_window?: number | null;
+    context_window_source?: string | null;
+    manual_context_window?: number | null;
     max_output_tokens?: number | null;
   },
 >(
@@ -124,24 +154,42 @@ async function enrichRoleLimits<
   options: {
     env?: Record<string, string | undefined>;
     allowLiveFetch?: boolean;
+    forceRefresh?: boolean;
     role?: 'primary' | 'worker';
+    customProviders?: CustomProviderConfig[];
   } = {},
 ): Promise<T> {
   if (!roleCfg.model || !roleCfg.model.trim()) return roleCfg;
-  if (roleCfg.context_window && roleCfg.max_output_tokens) return roleCfg;
+  if (roleCfg.manual_context_window && roleCfg.manual_context_window >= 512) {
+    return {
+      ...roleCfg,
+      context_window: Math.round(roleCfg.manual_context_window),
+      context_window_source: 'manual',
+    };
+  }
+  if (!options.forceRefresh && roleCfg.context_window && roleCfg.max_output_tokens && roleCfg.context_window_source) {
+    return roleCfg;
+  }
+  const normalizedProv = normalizeProviderId(roleCfg.provider);
+  const customProvider =
+    (options.customProviders || store.getCustomProviders()).find((cp) => cp.id === normalizedProv) || null;
   const meta = await resolveModelMetadataUnified({
-    provider: roleCfg.provider,
+    provider: normalizedProv,
     model: roleCfg.model,
-    base_url: roleCfg.base_url,
+    base_url: roleCfg.base_url || customProvider?.base_url,
+    customProvider,
     role: options.role,
     env: options.env,
-    explicitContextWindow: roleCfg.context_window,
-    explicitMaxOutputTokens: roleCfg.max_output_tokens,
+    manualContextWindow: roleCfg.manual_context_window,
+    explicitContextWindow: options.forceRefresh ? null : roleCfg.context_window,
+    explicitMaxOutputTokens: options.forceRefresh ? null : roleCfg.max_output_tokens,
     allowLiveFetch: options.allowLiveFetch ?? false,
+    forceRefresh: options.forceRefresh ?? false,
   });
   return {
     ...roleCfg,
     context_window: meta.context_window,
+    context_window_source: meta.context_window_source,
     max_output_tokens: meta.max_output_tokens,
   };
 }
@@ -150,18 +198,119 @@ async function enrichLLMConfigLimits(
   cfg: ReturnType<typeof store.getLLMConfig>,
   options: { env?: Record<string, string | undefined>; allowLiveFetch?: boolean } = {},
 ): Promise<ReturnType<typeof store.getLLMConfig>> {
+  const opts = { ...options, customProviders: cfg.custom_providers };
   const [primary, worker, image, video, audio] = await Promise.all([
-    enrichRoleLimits(cfg.primary, { ...options, role: 'primary' }),
-    enrichRoleLimits(cfg.worker, { ...options, role: 'worker' }),
-    enrichRoleLimits(cfg.accessories.image, { ...options, role: 'worker' }),
-    enrichRoleLimits(cfg.accessories.video, { ...options, role: 'worker' }),
-    enrichRoleLimits(cfg.accessories.audio, { ...options, role: 'worker' }),
+    enrichRoleLimits(cfg.primary, { ...opts, role: 'primary' }),
+    enrichRoleLimits(cfg.worker, { ...opts, role: 'worker' }),
+    enrichRoleLimits(cfg.accessories.image, { ...opts, role: 'worker' }),
+    enrichRoleLimits(cfg.accessories.video, { ...opts, role: 'worker' }),
+    enrichRoleLimits(cfg.accessories.audio, { ...opts, role: 'worker' }),
   ]);
   return {
     ...cfg,
     primary,
     worker,
     accessories: { image, video, audio },
+  };
+}
+
+async function resolveThreadExecutionPayload(params: {
+  thread: ChatThreadRecord | null;
+  globalCfg: ReturnType<typeof store.getLLMConfig>;
+  profileSecrets: Record<string, string>;
+  reasoningEffortOverride?: string;
+  accessModeOverride?: ExecutionAccessMode;
+}) {
+  const { thread, globalCfg, profileSecrets, reasoningEffortOverride, accessModeOverride } = params;
+  const baseSession: ThreadSessionConfig = thread?.sessionConfig
+    ? { ...thread.sessionConfig }
+    : store.buildThreadSessionConfig(undefined, globalCfg);
+
+  const requestedEffort =
+    typeof reasoningEffortOverride === 'string' && reasoningEffortOverride.trim()
+      ? reasoningEffortOverride.trim().toLowerCase()
+      : baseSession.reasoning_effort;
+  const effectiveAccessMode: ExecutionAccessMode =
+    accessModeOverride === 'default' || accessModeOverride === 'full_access'
+      ? accessModeOverride
+      : baseSession.access_mode;
+
+  const sessionPrimary = await enrichRoleLimits(
+    { ...baseSession, reasoning_effort: requestedEffort },
+    {
+      env: profileSecrets,
+      role: 'primary',
+      customProviders: globalCfg.custom_providers,
+    },
+  );
+  const customPrimary =
+    globalCfg.custom_providers.find((cp) => cp.id === normalizeProviderId(sessionPrimary.provider)) || null;
+  const primaryApiKey = resolveProviderApiKey(
+    sessionPrimary.provider,
+    'primary',
+    profileSecrets,
+  );
+  const timeoutCfg = globalCfg.planning_timeout;
+
+  const customWorker =
+    globalCfg.custom_providers.find((cp) => cp.id === normalizeProviderId(globalCfg.worker.provider)) || null;
+  const workerApiKey = resolveProviderApiKey(
+    globalCfg.worker.provider,
+    'worker',
+    profileSecrets,
+  );
+
+  return {
+    sessionConfig: {
+      ...sessionPrimary,
+      access_mode: effectiveAccessMode,
+    } as ThreadSessionConfig,
+    effectiveAccessMode,
+    primaryModelPayload: {
+      provider: sessionPrimary.provider,
+      model: sessionPrimary.model,
+      base_url: sessionPrimary.base_url || customPrimary?.base_url || '',
+      temperature: sessionPrimary.temperature,
+      max_tokens: sessionPrimary.max_tokens,
+      reasoning_effort: sessionPrimary.reasoning_effort,
+      ...(customPrimary?.protocol ? { protocol: customPrimary.protocol } : {}),
+      ...(primaryApiKey ? { api_key: primaryApiKey } : {}),
+      ...(sessionPrimary.context_window ? { context_window: sessionPrimary.context_window } : {}),
+      ...(sessionPrimary.context_window_source
+        ? { context_window_source: sessionPrimary.context_window_source }
+        : {}),
+      ...(sessionPrimary.manual_context_window
+        ? { manual_context_window: sessionPrimary.manual_context_window }
+        : {}),
+      ...(sessionPrimary.max_output_tokens ? { max_output_tokens: sessionPrimary.max_output_tokens } : {}),
+      timeout_seconds: customPrimary?.timeout_seconds ?? timeoutCfg.read_timeout_seconds,
+      connect_timeout_seconds: timeoutCfg.connect_timeout_seconds,
+      max_retries: timeoutCfg.max_retries,
+      fallback_on_timeout: timeoutCfg.fallback_on_timeout,
+      ...(timeoutCfg.fallback_provider ? { fallback_provider: timeoutCfg.fallback_provider } : {}),
+      ...(timeoutCfg.fallback_model ? { fallback_model: timeoutCfg.fallback_model } : {}),
+    },
+    workerModelPayload: {
+      provider: globalCfg.worker.provider,
+      model: globalCfg.worker.model,
+      base_url: globalCfg.worker.base_url || customWorker?.base_url || '',
+      temperature: globalCfg.worker.temperature,
+      max_tokens: globalCfg.worker.max_tokens,
+      reasoning_effort: globalCfg.worker.reasoning_effort,
+      ...(customWorker?.protocol ? { protocol: customWorker.protocol } : {}),
+      ...(workerApiKey ? { api_key: workerApiKey } : {}),
+      ...(globalCfg.worker.context_window ? { context_window: globalCfg.worker.context_window } : {}),
+      ...(globalCfg.worker.context_window_source
+        ? { context_window_source: globalCfg.worker.context_window_source }
+        : {}),
+      ...(globalCfg.worker.manual_context_window
+        ? { manual_context_window: globalCfg.worker.manual_context_window }
+        : {}),
+      ...(globalCfg.worker.max_output_tokens ? { max_output_tokens: globalCfg.worker.max_output_tokens } : {}),
+      timeout_seconds: customWorker?.timeout_seconds ?? timeoutCfg.read_timeout_seconds,
+      connect_timeout_seconds: timeoutCfg.connect_timeout_seconds,
+      max_retries: timeoutCfg.max_retries,
+    },
   };
 }
 
@@ -309,8 +458,16 @@ async function startServer(): Promise<void> {
   });
 
   // ---------------------------------------------------------------------------
-  // Public Auth Endpoints
+  // Public Health & Auth Endpoints
   // ---------------------------------------------------------------------------
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'nemofy-gateway',
+      agent_core: agentManager.getStatus().state,
+    });
+  });
+
   app.get('/api/auth/me', (req, res) => {
     const token = extractSessionToken(req);
     const session = authStore.verifySessionToken(token);
@@ -437,8 +594,20 @@ async function startServer(): Promise<void> {
     res.json({ threads: store.listThreads() });
   });
 
-  app.post('/api/threads', requireSession, (req, res) => {
-    const { title } = (req.body || {}) as { title?: string };
+  app.post('/api/threads', requireSession, async (req, res) => {
+    const { title, sessionConfig } = (req.body || {}) as {
+      title?: string;
+      sessionConfig?: Partial<ThreadSessionConfig>;
+    };
+    const username = getSessionUsername(res);
+    const profileSecrets = loadProfileSecrets(username);
+    const globalCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
+    const initialSession = store.buildThreadSessionConfig(sessionConfig, globalCfg);
+    const enrichedSession = await enrichRoleLimits(initialSession, {
+      env: profileSecrets,
+      role: 'primary',
+      customProviders: globalCfg.custom_providers,
+    });
     const now = new Date().toISOString();
     const thread: ChatThreadRecord = {
       id: `thread-${crypto.randomBytes(5).toString('hex')}`,
@@ -447,10 +616,91 @@ async function startServer(): Promise<void> {
       updatedAt: now,
       messages: [],
       pendingApproval: null,
+      sessionConfig: {
+        ...enrichedSession,
+        access_mode: initialSession.access_mode,
+      },
     };
     const threads = [thread, ...store.listThreads()];
     store.saveThreads(threads);
     res.status(201).json({ thread });
+  });
+
+  app.patch('/api/threads/:id/config', requireSession, async (req, res) => {
+    const id = req.params.id;
+    const body = (req.body || {}) as Partial<ThreadSessionConfig> & { force_refresh?: boolean };
+    const username = getSessionUsername(res);
+    const profileSecrets = loadProfileSecrets(username);
+    const globalCfg = store.getLLMConfig();
+
+    const patch: Partial<ThreadSessionConfig> = {};
+    if (typeof body.provider === 'string' && body.provider.trim()) {
+      const nextProv = normalizeProviderId(body.provider);
+      const customMatch = globalCfg.custom_providers.find((cp) => cp.id === nextProv);
+      if (customMatch && !customMatch.enabled) {
+        res.status(400).json({ error: `Custom provider '${customMatch.name}' is currently disabled.` });
+        return;
+      }
+      patch.provider = nextProv;
+    }
+    if (typeof body.model === 'string') patch.model = body.model.trim();
+    if (typeof body.base_url === 'string') patch.base_url = body.base_url.trim().replace(/\/+$/, '');
+    if (typeof body.temperature === 'number') patch.temperature = body.temperature;
+    if (typeof body.max_tokens === 'number') patch.max_tokens = body.max_tokens;
+    if (typeof body.reasoning_effort === 'string') patch.reasoning_effort = body.reasoning_effort.trim().toLowerCase();
+    if (body.access_mode === 'default' || body.access_mode === 'full_access') {
+      patch.access_mode = body.access_mode;
+    }
+    if ('manual_context_window' in body) {
+      if (body.manual_context_window === null || body.manual_context_window === undefined) {
+        patch.manual_context_window = null;
+        patch.context_window = null;
+        patch.context_window_source = null;
+      } else {
+        const num = Number(body.manual_context_window);
+        if (!Number.isFinite(num) || num < 512) {
+          res.status(400).json({ error: 'Manual context window must be at least 512 tokens.' });
+          return;
+        }
+        patch.manual_context_window = Math.round(num);
+        patch.context_window = Math.round(num);
+        patch.context_window_source = 'manual';
+      }
+    }
+    if ('context_window' in body && !('manual_context_window' in body)) {
+      patch.context_window = body.context_window;
+    }
+    if ('context_window_source' in body && !('manual_context_window' in body)) {
+      patch.context_window_source = body.context_window_source;
+    }
+    if ('max_output_tokens' in body) {
+      patch.max_output_tokens = body.max_output_tokens;
+    }
+
+    const updated = store.updateThreadSessionConfig(id, patch);
+    if (!updated || !updated.sessionConfig) {
+      res.status(404).json({ error: 'Thread not found.' });
+      return;
+    }
+
+    const enriched = await enrichRoleLimits(updated.sessionConfig, {
+      env: profileSecrets,
+      allowLiveFetch: Boolean(body.force_refresh),
+      forceRefresh: Boolean(body.force_refresh),
+      role: 'primary',
+      customProviders: globalCfg.custom_providers,
+    });
+
+    const finalThread = store.updateThreadSessionConfig(id, {
+      context_window: enriched.context_window ?? null,
+      context_window_source: enriched.context_window_source ?? 'unknown',
+      max_output_tokens: enriched.max_output_tokens ?? null,
+      ...(enriched.manual_context_window !== undefined
+        ? { manual_context_window: enriched.manual_context_window }
+        : {}),
+    });
+
+    res.json({ thread: finalThread || updated });
   });
 
   app.delete('/api/threads/:id', requireSession, async (req, res) => {
@@ -597,13 +847,7 @@ async function startServer(): Promise<void> {
 
     const username = getSessionUsername(res);
     const profileSecrets = loadProfileSecrets(username);
-    let llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
-    if (!llmCfg.primary.model.trim()) {
-      res.status(400).json({
-        error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
-      });
-      return;
-    }
+    const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
 
     const now = new Date().toISOString();
     const derivedTitle = cleanThreadTitle(text) || 'New Agent Session';
@@ -615,6 +859,21 @@ async function startServer(): Promise<void> {
       ...(publicAttachments.length > 0 ? { attachments: publicAttachments } : {}),
     };
 
+    const existingThread = threadId ? store.listThreads().find((t) => t.id === threadId) || null : null;
+    const preResolved = await resolveThreadExecutionPayload({
+      thread: existingThread,
+      globalCfg: llmCfg,
+      profileSecrets,
+      reasoningEffortOverride: reasoningEffort,
+      accessModeOverride: accessMode,
+    });
+    if (!preResolved.sessionConfig.model.trim()) {
+      res.status(400).json({
+        error: 'No model is selected for this session. Pick a provider and model in the chat header or Settings.',
+      });
+      return;
+    }
+
     const resolvedThreadId = store.updateThreads((threads) => {
       let target = threads.find((t) => t.id === threadId);
       if (!target) {
@@ -625,35 +884,19 @@ async function startServer(): Promise<void> {
           updatedAt: now,
           messages: [],
           pendingApproval: null,
+          sessionConfig: preResolved.sessionConfig,
         };
         threads.unshift(target);
-      } else if (target.messages.length === 0) {
-        target.title = derivedTitle;
+      } else {
+        if (target.messages.length === 0) {
+          target.title = derivedTitle;
+        }
+        target.sessionConfig = preResolved.sessionConfig;
       }
       target.messages.push(userMsg);
       target.updatedAt = now;
       return target.id;
     });
-
-    const requestedEffort =
-      typeof reasoningEffort === 'string' && reasoningEffort.trim()
-        ? reasoningEffort.trim().toLowerCase()
-        : llmCfg.primary.reasoning_effort;
-
-    const effectiveAccessMode =
-      accessMode === 'default' || accessMode === 'full_access'
-        ? accessMode
-        : llmCfg.access_mode;
-
-    if (
-      (requestedEffort && requestedEffort !== llmCfg.primary.reasoning_effort) ||
-      effectiveAccessMode !== llmCfg.access_mode
-    ) {
-      llmCfg = store.saveLLMConfig({
-        primary: { ...llmCfg.primary, reasoning_effort: requestedEffort },
-        access_mode: effectiveAccessMode,
-      });
-    }
 
     const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
     await syncProfileSecretsToCore(username, true);
@@ -664,27 +907,9 @@ async function startServer(): Promise<void> {
         task: text,
         thread_id: resolvedThreadId,
         max_turns: llmCfg.max_turns,
-        access_mode: effectiveAccessMode,
-        primary_model: {
-          provider: llmCfg.primary.provider,
-          model: llmCfg.primary.model,
-          base_url: llmCfg.primary.base_url,
-          temperature: llmCfg.primary.temperature,
-          max_tokens: llmCfg.primary.max_tokens,
-          reasoning_effort: requestedEffort,
-          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
-          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
-        },
-        worker_model: {
-          provider: llmCfg.worker.provider,
-          model: llmCfg.worker.model,
-          base_url: llmCfg.worker.base_url,
-          temperature: llmCfg.worker.temperature,
-          max_tokens: llmCfg.worker.max_tokens,
-          reasoning_effort: llmCfg.worker.reasoning_effort,
-          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
-          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
-        },
+        access_mode: preResolved.effectiveAccessMode,
+        primary_model: preResolved.primaryModelPayload,
+        worker_model: preResolved.workerModelPayload,
         accessory_models: llmCfg.accessories,
         attachments: agentAttachments.length > 0 ? agentAttachments : undefined,
         mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
@@ -799,16 +1024,26 @@ async function startServer(): Promise<void> {
     try {
       const username = getSessionUsername(res);
       const profileSecrets = loadProfileSecrets(username);
-      let llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
-      if (!llmCfg.primary.model.trim()) {
-        res.status(400).json({
-          error: 'No Primary model is selected yet. Open Settings → LLM Config and choose your Primary model first.',
-        });
-        return;
-      }
+      const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
 
       if (lockedThreadId && jobOrchestrator.isThreadDeleted(lockedThreadId)) {
         res.status(404).json({ error: 'Thread was deleted before execution started.' });
+        return;
+      }
+
+      const existingThread = threadId ? store.listThreads().find((t) => t.id === threadId) || null : null;
+      const resolvedExec = await resolveThreadExecutionPayload({
+        thread: existingThread,
+        globalCfg: llmCfg,
+        profileSecrets,
+        reasoningEffortOverride: reasoningEffort,
+        accessModeOverride: accessMode,
+      });
+
+      if (!resolvedExec.sessionConfig.model.trim()) {
+        res.status(400).json({
+          error: 'No model is selected for this session. Pick a provider and model in the chat header or Settings.',
+        });
         return;
       }
 
@@ -835,10 +1070,14 @@ async function startServer(): Promise<void> {
             updatedAt: now,
             messages: [],
             pendingApproval: null,
+            sessionConfig: resolvedExec.sessionConfig,
           };
           threads.unshift(target);
-        } else if (target.messages.length === 0) {
-          target.title = derivedTitle;
+        } else {
+          if (target.messages.length === 0) {
+            target.title = derivedTitle;
+          }
+          target.sessionConfig = resolvedExec.sessionConfig;
         }
         target.messages.push(userMsg);
         target.updatedAt = now;
@@ -853,26 +1092,6 @@ async function startServer(): Promise<void> {
       if (!lockedThreadId) {
         lockedThreadId = thread.id;
         jobOrchestrator.tryAcquireThreadLaunch(lockedThreadId);
-      }
-
-      const requestedEffort =
-        typeof reasoningEffort === 'string' && reasoningEffort.trim()
-          ? reasoningEffort.trim().toLowerCase()
-          : llmCfg.primary.reasoning_effort;
-
-      const effectiveAccessMode =
-        accessMode === 'default' || accessMode === 'full_access'
-          ? accessMode
-          : llmCfg.access_mode;
-
-      if (
-        (requestedEffort && requestedEffort !== llmCfg.primary.reasoning_effort) ||
-        effectiveAccessMode !== llmCfg.access_mode
-      ) {
-        llmCfg = store.saveLLMConfig({
-          primary: { ...llmCfg.primary, reasoning_effort: requestedEffort },
-          access_mode: effectiveAccessMode,
-        });
       }
 
       const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
@@ -893,27 +1112,9 @@ async function startServer(): Promise<void> {
           task: text,
           thread_id: thread.id,
           max_turns: llmCfg.max_turns,
-          access_mode: effectiveAccessMode,
-          primary_model: {
-            provider: llmCfg.primary.provider,
-            model: llmCfg.primary.model,
-            base_url: llmCfg.primary.base_url,
-            temperature: llmCfg.primary.temperature,
-            max_tokens: llmCfg.primary.max_tokens,
-            reasoning_effort: requestedEffort,
-            ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
-            ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
-          },
-          worker_model: {
-            provider: llmCfg.worker.provider,
-            model: llmCfg.worker.model,
-            base_url: llmCfg.worker.base_url,
-            temperature: llmCfg.worker.temperature,
-            max_tokens: llmCfg.worker.max_tokens,
-            reasoning_effort: llmCfg.worker.reasoning_effort,
-            ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
-            ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
-          },
+          access_mode: resolvedExec.effectiveAccessMode,
+          primary_model: resolvedExec.primaryModelPayload,
+          worker_model: resolvedExec.workerModelPayload,
           accessory_models: llmCfg.accessories,
           attachments: agentAttachments.length > 0 ? agentAttachments : undefined,
           mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
@@ -1034,20 +1235,19 @@ async function startServer(): Promise<void> {
       const username = getSessionUsername(res);
       const profileSecrets = loadProfileSecrets(username);
       const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
-      const effectiveAccessMode =
-        accessMode === 'default' || accessMode === 'full_access'
-          ? accessMode
-          : llmCfg.access_mode;
-      const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
-      await syncProfileSecretsToCore(username, true);
-
-      if (
-        jobOrchestrator.isThreadDeleted(threadId) ||
-        !store.listThreads().some((t) => t.id === threadId)
-      ) {
+      const targetThread = store.listThreads().find((t) => t.id === threadId) || null;
+      if (jobOrchestrator.isThreadDeleted(threadId) || !targetThread) {
         res.status(404).json({ error: 'Thread was deleted before resume started.' });
         return;
       }
+      const resolvedExec = await resolveThreadExecutionPayload({
+        thread: targetThread,
+        globalCfg: llmCfg,
+        profileSecrets,
+        accessModeOverride: accessMode,
+      });
+      const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
+      await syncProfileSecretsToCore(username, true);
 
       const agentResp = await callAgentCore('/agent/jobs/resume', {
         method: 'POST',
@@ -1057,27 +1257,9 @@ async function startServer(): Promise<void> {
           decision,
           arguments: editedArgs,
           reason,
-          access_mode: effectiveAccessMode,
-          primary_model: {
-            provider: llmCfg.primary.provider,
-            model: llmCfg.primary.model,
-            base_url: llmCfg.primary.base_url,
-            temperature: llmCfg.primary.temperature,
-            max_tokens: llmCfg.primary.max_tokens,
-            reasoning_effort: llmCfg.primary.reasoning_effort,
-            ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
-            ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
-          },
-          worker_model: {
-            provider: llmCfg.worker.provider,
-            model: llmCfg.worker.model,
-            base_url: llmCfg.worker.base_url,
-            temperature: llmCfg.worker.temperature,
-            max_tokens: llmCfg.worker.max_tokens,
-            reasoning_effort: llmCfg.worker.reasoning_effort,
-            ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
-            ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
-          },
+          access_mode: resolvedExec.effectiveAccessMode,
+          primary_model: resolvedExec.primaryModelPayload,
+          worker_model: resolvedExec.workerModelPayload,
           accessory_models: llmCfg.accessories,
           mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
         },
@@ -1183,10 +1365,13 @@ async function startServer(): Promise<void> {
     const username = getSessionUsername(res);
     const profileSecrets = loadProfileSecrets(username);
     const llmCfg = await enrichLLMConfigLimits(store.getLLMConfig(), { env: profileSecrets });
-    const effectiveAccessMode =
-      accessMode === 'default' || accessMode === 'full_access'
-        ? accessMode
-        : llmCfg.access_mode;
+    const targetThread = store.listThreads().find((t) => t.id === threadId) || null;
+    const resolvedExec = await resolveThreadExecutionPayload({
+      thread: targetThread,
+      globalCfg: llmCfg,
+      profileSecrets,
+      accessModeOverride: accessMode,
+    });
     const enabledMcps = store.listMCPServers().filter((s) => s.enabled);
     await syncProfileSecretsToCore(username, true);
     const agentResp = await callAgentCore('/agent/resume', {
@@ -1197,27 +1382,9 @@ async function startServer(): Promise<void> {
         decision,
         arguments: editedArgs,
         reason,
-        access_mode: effectiveAccessMode,
-        primary_model: {
-          provider: llmCfg.primary.provider,
-          model: llmCfg.primary.model,
-          base_url: llmCfg.primary.base_url,
-          temperature: llmCfg.primary.temperature,
-          max_tokens: llmCfg.primary.max_tokens,
-          reasoning_effort: llmCfg.primary.reasoning_effort,
-          ...(llmCfg.primary.context_window ? { context_window: llmCfg.primary.context_window } : {}),
-          ...(llmCfg.primary.max_output_tokens ? { max_output_tokens: llmCfg.primary.max_output_tokens } : {}),
-        },
-        worker_model: {
-          provider: llmCfg.worker.provider,
-          model: llmCfg.worker.model,
-          base_url: llmCfg.worker.base_url,
-          temperature: llmCfg.worker.temperature,
-          max_tokens: llmCfg.worker.max_tokens,
-          reasoning_effort: llmCfg.worker.reasoning_effort,
-          ...(llmCfg.worker.context_window ? { context_window: llmCfg.worker.context_window } : {}),
-          ...(llmCfg.worker.max_output_tokens ? { max_output_tokens: llmCfg.worker.max_output_tokens } : {}),
-        },
+        access_mode: resolvedExec.effectiveAccessMode,
+        primary_model: resolvedExec.primaryModelPayload,
+        worker_model: resolvedExec.workerModelPayload,
         accessory_models: llmCfg.accessories,
         mcp_servers: enabledMcps.length > 0 ? enabledMcps : undefined,
       },
@@ -1355,7 +1522,23 @@ async function startServer(): Promise<void> {
   app.get('/api/settings/llm', requireSession, async (_req, res) => {
     const username = getSessionUsername(res);
     const secrets = loadProfileSecrets(username);
-    const config = await enrichLLMConfigLimits(store.getLLMConfig(), { env: secrets });
+    const rawConfig = await enrichLLMConfigLimits(store.getLLMConfig(), { env: secrets });
+    const config = {
+      ...rawConfig,
+      custom_providers: (rawConfig.custom_providers || []).map((cp) => {
+        const envVar = deriveCustomProviderEnvVar(cp.id);
+        const rawKey = (
+          secrets[envVar] ||
+          (cp.id === 'custom_legacy' ? secrets.PRIMARY_API_KEY : '') ||
+          ''
+        ).trim();
+        return {
+          ...cp,
+          api_key_configured: Boolean(rawKey),
+          masked_key: maskEnvSecret(rawKey),
+        };
+      }),
+    };
     res.json({
       config,
       providers: store.getProviderAvailability(secrets),
@@ -1389,26 +1572,236 @@ async function startServer(): Promise<void> {
     });
   });
 
+  app.get('/api/settings/sandbox', requireSession, (_req, res) => {
+    const cfg = store.getLLMConfig();
+    res.json({
+      allow_unsafe_local_bash: cfg.allow_unsafe_local_bash,
+    });
+  });
+
+  app.put('/api/settings/sandbox', requireSession, async (req, res) => {
+    const { allow_unsafe_local_bash } = (req.body || {}) as { allow_unsafe_local_bash?: unknown };
+    if (typeof allow_unsafe_local_bash !== 'boolean') {
+      res.status(400).json({ error: 'allow_unsafe_local_bash must be a boolean.' });
+      return;
+    }
+    const saved = store.saveLLMConfig({ allow_unsafe_local_bash });
+    const syncResp = await callAgentCore('/config/sandbox', {
+      method: 'PUT',
+      body: { allow_unsafe_local_bash: saved.allow_unsafe_local_bash },
+      timeoutMs: 4000,
+    });
+    res.json({
+      ok: true,
+      allow_unsafe_local_bash: saved.allow_unsafe_local_bash,
+      coreSynced: syncResp.ok,
+    });
+  });
+
+  const enrichCustomProvidersWithVaultStatus = (
+    providers: CustomProviderConfig[],
+    profileSecrets: Record<string, string>,
+  ) =>
+    providers.map((cp) => {
+      const envVar = deriveCustomProviderEnvVar(cp.id);
+      const rawKey = (
+        profileSecrets[envVar] ||
+        (cp.id === 'custom_legacy' ? profileSecrets.PRIMARY_API_KEY : '') ||
+        ''
+      ).trim();
+      return {
+        ...cp,
+        api_key_configured: Boolean(rawKey),
+        masked_key: maskEnvSecret(rawKey),
+      };
+    });
+
+  app.get('/api/settings/custom-providers', requireSession, (_req, res) => {
+    const username = getSessionUsername(res);
+    const secrets = loadProfileSecrets(username);
+    const list = enrichCustomProvidersWithVaultStatus(store.getCustomProviders(), secrets);
+    res.json({ custom_providers: list, providers: store.getProviderAvailability(secrets) });
+  });
+
+  app.post('/api/settings/custom-providers', requireSession, async (req, res) => {
+    const username = getSessionUsername(res);
+    const body = (req.body || {}) as {
+      id?: string;
+      name?: string;
+      base_url?: string;
+      protocol?: CustomProviderProtocol;
+      enabled?: boolean;
+      models?: Array<string | CustomProviderModelConfig>;
+      timeout_seconds?: number | null;
+      api_key?: string;
+    };
+    const cleanBase = (body.base_url || '').trim().replace(/\/+$/, '');
+    const urlCheck = await validateOutboundProviderUrl(cleanBase, {
+      allowLoopback: true,
+      resolveDns: false,
+    });
+    if (!urlCheck.ok) {
+      res.status(400).json({ error: urlCheck.error });
+      return;
+    }
+    try {
+      const created = store.upsertCustomProvider({
+        id: body.id,
+        name: body.name || '',
+        base_url: cleanBase,
+        protocol: body.protocol,
+        enabled: body.enabled,
+        models: body.models,
+        timeout_seconds: body.timeout_seconds,
+      });
+      if (typeof body.api_key === 'string' && body.api_key.trim()) {
+        const envVar = deriveCustomProviderEnvVar(created.id);
+        loadProfileSecrets(username);
+        profileVault.setSecrets(username, { [envVar]: body.api_key.trim() }, { resetIfUnreadable: true });
+      }
+      const updatedSecrets = loadProfileSecrets(username);
+      await syncProfileSecretsToCore(username, true);
+      await callAgentCore('/config/llm', {
+        method: 'PUT',
+        body: store.getLLMConfig(),
+        timeoutMs: 5000,
+      });
+      const list = enrichCustomProvidersWithVaultStatus(store.getCustomProviders(), updatedSecrets);
+      res.status(201).json({
+        ok: true,
+        provider: list.find((p) => p.id === created.id) || created,
+        custom_providers: list,
+        providers: store.getProviderAvailability(updatedSecrets),
+        vault: buildVaultSummary(username),
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to save custom provider.' });
+    }
+  });
+
+  app.put('/api/settings/custom-providers/:id', requireSession, async (req, res) => {
+    const username = getSessionUsername(res);
+    const targetId = normalizeProviderId(req.params.id);
+    const existing = store.getCustomProvider(targetId);
+    if (!existing) {
+      res.status(404).json({ error: 'Custom provider not found.' });
+      return;
+    }
+    const body = (req.body || {}) as {
+      name?: string;
+      base_url?: string;
+      protocol?: CustomProviderProtocol;
+      enabled?: boolean;
+      models?: Array<string | CustomProviderModelConfig>;
+      timeout_seconds?: number | null;
+      api_key?: string;
+      clear_api_key?: boolean;
+    };
+    const nextBase = (body.base_url ?? existing.base_url).trim().replace(/\/+$/, '');
+    const urlCheck = await validateOutboundProviderUrl(nextBase, {
+      allowLoopback: true,
+      resolveDns: false,
+    });
+    if (!urlCheck.ok) {
+      res.status(400).json({ error: urlCheck.error });
+      return;
+    }
+    try {
+      const updated = store.upsertCustomProvider({
+        id: targetId,
+        name: body.name ?? existing.name,
+        base_url: nextBase,
+        protocol: body.protocol ?? existing.protocol,
+        enabled: body.enabled ?? existing.enabled,
+        models: body.models ?? existing.models,
+        timeout_seconds: 'timeout_seconds' in body ? body.timeout_seconds : existing.timeout_seconds,
+      });
+      const envVar = deriveCustomProviderEnvVar(updated.id);
+      if (body.clear_api_key) {
+        loadProfileSecrets(username);
+        profileVault.deleteSecret(username, envVar, { resetIfUnreadable: true });
+      } else if (typeof body.api_key === 'string' && body.api_key.trim()) {
+        loadProfileSecrets(username);
+        profileVault.setSecrets(username, { [envVar]: body.api_key.trim() }, { resetIfUnreadable: true });
+      }
+      const updatedSecrets = loadProfileSecrets(username);
+      await syncProfileSecretsToCore(username, true);
+      await callAgentCore('/config/llm', {
+        method: 'PUT',
+        body: store.getLLMConfig(),
+        timeoutMs: 5000,
+      });
+      const list = enrichCustomProvidersWithVaultStatus(store.getCustomProviders(), updatedSecrets);
+      res.json({
+        ok: true,
+        provider: list.find((p) => p.id === updated.id) || updated,
+        custom_providers: list,
+        providers: store.getProviderAvailability(updatedSecrets),
+        vault: buildVaultSummary(username),
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to update custom provider.' });
+    }
+  });
+
+  app.delete('/api/settings/custom-providers/:id', requireSession, async (req, res) => {
+    const username = getSessionUsername(res);
+    const targetId = normalizeProviderId(req.params.id);
+    const deleted = store.deleteCustomProvider(targetId);
+    if (!deleted) {
+      res.status(404).json({ error: 'Custom provider not found.' });
+      return;
+    }
+    const envVar = deriveCustomProviderEnvVar(targetId);
+    try {
+      loadProfileSecrets(username);
+      profileVault.deleteSecret(username, envVar, { resetIfUnreadable: true });
+    } catch {
+      // ignore if key did not exist
+    }
+    const updatedSecrets = loadProfileSecrets(username);
+    await syncProfileSecretsToCore(username, true);
+    await callAgentCore('/config/llm', {
+      method: 'PUT',
+      body: store.getLLMConfig(),
+      timeoutMs: 5000,
+    });
+    const list = enrichCustomProvidersWithVaultStatus(store.getCustomProviders(), updatedSecrets);
+    res.json({
+      ok: true,
+      custom_providers: list,
+      providers: store.getProviderAvailability(updatedSecrets),
+      vault: buildVaultSummary(username),
+    });
+  });
+
   app.post('/api/settings/resolve-model', requireSession, async (req, res) => {
     const username = getSessionUsername(res);
-    const { provider, model, base_url, api_key, role } = (req.body || {}) as {
+    const { provider, model, base_url, api_key, role, manual_context_window, force_refresh } = (req.body || {}) as {
       provider?: string;
       model?: string;
       base_url?: string;
       api_key?: string;
       role?: 'primary' | 'worker' | 'image' | 'video' | 'audio';
+      manual_context_window?: number | null;
+      force_refresh?: boolean;
     };
     const cleanModel = (model || '').trim();
     if (!cleanModel) {
       res.status(400).json({ error: 'Model ID is required.' });
       return;
     }
+    const cleanProvider = normalizeProviderId(provider || 'river_ai');
+    const customProvider = store.getCustomProvider(cleanProvider);
     const profileSecrets = loadProfileSecrets(username);
     const resolved = await resolveModelMetadataUnified({
-      provider: (provider || 'river_ai').trim(),
+      provider: cleanProvider,
       model: cleanModel,
-      base_url: base_url?.trim() || undefined,
+      base_url: base_url?.trim() || customProvider?.base_url || undefined,
       api_key: api_key?.trim() || undefined,
+      customProvider,
+      manualContextWindow: manual_context_window ?? null,
+      forceRefresh: Boolean(force_refresh),
       role: role === 'primary' ? 'primary' : 'worker',
       env: profileSecrets,
       allowLiveFetch: true,
@@ -1430,6 +1823,9 @@ async function startServer(): Promise<void> {
       }>;
       max_turns?: unknown;
       access_mode?: unknown;
+      allow_unsafe_local_bash?: unknown;
+      custom_providers?: CustomProviderConfig[];
+      planning_timeout?: Partial<PlanningTimeoutConfig>;
       api_keys?: {
         primary?: string;
         worker?: string;
@@ -1467,6 +1863,11 @@ async function startServer(): Promise<void> {
       accessories: body.accessories,
       ...(validatedMaxTurns !== undefined ? { max_turns: validatedMaxTurns } : {}),
       ...(validatedAccessMode !== undefined ? { access_mode: validatedAccessMode } : {}),
+      ...(typeof body.allow_unsafe_local_bash === 'boolean'
+        ? { allow_unsafe_local_bash: body.allow_unsafe_local_bash }
+        : {}),
+      ...(Array.isArray(body.custom_providers) ? { custom_providers: body.custom_providers } : {}),
+      ...(body.planning_timeout ? { planning_timeout: body.planning_timeout } : {}),
     });
 
     const vaultUpdates: Record<string, string> = {};
@@ -1570,7 +1971,7 @@ async function startServer(): Promise<void> {
       env_var?.trim().toUpperCase() ||
       (provider ? store.getEnvVarForProvider(provider, 'primary') : '')
     ).trim();
-    if (!ALLOWED_PROFILE_SECRET_KEYS.has(targetEnvVar)) {
+    if (!isAllowedProfileSecretKey(targetEnvVar)) {
       res.status(400).json({ error: 'Unsupported provider API key name.' });
       return;
     }
@@ -1598,7 +1999,7 @@ async function startServer(): Promise<void> {
   app.delete('/api/settings/vault/:envVar', requireSession, async (req, res) => {
     const username = getSessionUsername(res);
     const targetEnvVar = String(req.params.envVar || '').trim().toUpperCase();
-    if (!ALLOWED_PROFILE_SECRET_KEYS.has(targetEnvVar)) {
+    if (!isAllowedProfileSecretKey(targetEnvVar)) {
       res.status(400).json({ error: 'Unsupported provider API key name.' });
       return;
     }
@@ -1626,23 +2027,28 @@ async function startServer(): Promise<void> {
 
   app.post('/api/settings/models', requireSession, async (req, res) => {
     const username = getSessionUsername(res);
-    const { provider, base_url, api_key, role } = (req.body || {}) as {
+    const { provider, base_url, api_key, role, force_refresh } = (req.body || {}) as {
       provider?: string;
       base_url?: string;
       api_key?: string;
       role?: 'primary' | 'worker' | 'image' | 'video' | 'audio';
+      force_refresh?: boolean;
     };
-    const cleanProvider = (provider || '').trim();
+    const cleanProvider = normalizeProviderId(provider || '');
     if (!cleanProvider) {
       res.status(400).json({ ok: false, models: [], count: 0, error: 'Provider is required.' });
       return;
     }
 
+    const customProvider = store.getCustomProvider(cleanProvider);
     const profileSecrets = loadProfileSecrets(username);
     const catalog = await listProviderModelsDirect({
       provider: cleanProvider,
-      base_url: base_url?.trim() || undefined,
+      base_url: base_url?.trim() || customProvider?.base_url || undefined,
       api_key: api_key?.trim() || undefined,
+      protocol: customProvider?.protocol,
+      customProvider,
+      forceRefresh: Boolean(force_refresh),
       role: role === 'primary' ? 'primary' : 'worker',
       env: profileSecrets,
     });
@@ -1664,10 +2070,13 @@ async function startServer(): Promise<void> {
     const persistedRoleConfig = isAccessory
       ? persisted.accessories[role]
       : persisted[targetRole];
+    const targetProvider = normalizeProviderId(override?.provider || persistedRoleConfig.provider);
+    const customProvider = store.getCustomProvider(targetProvider);
     const result = await probeProviderModelDirect({
       role: targetRole,
       override,
       persistedRoleConfig,
+      customProvider,
       apiKey,
       env: profileSecrets,
     });
@@ -1745,6 +2154,7 @@ async function startServer(): Promise<void> {
 
   server.listen(PORT, HOST, () => {
     console.log(`[nemofy-agent] Server running on http://${HOST}:${PORT}`);
+    void firecrawlManager.start();
     void agentManager.start();
   });
 
@@ -1772,6 +2182,7 @@ async function startServer(): Promise<void> {
     await Promise.allSettled([
       httpClosePromise,
       viteServer ? viteServer.close() : Promise.resolve(),
+      firecrawlManager.stop(),
       agentManager.stop(),
     ]);
 

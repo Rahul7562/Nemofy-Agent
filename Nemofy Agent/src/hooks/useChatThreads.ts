@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createThread, deleteThread, listThreads } from '../lib/apiClient.ts';
-import type { ChatThread } from '../types/agent.ts';
+import type { ChatThread, ThreadSessionConfig } from '../types/agent.ts';
 
 export function useChatThreads(authenticated: boolean) {
   const [threads, setThreads] = useState<ChatThread[]>([]);
@@ -86,19 +86,25 @@ export function useChatThreads(authenticated: boolean) {
     [],
   );
 
-  const createNewThread = useCallback(async (title = 'New Agent Session'): Promise<ChatThread | null> => {
-    setThreadsError(null);
-    try {
-      const created = await createThread(title);
-      deletedIdsRef.current.delete(created.id);
-      setThreads((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
-      setActiveThreadId(created.id);
-      return created;
-    } catch (err) {
-      setThreadsError(err instanceof Error ? err.message : 'Unable to create session.');
-      return null;
-    }
-  }, []);
+  const createNewThread = useCallback(
+    async (
+      title = 'New Agent Session',
+      sessionConfig?: Partial<ThreadSessionConfig>,
+    ): Promise<ChatThread | null> => {
+      setThreadsError(null);
+      try {
+        const created = await createThread(title, sessionConfig);
+        deletedIdsRef.current.delete(created.id);
+        setThreads((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
+        setActiveThreadId(created.id);
+        return created;
+      } catch (err) {
+        setThreadsError(err instanceof Error ? err.message : 'Unable to create session.');
+        return null;
+      }
+    },
+    [],
+  );
 
   const removeThread = useCallback(async (id: string) => {
     setThreadsError(null);

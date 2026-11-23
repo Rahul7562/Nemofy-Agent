@@ -56,6 +56,50 @@ export function validateMaxTurns(
   return { ok: true, value: parsed };
 }
 
+export type CustomProviderProtocol = 'openai_compatible' | 'anthropic_compatible';
+
+export interface CustomProviderModelConfig {
+  id: string;
+  name?: string;
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+}
+
+export interface CustomProviderConfig {
+  id: string;
+  name: string;
+  base_url: string;
+  protocol: CustomProviderProtocol;
+  enabled: boolean;
+  models: CustomProviderModelConfig[];
+  timeout_seconds?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlanningTimeoutConfig {
+  connect_timeout_seconds: number;
+  read_timeout_seconds: number;
+  max_retries: number;
+  fallback_on_timeout: boolean;
+  fallback_provider?: string | null;
+  fallback_model?: string | null;
+}
+
+export interface ThreadSessionConfig {
+  provider: string;
+  model: string;
+  base_url: string;
+  temperature: number;
+  max_tokens: number;
+  reasoning_effort: string;
+  context_window?: number | null;
+  context_window_source?: string | null;
+  manual_context_window?: number | null;
+  max_output_tokens?: number | null;
+  access_mode: ExecutionAccessMode;
+}
+
 export interface RoleLLMConfig {
   provider: string;
   model: string;
@@ -64,6 +108,8 @@ export interface RoleLLMConfig {
   max_tokens: number;
   reasoning_effort: string;
   context_window?: number | null;
+  context_window_source?: string | null;
+  manual_context_window?: number | null;
   max_output_tokens?: number | null;
 }
 
@@ -81,9 +127,17 @@ export interface ContextUsageSnapshot {
   provider: string;
   context_window: number | null;
   context_window_source: string;
+  detection_mode?: 'auto' | 'manual' | 'unknown';
+  is_manual_override?: boolean;
+  manual_context_window?: number | null;
   max_output_tokens?: number | null;
   max_output_tokens_source?: string;
   configured_max_tokens?: number | null;
+  reserved_output_tokens?: number;
+  safety_buffer_tokens?: number;
+  usable_input_window?: number | null;
+  remaining_input_budget?: number | null;
+  input_budget_percent?: number | null;
   used_tokens: number;
   free_tokens: number | null;
   usage_percent: number | null;
@@ -116,6 +170,10 @@ export interface PersistedLLMConfig {
   accessories: AccessoriesConfig;
   max_turns: number;
   access_mode: ExecutionAccessMode;
+  allow_unsafe_local_bash: boolean;
+  firecrawl_api_url?: string;
+  custom_providers: CustomProviderConfig[];
+  planning_timeout: PlanningTimeoutConfig;
 }
 
 export interface ChatAttachmentRecord {
@@ -207,6 +265,7 @@ export interface ChatThreadRecord {
   messages: ChatMessageRecord[];
   pendingApproval?: Record<string, unknown> | null;
   contextUsage?: ContextUsageSnapshot | null;
+  sessionConfig?: ThreadSessionConfig;
 }
 
 const PROVIDER_DEFAULTS: Record<string, { baseUrl: string; envVars: string[]; requiresKey: boolean }> = {
@@ -237,6 +296,170 @@ const PROVIDER_ALIASES: Record<string, string> = {
   local: 'ollama',
 };
 
+export function isCustomProviderId(provider?: string | null): boolean {
+  const clean = (provider || '').trim().toLowerCase();
+  return clean === 'custom' || clean.startsWith('custom_');
+}
+
+export function deriveCustomProviderSecretKey(providerId: string): string {
+  const safe = (providerId || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return `CUSTOM_PROVIDER_${safe || 'CUSTOM'}_API_KEY`;
+}
+
+export function slugifyCustomProviderId(name: string, existingIds?: Iterable<string>): string {
+  const taken = new Set(Array.from(existingIds || []).map((id) => id.toLowerCase()));
+  const baseSlug = (name || 'provider')
+    .trim()
+    .toLowerCase()
+    .replace(/^custom[_-]+/, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 36) || 'provider';
+  let candidate = `custom_${baseSlug}`;
+  let idx = 2;
+  while (taken.has(candidate)) {
+    candidate = `custom_${baseSlug.slice(0, 30)}_${idx}`;
+    idx += 1;
+  }
+  return candidate;
+}
+
+export function getDefaultAllowUnsafeLocalBash(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = (env.ALLOW_UNSAFE_LOCAL_BASH || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+export function getDefaultPlanningTimeoutConfig(
+  env: Record<string, string | undefined> = process.env,
+): PlanningTimeoutConfig {
+  const rawConnect = Number(env.MODEL_CONNECT_TIMEOUT_SECONDS || '20');
+  const rawRead = Number(env.MODEL_READ_TIMEOUT_SECONDS || env.MODEL_TIMEOUT_SECONDS || '120');
+  const rawRetries = Number(env.MODEL_MAX_RETRIES || '2');
+  const rawFallback = (env.MODEL_FALLBACK_ON_TIMEOUT || '').trim().toLowerCase();
+  return {
+    connect_timeout_seconds:
+      Number.isFinite(rawConnect) && rawConnect >= 3 && rawConnect <= 120 ? Math.round(rawConnect) : 20,
+    read_timeout_seconds:
+      Number.isFinite(rawRead) && rawRead >= 15 && rawRead <= 600 ? Math.round(rawRead) : 120,
+    max_retries:
+      Number.isFinite(rawRetries) && rawRetries >= 0 && rawRetries <= 5 ? Math.round(rawRetries) : 2,
+    fallback_on_timeout: rawFallback === '1' || rawFallback === 'true' || rawFallback === 'yes',
+    fallback_provider: (env.MODEL_FALLBACK_PROVIDER || '').trim() || null,
+    fallback_model: (env.MODEL_FALLBACK_MODEL || '').trim() || null,
+  };
+}
+
+function normalizePlanningTimeoutConfig(
+  raw: Partial<PlanningTimeoutConfig> | undefined,
+  fallback: PlanningTimeoutConfig,
+): PlanningTimeoutConfig {
+  const connect = Number(raw?.connect_timeout_seconds);
+  const read = Number(raw?.read_timeout_seconds);
+  const retries = Number(raw?.max_retries);
+  return {
+    connect_timeout_seconds:
+      Number.isFinite(connect) && connect >= 3 && connect <= 120
+        ? Math.round(connect)
+        : fallback.connect_timeout_seconds,
+    read_timeout_seconds:
+      Number.isFinite(read) && read >= 15 && read <= 600
+        ? Math.round(read)
+        : fallback.read_timeout_seconds,
+    max_retries:
+      Number.isFinite(retries) && retries >= 0 && retries <= 5
+        ? Math.round(retries)
+        : fallback.max_retries,
+    fallback_on_timeout:
+      typeof raw?.fallback_on_timeout === 'boolean'
+        ? raw.fallback_on_timeout
+        : fallback.fallback_on_timeout,
+    fallback_provider:
+      raw && 'fallback_provider' in raw
+        ? (typeof raw.fallback_provider === 'string' && raw.fallback_provider.trim()
+            ? normalizeProviderId(raw.fallback_provider)
+            : null)
+        : fallback.fallback_provider ?? null,
+    fallback_model:
+      raw && 'fallback_model' in raw
+        ? (typeof raw.fallback_model === 'string' && raw.fallback_model.trim()
+            ? raw.fallback_model.trim()
+            : null)
+        : fallback.fallback_model ?? null,
+  };
+}
+
+function normalizeCustomProviderModels(rawModels: unknown): CustomProviderModelConfig[] {
+  if (!Array.isArray(rawModels)) return [];
+  const seen = new Set<string>();
+  const out: CustomProviderModelConfig[] = [];
+  for (const item of rawModels) {
+    if (typeof item === 'string') {
+      const id = item.trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id });
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Partial<CustomProviderModelConfig>;
+    const id = typeof rec.id === 'string' ? rec.id.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const ctx = Number(rec.context_window);
+    const maxOut = Number(rec.max_output_tokens);
+    out.push({
+      id,
+      ...(typeof rec.name === 'string' && rec.name.trim() ? { name: rec.name.trim() } : {}),
+      ...(Number.isFinite(ctx) && ctx >= 512 ? { context_window: Math.round(ctx) } : {}),
+      ...(Number.isFinite(maxOut) && maxOut >= 256 ? { max_output_tokens: Math.round(maxOut) } : {}),
+    });
+  }
+  return out;
+}
+
+function normalizeCustomProvidersList(rawList: unknown): CustomProviderConfig[] {
+  if (!Array.isArray(rawList)) return [];
+  const now = new Date().toISOString();
+  const seen = new Set<string>();
+  const out: CustomProviderConfig[] = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Partial<CustomProviderConfig>;
+    const rawName = typeof rec.name === 'string' ? rec.name.trim() : '';
+    const rawId = typeof rec.id === 'string' ? rec.id.trim().toLowerCase() : '';
+    const id =
+      rawId && /^custom_[a-z0-9][a-z0-9_-]{0,48}$/.test(rawId)
+        ? rawId
+        : slugifyCustomProviderId(rawName || 'provider', seen);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const base_url = typeof rec.base_url === 'string' ? rec.base_url.trim().replace(/\/+$/, '') : '';
+    if (!base_url) continue;
+    const protocol: CustomProviderProtocol =
+      rec.protocol === 'anthropic_compatible' ? 'anthropic_compatible' : 'openai_compatible';
+    const rawTimeout = Number(rec.timeout_seconds);
+    out.push({
+      id,
+      name: rawName || id.replace(/^custom_/, '').replace(/_/g, ' '),
+      base_url,
+      protocol,
+      enabled: rec.enabled !== false,
+      models: normalizeCustomProviderModels(rec.models),
+      ...(Number.isFinite(rawTimeout) && rawTimeout >= 10 && rawTimeout <= 600
+        ? { timeout_seconds: Math.round(rawTimeout) }
+        : {}),
+      created_at: typeof rec.created_at === 'string' && rec.created_at ? rec.created_at : now,
+      updated_at: typeof rec.updated_at === 'string' && rec.updated_at ? rec.updated_at : now,
+    });
+  }
+  return out;
+}
+
 export function normalizeProviderId(provider?: string | null): string {
   const clean = (provider || '').trim().toLowerCase();
   if (!clean) return 'river_ai';
@@ -246,10 +469,11 @@ export function normalizeProviderId(provider?: string | null): string {
 function normalizeRoleConfig(
   raw: Partial<RoleLLMConfig> | undefined,
   fallback: RoleLLMConfig,
-  options: { allowEmptyModel?: boolean } = {},
+  options: { allowEmptyModel?: boolean; customProviders?: CustomProviderConfig[] } = {},
 ): RoleLLMConfig {
   const provider = normalizeProviderId(raw?.provider || fallback.provider);
-  const presetBase = PROVIDER_DEFAULTS[provider]?.baseUrl || '';
+  const customMatch = (options.customProviders || []).find((cp) => cp.id === provider);
+  const presetBase = customMatch?.base_url || PROVIDER_DEFAULTS[provider]?.baseUrl || '';
   const rawBase = typeof raw?.base_url === 'string' ? raw.base_url.trim().replace(/\/+$/, '') : '';
   const base_url = rawBase || presetBase || fallback.base_url;
   const hasExplicitModel = typeof raw?.model === 'string';
@@ -269,6 +493,25 @@ function normalizeRoleConfig(
       ? raw.reasoning_effort.trim().toLowerCase()
       : fallback.reasoning_effort;
 
+  const sameModelAndProvider = model === fallback.model && provider === fallback.provider;
+
+  let manual_context_window: number | null | undefined;
+  if (raw && 'manual_context_window' in raw) {
+    if (raw.manual_context_window === null || raw.manual_context_window === undefined) {
+      manual_context_window = null;
+    } else {
+      const rawManual = Number(raw.manual_context_window);
+      manual_context_window = Number.isFinite(rawManual) && rawManual >= 512 ? Math.round(rawManual) : null;
+    }
+  } else if (
+    typeof fallback.manual_context_window === 'number' &&
+    Number.isFinite(fallback.manual_context_window) &&
+    fallback.manual_context_window >= 512 &&
+    sameModelAndProvider
+  ) {
+    manual_context_window = Math.round(fallback.manual_context_window);
+  }
+
   let context_window: number | null | undefined;
   if (raw && 'context_window' in raw) {
     const rawCtx = Number(raw.context_window);
@@ -277,10 +520,22 @@ function normalizeRoleConfig(
     typeof fallback.context_window === 'number' &&
     Number.isFinite(fallback.context_window) &&
     fallback.context_window >= 512 &&
-    model === fallback.model &&
-    provider === fallback.provider
+    sameModelAndProvider
   ) {
     context_window = Math.round(fallback.context_window);
+  }
+
+  let context_window_source: string | null | undefined;
+  if (manual_context_window) {
+    context_window = manual_context_window;
+    context_window_source = 'manual';
+  } else if (raw && 'context_window_source' in raw) {
+    context_window_source =
+      typeof raw.context_window_source === 'string' && raw.context_window_source.trim()
+        ? raw.context_window_source.trim()
+        : null;
+  } else if (sameModelAndProvider && fallback.context_window_source) {
+    context_window_source = fallback.context_window_source;
   }
 
   let max_output_tokens: number | null | undefined;
@@ -291,8 +546,7 @@ function normalizeRoleConfig(
     typeof fallback.max_output_tokens === 'number' &&
     Number.isFinite(fallback.max_output_tokens) &&
     fallback.max_output_tokens >= 256 &&
-    model === fallback.model &&
-    provider === fallback.provider
+    sameModelAndProvider
   ) {
     max_output_tokens = Math.round(fallback.max_output_tokens);
   }
@@ -305,6 +559,8 @@ function normalizeRoleConfig(
     max_tokens,
     reasoning_effort,
     ...(context_window ? { context_window } : {}),
+    ...(context_window_source ? { context_window_source } : {}),
+    ...(manual_context_window ? { manual_context_window } : {}),
     ...(max_output_tokens ? { max_output_tokens } : {}),
   };
 }
@@ -922,6 +1178,11 @@ export class WorkspaceAndConfigStore {
       masked_key: string | null;
       requires_api_key: boolean;
       storage?: 'profile_vault' | 'env';
+      is_custom?: boolean;
+      name?: string;
+      enabled?: boolean;
+      protocol?: CustomProviderProtocol;
+      models?: CustomProviderModelConfig[];
     }
   > {
     if (!profileSecrets) {
@@ -939,6 +1200,11 @@ export class WorkspaceAndConfigStore {
         masked_key: string | null;
         requires_api_key: boolean;
         storage?: 'profile_vault' | 'env';
+        is_custom?: boolean;
+        name?: string;
+        enabled?: boolean;
+        protocol?: CustomProviderProtocol;
+        models?: CustomProviderModelConfig[];
       }
     > = {};
     for (const [key, info] of Object.entries(PROVIDER_DEFAULTS)) {
@@ -961,11 +1227,36 @@ export class WorkspaceAndConfigStore {
         storage,
       };
     }
+
+    // Include all user-defined custom providers
+    const customProviders = this.getLLMConfig().custom_providers || [];
+    for (const cp of customProviders) {
+      const envVar = deriveCustomProviderSecretKey(cp.id);
+      const val = (sourceEnv[envVar] || (cp.id === 'custom_legacy' ? sourceEnv.PRIMARY_API_KEY : '') || '').trim();
+      out[cp.id] = {
+        base_url: cp.base_url,
+        env_keys: [envVar],
+        primary_env_var: envVar,
+        api_key_configured: Boolean(val),
+        masked_key: maskEnvSecret(val),
+        requires_api_key: false,
+        storage,
+        is_custom: true,
+        name: cp.name,
+        enabled: cp.enabled,
+        protocol: cp.protocol,
+        models: cp.models,
+      };
+    }
+
     return out;
   }
 
   getEnvVarForProvider(provider: string, role: 'primary' | 'worker'): string {
     const normalized = normalizeProviderId(provider);
+    if (normalized.startsWith('custom_')) {
+      return deriveCustomProviderSecretKey(normalized);
+    }
     if (normalized === 'custom') {
       return role === 'worker' ? 'WORKER_API_KEY' : 'PRIMARY_API_KEY';
     }
@@ -1027,6 +1318,10 @@ export class WorkspaceAndConfigStore {
         Math.min(MAX_MAX_TURNS, Math.round(Number(process.env.MAX_TURNS || '30') || 30)),
       ),
       access_mode: normalizeAccessMode(process.env.EXECUTION_ACCESS_MODE),
+      allow_unsafe_local_bash: getDefaultAllowUnsafeLocalBash(process.env),
+      firecrawl_api_url: (process.env.FIRECRAWL_API_URL || '').trim().replace(/\/+$/, ''),
+      custom_providers: [],
+      planning_timeout: getDefaultPlanningTimeoutConfig(process.env),
     };
 
     if (!fs.existsSync(this.llmConfigPath)) {
@@ -1035,9 +1330,42 @@ export class WorkspaceAndConfigStore {
 
     try {
       const parsed = JSON.parse(fs.readFileSync(this.llmConfigPath, 'utf-8')) as Partial<PersistedLLMConfig>;
+      let customProviders = normalizeCustomProvidersList(parsed.custom_providers);
+      // Seamless migration of legacy single 'custom' provider if base_url was configured
+      if (
+        customProviders.length === 0 &&
+        parsed.primary?.provider === 'custom' &&
+        typeof parsed.primary.base_url === 'string' &&
+        parsed.primary.base_url.trim()
+      ) {
+        const now = new Date().toISOString();
+        customProviders = [
+          {
+            id: 'custom_legacy',
+            name: 'Legacy Custom Provider',
+            base_url: parsed.primary.base_url.trim().replace(/\/+$/, ''),
+            protocol: 'openai_compatible',
+            enabled: true,
+            models: parsed.primary.model?.trim()
+              ? [
+                  {
+                    id: parsed.primary.model.trim(),
+                    ...(parsed.primary.context_window ? { context_window: parsed.primary.context_window } : {}),
+                    ...(parsed.primary.max_output_tokens ? { max_output_tokens: parsed.primary.max_output_tokens } : {}),
+                  },
+                ]
+              : [],
+            created_at: now,
+            updated_at: now,
+          },
+        ];
+      }
       return {
-        primary: normalizeRoleConfig(parsed.primary, defaults.primary, { allowEmptyModel: true }),
-        worker: normalizeRoleConfig(parsed.worker, defaults.worker),
+        primary: normalizeRoleConfig(parsed.primary, defaults.primary, {
+          allowEmptyModel: true,
+          customProviders,
+        }),
+        worker: normalizeRoleConfig(parsed.worker, defaults.worker, { customProviders }),
         accessories: {
           image: normalizeAccessoryConfig(parsed.accessories?.image, defaults.accessories.image),
           video: normalizeAccessoryConfig(parsed.accessories?.video, defaults.accessories.video),
@@ -1051,6 +1379,16 @@ export class WorkspaceAndConfigStore {
           parsed.access_mode !== undefined
             ? normalizeAccessMode(parsed.access_mode)
             : defaults.access_mode,
+        allow_unsafe_local_bash:
+          typeof parsed.allow_unsafe_local_bash === 'boolean'
+            ? parsed.allow_unsafe_local_bash
+            : defaults.allow_unsafe_local_bash,
+        firecrawl_api_url:
+          typeof parsed.firecrawl_api_url === 'string'
+            ? parsed.firecrawl_api_url.trim().replace(/\/+$/, '')
+            : defaults.firecrawl_api_url || '',
+        custom_providers: customProviders,
+        planning_timeout: normalizePlanningTimeoutConfig(parsed.planning_timeout, defaults.planning_timeout),
       };
     } catch {
       return defaults;
@@ -1058,18 +1396,26 @@ export class WorkspaceAndConfigStore {
   }
 
   saveLLMConfig(
-    next: Partial<Omit<PersistedLLMConfig, 'accessories'>> & {
+    next: Partial<Omit<PersistedLLMConfig, 'accessories' | 'planning_timeout'>> & {
       accessories?: Partial<{
         image: Partial<AccessoryLLMConfig>;
         video: Partial<AccessoryLLMConfig>;
         audio: Partial<AccessoryLLMConfig>;
       }>;
+      planning_timeout?: Partial<PlanningTimeoutConfig>;
     },
   ): PersistedLLMConfig {
     const current = this.getLLMConfig();
+    const customProviders =
+      next.custom_providers !== undefined
+        ? normalizeCustomProvidersList(next.custom_providers)
+        : current.custom_providers;
     const merged: PersistedLLMConfig = {
-      primary: normalizeRoleConfig(next.primary, current.primary, { allowEmptyModel: true }),
-      worker: normalizeRoleConfig(next.worker, current.worker),
+      primary: normalizeRoleConfig(next.primary, current.primary, {
+        allowEmptyModel: true,
+        customProviders,
+      }),
+      worker: normalizeRoleConfig(next.worker, current.worker, { customProviders }),
       accessories: {
         image: normalizeAccessoryConfig(next.accessories?.image, current.accessories.image),
         video: normalizeAccessoryConfig(next.accessories?.video, current.accessories.video),
@@ -1083,12 +1429,107 @@ export class WorkspaceAndConfigStore {
         next.access_mode !== undefined
           ? normalizeAccessMode(next.access_mode)
           : current.access_mode,
+      allow_unsafe_local_bash:
+        typeof next.allow_unsafe_local_bash === 'boolean'
+          ? next.allow_unsafe_local_bash
+          : current.allow_unsafe_local_bash,
+      firecrawl_api_url:
+        typeof next.firecrawl_api_url === 'string'
+          ? next.firecrawl_api_url.trim().replace(/\/+$/, '')
+          : current.firecrawl_api_url || '',
+      custom_providers: customProviders,
+      planning_timeout: normalizePlanningTimeoutConfig(next.planning_timeout, current.planning_timeout),
     };
     const payload = JSON.stringify(merged, null, 2) + '\n';
     const tmpPath = `${this.llmConfigPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     fs.writeFileSync(tmpPath, payload, 'utf-8');
     fs.renameSync(tmpPath, this.llmConfigPath);
     return merged;
+  }
+
+  getCustomProviders(): CustomProviderConfig[] {
+    return this.getLLMConfig().custom_providers || [];
+  }
+
+  getCustomProvider(providerId: string): CustomProviderConfig | null {
+    const clean = normalizeProviderId(providerId);
+    return this.getCustomProviders().find((cp) => cp.id === clean) || null;
+  }
+
+  upsertCustomProvider(input: {
+    id?: string;
+    name: string;
+    base_url: string;
+    protocol?: CustomProviderProtocol;
+    enabled?: boolean;
+    models?: Array<string | CustomProviderModelConfig>;
+    timeout_seconds?: number | null;
+  }): CustomProviderConfig {
+    const current = this.getLLMConfig();
+    const list = [...(current.custom_providers || [])];
+    const now = new Date().toISOString();
+    const cleanName = (input.name || '').trim();
+    const cleanBase = (input.base_url || '').trim().replace(/\/+$/, '');
+    if (!cleanName) {
+      throw new Error('Custom provider name is required.');
+    }
+    if (!cleanBase || !/^https?:\/\//i.test(cleanBase)) {
+      throw new Error('A valid http:// or https:// Base URL is required.');
+    }
+
+    const existingIdx = input.id
+      ? list.findIndex((cp) => cp.id === normalizeProviderId(input.id))
+      : -1;
+    const id =
+      existingIdx >= 0
+        ? list[existingIdx].id
+        : input.id && /^custom_[a-z0-9][a-z0-9_-]{0,48}$/.test(input.id.trim().toLowerCase())
+          ? input.id.trim().toLowerCase()
+          : slugifyCustomProviderId(cleanName, list.map((c) => c.id));
+
+    const prev = existingIdx >= 0 ? list[existingIdx] : null;
+    const rawTimeout = Number(input.timeout_seconds);
+    const nextItem: CustomProviderConfig = {
+      id,
+      name: cleanName,
+      base_url: cleanBase,
+      protocol:
+        input.protocol === 'anthropic_compatible' ? 'anthropic_compatible' : 'openai_compatible',
+      enabled: input.enabled !== undefined ? Boolean(input.enabled) : prev?.enabled ?? true,
+      models:
+        input.models !== undefined
+          ? normalizeCustomProviderModels(input.models)
+          : prev?.models || [],
+      ...(Number.isFinite(rawTimeout) && rawTimeout >= 10 && rawTimeout <= 600
+        ? { timeout_seconds: Math.round(rawTimeout) }
+        : input.timeout_seconds === null
+          ? {}
+          : prev?.timeout_seconds
+            ? { timeout_seconds: prev.timeout_seconds }
+            : {}),
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+
+    if (existingIdx >= 0) {
+      list[existingIdx] = nextItem;
+    } else {
+      list.push(nextItem);
+    }
+
+    this.saveLLMConfig({ custom_providers: list });
+    return nextItem;
+  }
+
+  deleteCustomProvider(providerId: string): boolean {
+    const clean = normalizeProviderId(providerId);
+    const current = this.getLLMConfig();
+    const nextList = (current.custom_providers || []).filter((cp) => cp.id !== clean);
+    if (nextList.length === (current.custom_providers || []).length) {
+      return false;
+    }
+    this.saveLLMConfig({ custom_providers: nextList });
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -1244,5 +1685,80 @@ export class WorkspaceAndConfigStore {
     const result = mutator(fresh);
     this.saveThreads(fresh);
     return result;
+  }
+
+  buildThreadSessionConfig(
+    base?: Partial<ThreadSessionConfig>,
+    fallbackConfig?: PersistedLLMConfig,
+  ): ThreadSessionConfig {
+    const cfg = fallbackConfig || this.getLLMConfig();
+    const normalizedRole = normalizeRoleConfig(base, cfg.primary, {
+      allowEmptyModel: true,
+      customProviders: cfg.custom_providers,
+    });
+    return {
+      ...normalizedRole,
+      access_mode:
+        base?.access_mode !== undefined
+          ? normalizeAccessMode(base.access_mode)
+          : cfg.access_mode,
+    };
+  }
+
+  updateThreadSessionConfig(
+    threadId: string,
+    patch: Partial<ThreadSessionConfig>,
+  ): ChatThreadRecord | null {
+    const cfg = this.getLLMConfig();
+    return this.updateThreads((threads) => {
+      const target = threads.find((t) => t.id === threadId);
+      if (!target) return null;
+      const existingBase: ThreadSessionConfig = target.sessionConfig
+        ? { ...target.sessionConfig }
+        : this.buildThreadSessionConfig(undefined, cfg);
+
+      const providerChanged =
+        typeof patch.provider === 'string' &&
+        normalizeProviderId(patch.provider) !== normalizeProviderId(existingBase.provider);
+      const modelChanged =
+        typeof patch.model === 'string' &&
+        patch.model.trim() !== existingBase.model;
+
+      const mergedRaw: Partial<ThreadSessionConfig> = {
+        ...existingBase,
+        ...patch,
+      };
+      // When switching provider or model without specifying explicit limits, clear stale cached limits
+      // so the new provider/model resolves cleanly instead of inheriting the old model's window.
+      if ((providerChanged || modelChanged) && !('context_window' in patch)) {
+        mergedRaw.context_window = null;
+        mergedRaw.context_window_source = null;
+      }
+      if ((providerChanged || modelChanged) && !('manual_context_window' in patch)) {
+        mergedRaw.manual_context_window = null;
+      }
+      if ((providerChanged || modelChanged) && !('max_output_tokens' in patch)) {
+        mergedRaw.max_output_tokens = null;
+      }
+      if (providerChanged && !('base_url' in patch)) {
+        const nextProv = normalizeProviderId(patch.provider);
+        const customMatch = (cfg.custom_providers || []).find((cp) => cp.id === nextProv);
+        mergedRaw.base_url = customMatch?.base_url || PROVIDER_DEFAULTS[nextProv]?.baseUrl || '';
+      }
+
+      const normalized = normalizeRoleConfig(mergedRaw, existingBase, {
+        allowEmptyModel: true,
+        customProviders: cfg.custom_providers,
+      });
+      target.sessionConfig = {
+        ...normalized,
+        access_mode:
+          mergedRaw.access_mode !== undefined
+            ? normalizeAccessMode(mergedRaw.access_mode)
+            : existingBase.access_mode,
+      };
+      target.updatedAt = new Date().toISOString();
+      return target;
+    });
   }
 }

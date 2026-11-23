@@ -1,0 +1,60 @@
+# Nemofy Agent + Official Firecrawl Local Stack
+# Reference: https://github.com/firecrawl/firecrawl#firecrawl-local
+#
+# Official `firecrawl-local` is a standalone Rust binary compiled directly into the
+# image (Dockerfile Stage 1) with Chromium for JavaScript rendering — zero Redis,
+# zero Postgres, zero RabbitMQ, and zero separate Playwright sidecar containers needed.
+#
+# Optional secrets in .env (never hardcoded here):
+#   NEMOFY_ADMIN_PASSWORD=<admin-password>
+#   VAULT_MASTER_KEY=<32-byte-secret>
+#   FIRECRAWL_API_KEY=<optional Firecrawl Cloud key for cloud-only routes>
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  nemofy-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      AGENT_API_PORT: ${AGENT_API_PORT:-8100}
+      FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-http://127.0.0.1:3002}
+      FIRECRAWL_PORT: ${FIRECRAWL_PORT:-3002}
+      FIRECRAWL_CLOUD: ${FIRECRAWL_CLOUD:-auto}
+      FIRECRAWL_LOCAL_BROWSER: ${FIRECRAWL_LOCAL_BROWSER:-auto}
+      FIRECRAWL_LOCAL_AUTOSTART: ${FIRECRAWL_LOCAL_AUTOSTART:-true}
+      FIRECRAWL_CHROME_PATH: ${FIRECRAWL_CHROME_PATH:-/usr/bin/chromium}
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+      FIRECRAWL_LOCAL_TOKEN: ${FIRECRAWL_LOCAL_TOKEN:-}
+      FIRECRAWL_TIMEOUT_SECONDS: ${FIRECRAWL_TIMEOUT_SECONDS:-45}
+      ALLOW_UNSAFE_LOCAL_BASH: ${ALLOW_UNSAFE_LOCAL_BASH:-false}
+      MODEL_CONNECT_TIMEOUT_SECONDS: ${MODEL_CONNECT_TIMEOUT_SECONDS:-15}
+      MODEL_READ_TIMEOUT_SECONDS: ${MODEL_READ_TIMEOUT_SECONDS:-180}
+      MODEL_MAX_RETRIES: ${MODEL_MAX_RETRIES:-2}
+    volumes:
+      - nemofy_data:/app/data
+      - nemofy_workspace:/app/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+volumes:
+  nemofy_data:
+  nemofy_workspace:

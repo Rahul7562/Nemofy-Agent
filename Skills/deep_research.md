@@ -7,11 +7,17 @@ description: Multi-source research methodology covering evidence evaluation, fac
 
 Use this skill for open-ended investigations, technical comparisons, market or literature reviews, competitive audits, and fact-sensitive reports.
 
-## 1. Multi-Source Research Strategy
+## 1. Multi-Source Research Strategy (Firecrawl-Powered)
 - Decompose the research question into 3-6 specific sub-questions before fetching sources.
 - Consult multiple independent primary sources (official documentation, specifications, papers, primary data) rather than relying on a single secondary summary.
-- When gathering web pages with `web_fetch`, extract structured text and record the exact URL and access context.
-- For large investigations (>4 independent topics), delegate bounded sub-questions to isolated worker sub-agents via `spawn_subagent`.
+- Use Firecrawl tools systematically:
+  - `web_search(query, max_results)` to discover primary sources and get clean Markdown excerpts.
+  - `web_map(url, search)` to enumerate relevant documentation or site URLs before fetching.
+  - `web_fetch(url)` to scrape full primary pages into clean Markdown with source URL metadata.
+  - `web_crawl(url, limit, max_depth)` for multi-page documentation sections.
+  - `web_extract(urls, prompt, schema_json)` for structured facts, pricing tables, or benchmark comparisons.
+- Record the exact source URL and title for every fetched page. Never fabricate URLs or hide Firecrawl errors.
+- For large investigations (>4 independent topics), delegate bounded sub-questions to isolated worker sub-agents via `spawn_subagent(role="deep_research", ...)`.
 
 ## 2. Evidence Evaluation
 - Rank sources by reliability:

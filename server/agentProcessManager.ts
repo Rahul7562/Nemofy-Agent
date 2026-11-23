@@ -14,14 +14,21 @@ export class AgentCoreProcessManager {
   private lastError: string | null = null;
   private startPromise: Promise<void> | null = null;
   private readonly getApiToken: () => string;
+  private readonly getExtraEnv?: () => Record<string, string>;
   readonly port: number;
   readonly baseUrl: string;
 
-  constructor(cwd?: string, port?: number, getApiToken?: () => string) {
+  constructor(
+    cwd?: string,
+    port?: number,
+    getApiToken?: () => string,
+    getExtraEnv?: () => Record<string, string>,
+  ) {
     this.cwd = path.resolve(cwd || process.cwd());
     this.port = port || Number(process.env.AGENT_API_PORT || '8100');
     this.baseUrl = `http://127.0.0.1:${this.port}`;
     this.getApiToken = getApiToken || (() => (process.env.AGENT_API_TOKEN || '').trim());
+    this.getExtraEnv = getExtraEnv;
   }
 
   getStatus(): { state: AgentCoreLifecycleState; error: string | null } {
@@ -249,6 +256,7 @@ export class AgentCoreProcessManager {
             cwd: this.cwd,
             env: {
               ...process.env,
+              ...(this.getExtraEnv ? this.getExtraEnv() : {}),
               PYTHONPATH: pythonPath,
               AGENT_API_HOST: '127.0.0.1',
               AGENT_API_PORT: String(this.port),

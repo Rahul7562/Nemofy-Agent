@@ -105,12 +105,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_SUBAGENT_MAX_TURNS = 8
 
 ROLE_DEFAULT_TOOLS: dict[str, list[str]] = {
-    "deep_research": ["web_search", "web_fetch", "read_file", "write_file", "list_dir", "load_skill"],
+    "deep_research": [
+        "web_search",
+        "web_fetch",
+        "web_map",
+        "web_crawl",
+        "web_extract",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "load_skill",
+    ],
     "repo_inspection": ["list_dir", "read_file", "bash_exec", "load_skill"],
     "code_review": ["list_dir", "read_file", "bash_exec", "load_skill"],
     "data_analysis": ["list_dir", "read_file", "write_file", "bash_exec", "load_skill"],
     "documentation": ["list_dir", "read_file", "write_file", "edit_file", "load_skill"],
-    "general": ["list_dir", "read_file", "web_search", "web_fetch", "load_skill"],
+    "general": ["list_dir", "read_file", "web_search", "web_fetch", "web_map", "load_skill"],
 }
 
 

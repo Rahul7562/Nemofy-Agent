@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import secrets
 import uuid
 from collections.abc import AsyncIterator
@@ -68,6 +69,7 @@ from agent_core.models import (
     resolve_model_spec_with_override,
     save_persisted_llm_config,
 )
+from agent_core.firecrawl import FirecrawlClient
 from agent_core.multimodal import MediaAttachment
 from agent_core.sandbox import SandboxManager
 from agent_core.skills import SkillRegistry, get_skills_health
@@ -89,7 +91,16 @@ class ModelConfigOverride(BaseModel):
     max_tokens: int | None = Field(default=None, ge=64, le=20_000_000)
     reasoning_effort: str | None = Field(default=None, max_length=32)
     context_window: int | None = Field(default=None, ge=512, le=20_000_000)
+    context_window_source: str | None = Field(default=None, max_length=64)
+    manual_context_window: int | None = Field(default=None, ge=512, le=20_000_000)
     max_output_tokens: int | None = Field(default=None, ge=256, le=20_000_000)
+    protocol: str | None = Field(default=None, max_length=32)
+    timeout_seconds: float | None = Field(default=None, ge=5.0, le=1800.0)
+    connect_timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
+    max_retries: int | None = Field(default=None, ge=0, le=5)
+    fallback_on_timeout: bool | None = None
+    fallback_provider: str | None = Field(default=None, max_length=64)
+    fallback_model: str | None = Field(default=None, max_length=256)
 
     def to_model_override(self) -> ModelOverride | None:
         ov = ModelOverride(
@@ -101,7 +112,18 @@ class ModelConfigOverride(BaseModel):
             max_tokens=self.max_tokens,
             reasoning_effort=self.reasoning_effort.strip() if self.reasoning_effort else None,
             context_window=self.context_window,
+            context_window_source=(
+                self.context_window_source.strip() if self.context_window_source else None
+            ),
+            manual_context_window=self.manual_context_window,
             max_output_tokens=self.max_output_tokens,
+            protocol=self.protocol.strip() if self.protocol else None,
+            timeout_seconds=self.timeout_seconds,
+            connect_timeout_seconds=self.connect_timeout_seconds,
+            max_retries=self.max_retries,
+            fallback_on_timeout=self.fallback_on_timeout,
+            fallback_provider=self.fallback_provider.strip() if self.fallback_provider else None,
+            fallback_model=self.fallback_model.strip() if self.fallback_model else None,
         )
         return ov if ov.has_any_override() else None
 
@@ -124,10 +146,23 @@ class LLMConfigUpdateRequest(BaseModel):
     accessories: AccessoriesConfigPayload | None = None
     max_turns: int | None = Field(default=None, ge=1, le=180)
     access_mode: ExecutionAccessMode | None = None
+    allow_unsafe_local_bash: bool | None = None
+    custom_providers: list[dict[str, Any]] | None = None
+    planning_timeout: dict[str, Any] | None = None
 
 
 class AccessModeUpdateRequest(BaseModel):
     access_mode: ExecutionAccessMode
+
+
+class SandboxConfigUpdateRequest(BaseModel):
+    allow_unsafe_local_bash: bool
+
+
+class FirecrawlConfigUpdateRequest(BaseModel):
+    api_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=512)
+    clear_api_key: bool = False
 
 
 class ModelProbeRequest(BaseModel):
@@ -160,8 +195,14 @@ ALLOWED_PROFILE_SECRET_KEYS: frozenset[str] = frozenset(
         "VLLM_API_KEY",
         "PRIMARY_API_KEY",
         "WORKER_API_KEY",
+        "FIRECRAWL_API_KEY",
     }
 )
+_CUSTOM_PROVIDER_SECRET_KEY_RE = re.compile(r"^CUSTOM_PROVIDER_[A-Z0-9_]{1,64}_API_KEY$")
+
+
+def _is_allowed_secret_key(key: str) -> bool:
+    return key in ALLOWED_PROFILE_SECRET_KEYS or bool(_CUSTOM_PROVIDER_SECRET_KEY_RE.match(key))
 
 
 class ProfileSecretsRequest(BaseModel):
@@ -257,6 +298,15 @@ def create_app(
         set_runtime_access_mode(load_persisted_access_mode())
 
         resolved_sandbox = sandbox or SandboxManager()
+        # Synchronize persisted allow_unsafe_local_bash and firecrawl_api_url overrides if stored on disk
+        persisted_startup = load_persisted_llm_config()
+        if isinstance(persisted_startup.get("allow_unsafe_local_bash"), bool) and sandbox is None:
+            resolved_sandbox.set_allow_unsafe_local_bash(
+                bool(persisted_startup["allow_unsafe_local_bash"])
+            )
+        persisted_fc_url = persisted_startup.get("firecrawl_api_url")
+        if isinstance(persisted_fc_url, str) and persisted_fc_url.strip():
+            os.environ["FIRECRAWL_API_URL"] = persisted_fc_url.strip().rstrip("/")
         resolved_skills = skills or SkillRegistry()
         resolved_mcp = mcp_manager or MCPRegistryManager()
         job_manager = JobManager()
@@ -393,12 +443,22 @@ def create_app(
         reload_env_file()
         if getattr(app.state, "profile_secrets_active", False):
             active_secrets: dict[str, str] = getattr(app.state, "profile_secrets", {})
+            # Clear stale dynamic custom provider keys no longer present
+            for existing_k in list(os.environ.keys()):
+                if _CUSTOM_PROVIDER_SECRET_KEY_RE.match(existing_k) and existing_k not in active_secrets:
+                    os.environ.pop(existing_k, None)
             for key in ALLOWED_PROFILE_SECRET_KEYS:
                 val = active_secrets.get(key, "").strip()
                 if val:
                     os.environ[key] = val
                 else:
                     os.environ.pop(key, None)
+            for key, val in active_secrets.items():
+                if _CUSTOM_PROVIDER_SECRET_KEY_RE.match(key):
+                    if val.strip():
+                        os.environ[key] = val.strip()
+                    else:
+                        os.environ.pop(key, None)
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
@@ -424,6 +484,10 @@ def create_app(
         skills_health.pop("directory", None)
         mcp_health = dict(mcp_mgr.health_status())
         mcp_health.pop("config_path", None)
+        try:
+            firecrawl_health = await FirecrawlClient().check_health(timeout_seconds=1.5)
+        except Exception as fc_exc:  # noqa: BLE001
+            firecrawl_health = {"healthy": False, "reachable": False, "detail": str(fc_exc)}
 
         overall = "ok" if runtime is not None else "degraded"
         return {
@@ -439,6 +503,7 @@ def create_app(
                 "exists": await asyncio.to_thread(db_path.exists),
             },
             "sandbox": sandbox_health,
+            "firecrawl": firecrawl_health,
             "skills": skills_health,
             "mcps": mcp_health,
             "jobs": job_mgr.health_summary(),
@@ -455,7 +520,7 @@ def create_app(
         sanitized: dict[str, str] = {}
         for raw_key, raw_val in payload.secrets.items():
             key = str(raw_key).strip().upper()
-            if key not in ALLOWED_PROFILE_SECRET_KEYS:
+            if not _is_allowed_secret_key(key):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Unsupported secret key: {key}",
@@ -496,16 +561,83 @@ def create_app(
         save_persisted_llm_config(current)
         return {"ok": True, "access_mode": applied}
 
+    @app.get("/config/sandbox", dependencies=[Depends(require_auth)])
+    async def get_sandbox_config(request: Request) -> dict[str, Any]:
+        sandbox_mgr: SandboxManager = request.app.state.sandbox
+        return {
+            "allow_unsafe_local_bash": sandbox_mgr.allow_unsafe_local_bash,
+            "backend": sandbox_mgr.active_backend,
+        }
+
+    @app.put("/config/sandbox", dependencies=[Depends(require_auth)])
+    async def update_sandbox_config(
+        payload: SandboxConfigUpdateRequest, request: Request
+    ) -> dict[str, Any]:
+        sandbox_mgr: SandboxManager = request.app.state.sandbox
+        applied = sandbox_mgr.set_allow_unsafe_local_bash(bool(payload.allow_unsafe_local_bash))
+        current = load_persisted_llm_config()
+        current["allow_unsafe_local_bash"] = applied
+        save_persisted_llm_config(current)
+        return {
+            "ok": True,
+            "allow_unsafe_local_bash": applied,
+            "backend": sandbox_mgr.active_backend,
+        }
+
+    @app.get("/config/firecrawl", dependencies=[Depends(require_auth)])
+    async def get_firecrawl_config() -> dict[str, Any]:
+        _sync_env_with_profile_secrets()
+        health = await FirecrawlClient().check_health(timeout_seconds=3.0)
+        return {
+            "api_url": (os.getenv("FIRECRAWL_API_URL") or "").strip(),
+            "api_key_configured": bool((os.getenv("FIRECRAWL_API_KEY") or "").strip()),
+            "health": health,
+        }
+
+    @app.put("/config/firecrawl", dependencies=[Depends(require_auth)])
+    async def update_firecrawl_config(payload: FirecrawlConfigUpdateRequest) -> dict[str, Any]:
+        clean_url = (payload.api_url or "").strip().rstrip("/")
+        if clean_url and not clean_url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="FIRECRAWL_API_URL must start with http:// or https://.",
+            )
+        if clean_url:
+            os.environ["FIRECRAWL_API_URL"] = clean_url
+        else:
+            os.environ.pop("FIRECRAWL_API_URL", None)
+
+        if payload.clear_api_key:
+            os.environ.pop("FIRECRAWL_API_KEY", None)
+        elif payload.api_key is not None and payload.api_key.strip():
+            os.environ["FIRECRAWL_API_KEY"] = payload.api_key.strip()
+
+        current = load_persisted_llm_config()
+        current["firecrawl_api_url"] = clean_url
+        save_persisted_llm_config(current)
+
+        health = await FirecrawlClient().check_health(timeout_seconds=4.0)
+        return {
+            "ok": True,
+            "api_url": clean_url,
+            "api_key_configured": bool((os.getenv("FIRECRAWL_API_KEY") or "").strip()),
+            "health": health,
+        }
+
     @app.get("/config/llm", dependencies=[Depends(require_auth)])
-    async def get_llm_config() -> dict[str, Any]:
+    async def get_llm_config(request: Request) -> dict[str, Any]:
         _sync_env_with_profile_secrets()
         persisted = load_persisted_llm_config()
+        sandbox_mgr: SandboxManager = request.app.state.sandbox
         return {
             "primary": load_model_spec("primary", include_persisted=True).safe_summary(),
             "worker": load_model_spec("worker", include_persisted=True).safe_summary(),
             "accessories": load_persisted_accessories_config(),
             "max_turns": int(persisted.get("max_turns") or os.getenv("MAX_TURNS", "30")),
             "access_mode": get_runtime_access_mode(),
+            "allow_unsafe_local_bash": sandbox_mgr.allow_unsafe_local_bash,
+            "custom_providers": persisted.get("custom_providers") or [],
+            "planning_timeout": persisted.get("planning_timeout") or {},
             "providers": get_provider_presets()["providers"],
         }
 
@@ -515,6 +647,14 @@ def create_app(
     ) -> dict[str, Any]:
         _sync_env_with_profile_secrets()
         current = load_persisted_llm_config()
+        if payload.custom_providers is not None:
+            current["custom_providers"] = [
+                {k: v for k, v in cp.items() if k != "api_key"}
+                for cp in payload.custom_providers
+                if isinstance(cp, dict)
+            ]
+            # Save custom providers first so primary/worker validation can resolve custom_* base_urls
+            save_persisted_llm_config(current)
         try:
             if payload.primary is not None:
                 prim_dict = payload.primary.model_dump(exclude_none=True, exclude={"api_key"})
@@ -540,6 +680,13 @@ def create_app(
             current["max_turns"] = payload.max_turns
         if payload.access_mode is not None:
             current["access_mode"] = set_runtime_access_mode(payload.access_mode)
+        if payload.allow_unsafe_local_bash is not None:
+            sandbox_mgr: SandboxManager = request.app.state.sandbox
+            current["allow_unsafe_local_bash"] = sandbox_mgr.set_allow_unsafe_local_bash(
+                bool(payload.allow_unsafe_local_bash)
+            )
+        if payload.planning_timeout is not None:
+            current["planning_timeout"] = dict(payload.planning_timeout)
         save_persisted_llm_config(current)
 
         prim_spec = load_model_spec("primary", include_persisted=True)
@@ -547,6 +694,7 @@ def create_app(
         if prim_spec.api_key or prim_spec.provider in LOCAL_NO_KEY_PROVIDERS:
             request.app.state.model_error = None
 
+        sandbox_mgr_out: SandboxManager = request.app.state.sandbox
         return {
             "ok": True,
             "primary": prim_spec.safe_summary(),
@@ -554,6 +702,9 @@ def create_app(
             "accessories": load_persisted_accessories_config(),
             "max_turns": int(current.get("max_turns") or os.getenv("MAX_TURNS", "30")),
             "access_mode": get_runtime_access_mode(),
+            "allow_unsafe_local_bash": sandbox_mgr_out.allow_unsafe_local_bash,
+            "custom_providers": current.get("custom_providers") or [],
+            "planning_timeout": current.get("planning_timeout") or {},
         }
 
     @app.post("/models/list", dependencies=[Depends(require_auth)])

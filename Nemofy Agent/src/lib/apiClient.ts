@@ -5,6 +5,9 @@ import type {
   ChatAttachment,
   ChatMessage,
   ChatThread,
+  CustomProviderConfig,
+  CustomProviderModelConfig,
+  CustomProviderProtocol,
   ExecutionAccessMode,
   LiveAgentActivity,
   MCPServerItem,
@@ -16,6 +19,7 @@ import type {
   ProviderModelsResponse,
   RoleLLMConfig,
   SkillDocument,
+  ThreadSessionConfig,
   WorkspaceNode,
 } from '../types/agent.ts';
 import { resolveModelLimits } from './contextUtils.ts';
@@ -354,9 +358,26 @@ export async function listThreads(): Promise<ChatThread[]> {
   return res.data.threads || [];
 }
 
-export async function createThread(title?: string): Promise<ChatThread> {
+export async function createThread(
+  title?: string,
+  sessionConfig?: Partial<ThreadSessionConfig>,
+): Promise<ChatThread> {
   if (detectedStandaloneMode) {
     const now = new Date().toISOString();
+    const rawLlm = readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig());
+    const mergedSession: ThreadSessionConfig = {
+      provider: sessionConfig?.provider || rawLlm.primary.provider,
+      model: sessionConfig?.model ?? rawLlm.primary.model,
+      base_url: sessionConfig?.base_url ?? rawLlm.primary.base_url,
+      temperature: sessionConfig?.temperature ?? rawLlm.primary.temperature,
+      max_tokens: sessionConfig?.max_tokens ?? rawLlm.primary.max_tokens,
+      reasoning_effort: sessionConfig?.reasoning_effort ?? rawLlm.primary.reasoning_effort,
+      context_window: sessionConfig?.context_window ?? rawLlm.primary.context_window ?? null,
+      context_window_source: sessionConfig?.context_window_source ?? rawLlm.primary.context_window_source ?? null,
+      manual_context_window: sessionConfig?.manual_context_window ?? rawLlm.primary.manual_context_window ?? null,
+      max_output_tokens: sessionConfig?.max_output_tokens ?? rawLlm.primary.max_output_tokens ?? null,
+      access_mode: sessionConfig?.access_mode ?? rawLlm.access_mode ?? 'default',
+    };
     const thread: ChatThread = {
       id: `thread-${Math.random().toString(16).slice(2, 10)}`,
       title: title || 'New Agent Session',
@@ -364,6 +385,7 @@ export async function createThread(title?: string): Promise<ChatThread> {
       updatedAt: now,
       messages: [],
       pendingApproval: null,
+      sessionConfig: mergedSession,
     };
     const next = [thread, ...readLocalJson<ChatThread[]>(STANDALONE_THREADS_KEY, [])];
     writeLocalJson(STANDALONE_THREADS_KEY, next);
@@ -371,9 +393,60 @@ export async function createThread(title?: string): Promise<ChatThread> {
   }
   const res = await apiFetch<{ thread: ChatThread }>('/api/threads', {
     method: 'POST',
-    body: JSON.stringify({ title }),
+    body: JSON.stringify({
+      title,
+      ...(sessionConfig ? { sessionConfig } : {}),
+    }),
   });
   if (!res.ok) throw new Error('Unable to create session.');
+  return res.data.thread;
+}
+
+export async function updateThreadSessionConfig(
+  threadId: string,
+  patch: Partial<ThreadSessionConfig> & { force_refresh?: boolean },
+): Promise<ChatThread> {
+  if (detectedStandaloneMode) {
+    const threads = readLocalJson<ChatThread[]>(STANDALONE_THREADS_KEY, []);
+    const idx = threads.findIndex((t) => t.id === threadId);
+    if (idx === -1) throw new Error('Session not found.');
+    const rawLlm = readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig());
+    const existing = threads[idx];
+    const baseCfg: ThreadSessionConfig = existing.sessionConfig || {
+      provider: rawLlm.primary.provider,
+      model: rawLlm.primary.model,
+      base_url: rawLlm.primary.base_url,
+      temperature: rawLlm.primary.temperature,
+      max_tokens: rawLlm.primary.max_tokens,
+      reasoning_effort: rawLlm.primary.reasoning_effort,
+      context_window: rawLlm.primary.context_window ?? null,
+      context_window_source: rawLlm.primary.context_window_source ?? null,
+      manual_context_window: rawLlm.primary.manual_context_window ?? null,
+      max_output_tokens: rawLlm.primary.max_output_tokens ?? null,
+      access_mode: rawLlm.access_mode ?? 'default',
+    };
+    const { force_refresh: _ignored, ...cleanPatch } = patch;
+    const nextCfg: ThreadSessionConfig = { ...baseCfg, ...cleanPatch };
+    const updated: ChatThread = {
+      ...existing,
+      sessionConfig: nextCfg,
+      updatedAt: new Date().toISOString(),
+    };
+    threads[idx] = updated;
+    writeLocalJson(STANDALONE_THREADS_KEY, threads);
+    return updated;
+  }
+
+  const res = await apiFetch<{ thread?: ChatThread; error?: string }>(
+    `/api/threads/${encodeURIComponent(threadId)}/config`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    },
+  );
+  if (!res.ok || !res.data.thread) {
+    throw new Error(extractApiError(res, 'Unable to update session provider/model configuration.'));
+  }
   return res.data.thread;
 }
 
@@ -922,6 +995,7 @@ export async function fetchProviderModels(params: {
   base_url?: string;
   api_key?: string;
   role?: ModelRoleKey;
+  force_refresh?: boolean;
 }): Promise<ProviderModelsResponse> {
   if (detectedStandaloneMode) {
     const preset = getProviderPreset(params.provider);
@@ -948,6 +1022,7 @@ export async function fetchProviderModels(params: {
       base_url: params.base_url?.trim() || undefined,
       api_key: params.api_key?.trim() || undefined,
       role: params.role || 'primary',
+      ...(params.force_refresh ? { force_refresh: true } : {}),
     }),
   });
 
@@ -995,12 +1070,172 @@ export async function updateAccessMode(
   };
 }
 
+export async function updateSandboxSettings(
+  allowUnsafeLocalBash: boolean,
+): Promise<{ ok: boolean; allow_unsafe_local_bash: boolean; coreSynced?: boolean; syncWarning?: string | null }> {
+  if (detectedStandaloneMode) {
+    const raw = readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig());
+    writeLocalJson(STANDALONE_LLM_KEY, { ...raw, allow_unsafe_local_bash: allowUnsafeLocalBash });
+    return { ok: true, allow_unsafe_local_bash: allowUnsafeLocalBash, coreSynced: false };
+  }
+  const res = await apiFetch<{
+    ok?: boolean;
+    allow_unsafe_local_bash?: boolean;
+    coreSynced?: boolean;
+    syncWarning?: string | null;
+    error?: string;
+  }>('/api/settings/sandbox', {
+    method: 'PUT',
+    body: JSON.stringify({ allow_unsafe_local_bash: allowUnsafeLocalBash }),
+  });
+  if (!res.ok) {
+    throw new Error(extractApiError(res, 'Unable to update ALLOW_UNSAFE_LOCAL_BASH setting.'));
+  }
+  return {
+    ok: true,
+    allow_unsafe_local_bash: Boolean(res.data.allow_unsafe_local_bash),
+    coreSynced: res.data.coreSynced,
+    syncWarning: res.data.syncWarning ?? null,
+  };
+}
+
+export interface CustomProviderMutationPayload {
+  id?: string;
+  name: string;
+  base_url: string;
+  protocol: CustomProviderProtocol;
+  enabled: boolean;
+  models: CustomProviderModelConfig[];
+  timeout_seconds?: number | null;
+  api_key?: string;
+}
+
+export async function fetchCustomProviders(): Promise<{
+  custom_providers: CustomProviderConfig[];
+  providers?: Record<string, ProviderAvailability>;
+}> {
+  if (detectedStandaloneMode) {
+    const raw = readLocalJson<PersistedLLMConfig>(STANDALONE_LLM_KEY, getDefaultLLMConfig());
+    return { custom_providers: raw.custom_providers || [] };
+  }
+  const res = await apiFetch<{
+    custom_providers?: CustomProviderConfig[];
+    providers?: Record<string, ProviderAvailability>;
+    error?: string;
+  }>('/api/settings/custom-providers');
+  if (!res.ok) {
+    throw new Error(extractApiError(res, 'Unable to load custom providers.'));
+  }
+  return {
+    custom_providers: res.data.custom_providers || [],
+    providers: res.data.providers,
+  };
+}
+
+export async function createCustomProvider(
+  payload: CustomProviderMutationPayload,
+): Promise<{
+  ok: boolean;
+  provider: CustomProviderConfig;
+  custom_providers: CustomProviderConfig[];
+  providers: Record<string, ProviderAvailability>;
+  vault?: ProfileVaultSummary;
+}> {
+  const res = await apiFetch<{
+    ok?: boolean;
+    provider?: CustomProviderConfig;
+    custom_providers?: CustomProviderConfig[];
+    providers?: Record<string, ProviderAvailability>;
+    vault?: ProfileVaultSummary;
+    error?: string;
+  }>('/api/settings/custom-providers', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok || !res.data.provider) {
+    throw new Error(extractApiError(res, 'Unable to create custom provider.'));
+  }
+  return {
+    ok: true,
+    provider: res.data.provider,
+    custom_providers: res.data.custom_providers || [],
+    providers: res.data.providers || {},
+    vault: res.data.vault,
+  };
+}
+
+export async function updateCustomProvider(
+  providerId: string,
+  payload: Partial<CustomProviderMutationPayload>,
+): Promise<{
+  ok: boolean;
+  provider: CustomProviderConfig;
+  custom_providers: CustomProviderConfig[];
+  providers: Record<string, ProviderAvailability>;
+  vault?: ProfileVaultSummary;
+}> {
+  const res = await apiFetch<{
+    ok?: boolean;
+    provider?: CustomProviderConfig;
+    custom_providers?: CustomProviderConfig[];
+    providers?: Record<string, ProviderAvailability>;
+    vault?: ProfileVaultSummary;
+    error?: string;
+  }>(`/api/settings/custom-providers/${encodeURIComponent(providerId)}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok || !res.data.provider) {
+    throw new Error(extractApiError(res, 'Unable to update custom provider.'));
+  }
+  return {
+    ok: true,
+    provider: res.data.provider,
+    custom_providers: res.data.custom_providers || [],
+    providers: res.data.providers || {},
+    vault: res.data.vault,
+  };
+}
+
+export async function deleteCustomProvider(
+  providerId: string,
+): Promise<{
+  ok: boolean;
+  deleted: boolean;
+  custom_providers: CustomProviderConfig[];
+  providers: Record<string, ProviderAvailability>;
+  vault?: ProfileVaultSummary;
+}> {
+  const res = await apiFetch<{
+    ok?: boolean;
+    deleted?: boolean;
+    custom_providers?: CustomProviderConfig[];
+    providers?: Record<string, ProviderAvailability>;
+    vault?: ProfileVaultSummary;
+    error?: string;
+  }>(`/api/settings/custom-providers/${encodeURIComponent(providerId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    throw new Error(extractApiError(res, 'Unable to delete custom provider.'));
+  }
+  return {
+    ok: true,
+    deleted: Boolean(res.data.deleted),
+    custom_providers: res.data.custom_providers || [],
+    providers: res.data.providers || {},
+    vault: res.data.vault,
+  };
+}
+
 export async function resolveModelMetadata(params: {
   provider: string;
   model: string;
   base_url?: string;
   api_key?: string;
   role?: ModelRoleKey;
+  manual_context_window?: number | null;
+  force_refresh?: boolean;
 }): Promise<ModelResolutionResult> {
   const cleanModel = (params.model || '').trim();
   const cleanProvider = (params.provider || '').trim() || 'river_ai';
@@ -1018,7 +1253,9 @@ export async function resolveModelMetadata(params: {
   }
 
   if (detectedStandaloneMode) {
-    const limits = resolveModelLimits(cleanProvider, cleanModel);
+    const limits = resolveModelLimits(cleanProvider, cleanModel, null, null, {
+      manualContextWindow: params.manual_context_window ?? null,
+    });
     return {
       resolved: limits.contextWindow !== null,
       provider: cleanProvider,
@@ -1039,11 +1276,16 @@ export async function resolveModelMetadata(params: {
       base_url: params.base_url?.trim() || undefined,
       api_key: params.api_key?.trim() || undefined,
       role: params.role || 'primary',
+      manual_context_window:
+        params.manual_context_window !== undefined ? params.manual_context_window : undefined,
+      ...(params.force_refresh ? { force_refresh: true } : {}),
     }),
   });
 
   if (!res.ok || !res.data) {
-    const limits = resolveModelLimits(cleanProvider, cleanModel);
+    const limits = resolveModelLimits(cleanProvider, cleanModel, null, null, {
+      manualContextWindow: params.manual_context_window ?? null,
+    });
     return {
       resolved: limits.contextWindow !== null,
       provider: cleanProvider,

@@ -1,59 +1,35 @@
-"""Local Sandbox Tools (Local Hands): bash_exec, read/write/edit_file, list_dir, web_search, web_fetch."""
+"""Local Sandbox & Official Firecrawl Local Tools: bash_exec, file tools, web_search, web_fetch, web_map, web_crawl, web_extract."""
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
-import os
+import json
 import re
 import socket
+from collections.abc import Callable
 from contextvars import ContextVar
-from html import unescape
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from typing import Any
+from urllib.parse import urlparse
 
-import httpx
-from bs4 import BeautifulSoup
-from langchain_core.tools import BaseTool, tool
-from markdownify import markdownify as html_to_markdown
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool, StructuredTool, tool
 
+from agent_core.firecrawl import (
+    FirecrawlClient,
+    FirecrawlError,
+    is_firecrawl_document_path,
+    parse_optional_json_schema,
+)
 from agent_core.sandbox import (
     SandboxExecutionError,
     SandboxManager,
     SandboxSecurityError,
+    resolve_workspace_path,
+    to_virtual_workspace_path,
 )
 
 current_session_id: ContextVar[str] = ContextVar("sandbox_session_id", default="default")
-
-
-def html_to_clean_markdown(html: str, *, base_url: str = "") -> str:
-    """Convert raw HTML into clean, readable Markdown stripped of scripts/styles/chrome."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg", "iframe", "template", "canvas"]):
-        tag.decompose()
-
-    title = ""
-    if soup.title and soup.title.string:
-        title = " ".join(soup.title.string.split()).strip()
-
-    main_container = soup.find("main") or soup.find("article") or soup.body or soup
-    raw_md = html_to_markdown(
-        str(main_container),
-        heading_style="ATX",
-        strip=["img"],
-    )
-
-    cleaned_lines = [line.rstrip() for line in raw_md.splitlines()]
-    markdown = "\n".join(cleaned_lines)
-    markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
-
-    header_lines: list[str] = []
-    if title:
-        header_lines.append(f"# {title}")
-    if base_url:
-        header_lines.append(f"Source: {base_url}")
-    if header_lines:
-        return "\n".join(header_lines) + "\n\n" + markdown
-    return markdown
 
 
 def _is_blocked_web_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -69,7 +45,8 @@ def _is_blocked_web_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
     )
 
 
-def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
+def validate_public_url(url: str, *, allow_private: bool = False) -> str:
+    """Validate an http(s) URL and block loopback/private/metadata SSRF targets unless explicitly allowed."""
     cleaned = url.strip()
     parsed = urlparse(cleaned)
     if parsed.scheme not in ("http", "https"):
@@ -77,7 +54,7 @@ def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
     if not parsed.hostname:
         raise ValueError(f"Invalid URL (missing hostname): {url!r}")
     if parsed.username or parsed.password:
-        raise SandboxSecurityError("Access denied: web_fetch URLs must not contain embedded credentials.")
+        raise SandboxSecurityError("Access denied: web URLs must not contain embedded credentials.")
 
     if not allow_private:
         host = parsed.hostname.lower().rstrip(".")
@@ -86,7 +63,7 @@ def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
             or host.endswith((".localhost", ".local", ".internal", ".localdomain"))
         ):
             raise SandboxSecurityError(
-                f"Access denied: web_fetch cannot target internal or loopback host {host!r}."
+                f"Access denied: web tools cannot target internal or loopback host {host!r}."
             )
         try:
             literal_ip = ipaddress.ip_address(host)
@@ -96,7 +73,7 @@ def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
         if literal_ip is not None:
             if _is_blocked_web_ip(literal_ip):
                 raise SandboxSecurityError(
-                    f"Access denied: web_fetch cannot target private/internal IP {host!r}."
+                    f"Access denied: web tools cannot target private/internal IP {host!r}."
                 )
         else:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -111,317 +88,245 @@ def _validate_web_url(url: str, *, allow_private: bool = False) -> str:
                     continue
                 if _is_blocked_web_ip(resolved_ip):
                     raise SandboxSecurityError(
-                        f"Access denied: web_fetch host {host!r} resolves to private/internal IP {resolved_ip}."
+                        f"Access denied: web host {host!r} resolves to private/internal IP {resolved_ip}."
                     )
 
     return cleaned
 
 
-async def fetch_webpage_markdown(
-    url: str,
-    *,
-    timeout_seconds: float = 20.0,
-    max_chars: int = 20_000,
-    allow_private: bool = False,
-    transport: httpx.AsyncBaseTransport | None = None,
-) -> str:
-    """Fetch a webpage and return clean Markdown or plain text."""
-    current_url = _validate_web_url(url, allow_private=allow_private)
-    headers = {
-        "User-Agent": "NemofyAgentCore/2.0 (+https://nemofy.tech; research-fetch)",
-        "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
-    }
-
-    max_redirects = 5
-    async with httpx.AsyncClient(
-        timeout=timeout_seconds,
-        follow_redirects=False,
-        transport=transport,
-    ) as client:
-        response: httpx.Response | None = None
-        for _hop in range(max_redirects + 1):
-            response = await client.get(current_url, headers=headers)
-            if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("location")
-                if not location:
-                    break
-                next_url = urljoin(current_url, location.strip())
-                current_url = _validate_web_url(next_url, allow_private=allow_private)
-                continue
-            break
-        else:
-            raise httpx.TooManyRedirects(f"Exceeded {max_redirects} redirects while fetching {url!r}.")
-
-        assert response is not None
-        if response.status_code in (301, 302, 303, 307, 308) and response.headers.get("location"):
-            raise httpx.TooManyRedirects(f"Exceeded {max_redirects} redirects while fetching {url!r}.")
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "").lower()
-        body = response.text
-
-    if "html" in content_type or "<html" in body[:500].lower():
-        extracted = html_to_clean_markdown(body, base_url=str(response.url))
-    else:
-        extracted = f"Source: {response.url}\n\n{body.strip()}"
-
-    if len(extracted) > max_chars:
-        extracted = (
-            extracted[:max_chars].rstrip()
-            + f"\n\n[Truncated at {max_chars:,} characters from {len(extracted):,} total]"
-        )
-    return extracted
+_validate_web_url = validate_public_url
 
 
-_DEFAULT_SEARCH_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-
-def _unwrap_search_url(raw_href: str) -> str:
-    """Extract clean target http(s) URL from DuckDuckGo redirect links or raw hrefs."""
-    href = unescape((raw_href or "").strip())
-    if not href:
-        return ""
-    if href.startswith("//"):
-        href = f"https:{href}"
-    parsed = urlparse(href)
-    if "duckduckgo.com" in (parsed.hostname or "").lower() and parsed.path.startswith("/l/"):
-        qs = parse_qs(parsed.query)
-        uddg = qs.get("uddg")
-        if uddg and uddg[0]:
-            href = unquote(uddg[0])
-            parsed = urlparse(href)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return ""
-    return href
-
-
-def _parse_ddg_html_results(html_text: str, max_results: int) -> list[dict[str, str]]:
-    """Parse search results from DuckDuckGo's HTML endpoint."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    results: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
-
-    for block in soup.select(".result, .web-result"):
-        link = block.select_one("a.result__a") or block.select_one("h2 a")
-        if not link:
-            continue
-        url = _unwrap_search_url(str(link.get("href") or ""))
-        if not url or url in seen_urls:
-            continue
-        title = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip() or url
-        snippet_el = block.select_one(".result__snippet") or block.select_one("a.result__snippet")
-        snippet = (
-            re.sub(r"\s+", " ", snippet_el.get_text(" ", strip=True)).strip()
-            if snippet_el
-            else ""
-        )
-        seen_urls.add(url)
-        results.append({"title": title, "url": url, "snippet": snippet})
-        if len(results) >= max_results:
-            break
-    return results
-
-
-def _parse_ddg_lite_results(html_text: str, max_results: int) -> list[dict[str, str]]:
-    """Parse search results from DuckDuckGo's Lite endpoint as a resilient fallback."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    results: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
-
-    links = soup.select("a.result-link")
-    snippets = soup.select("td.result-snippet")
-    for idx, link in enumerate(links):
-        url = _unwrap_search_url(str(link.get("href") or ""))
-        if not url or url in seen_urls:
-            continue
-        title = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip() or url
-        snippet = ""
-        if idx < len(snippets):
-            snippet = re.sub(r"\s+", " ", snippets[idx].get_text(" ", strip=True)).strip()
-        seen_urls.add(url)
-        results.append({"title": title, "url": url, "snippet": snippet})
-        if len(results) >= max_results:
-            break
-    return results
-
-
-async def search_web_results(
+def _format_firecrawl_search_markdown(
     query: str,
-    *,
-    max_results: int = 5,
-    timeout_seconds: float = 15.0,
-    transport: httpx.AsyncBaseTransport | None = None,
-) -> tuple[list[dict[str, str]], str]:
-    """Run a live web search and return (results, provider_name).
-
-    Uses TAVILY_API_KEY or BRAVE_SEARCH_API_KEY when configured in environment;
-    otherwise uses zero-key DuckDuckGo HTML/Lite search with a Wikipedia OpenSearch fallback.
-    """
-    clean_query = query.strip()
-    if not clean_query:
-        raise ValueError("Search query must not be empty.")
-    clamped = max(1, min(int(max_results), 10))
-    headers = {
-        "User-Agent": _DEFAULT_SEARCH_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout_seconds, connect=8.0),
-        follow_redirects=True,
-        max_redirects=5,
-        headers=headers,
-        transport=transport,
-    ) as client:
-        tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
-        if tavily_key:
-            try:
-                resp = await client.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key": tavily_key,
-                        "query": clean_query,
-                        "max_results": clamped,
-                        "search_depth": "basic",
-                    },
-                )
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    items = [
-                        {
-                            "title": str(it.get("title") or it.get("url") or "").strip(),
-                            "url": str(it.get("url") or "").strip(),
-                            "snippet": str(it.get("content") or "").strip(),
-                        }
-                        for it in (payload.get("results") or [])
-                        if isinstance(it, dict)
-                        and str(it.get("url") or "").startswith(("http://", "https://"))
-                    ][:clamped]
-                    if items:
-                        return items, "tavily"
-            except Exception:
-                pass
-
-        brave_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
-        if brave_key:
-            try:
-                resp = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": clean_query, "count": clamped},
-                    headers={"X-Subscription-Token": brave_key, "Accept": "application/json"},
-                )
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    web_items = (payload.get("web") or {}).get("results") or []
-                    items = [
-                        {
-                            "title": str(it.get("title") or it.get("url") or "").strip(),
-                            "url": str(it.get("url") or "").strip(),
-                            "snippet": str(it.get("description") or "").strip(),
-                        }
-                        for it in web_items
-                        if isinstance(it, dict)
-                        and str(it.get("url") or "").startswith(("http://", "https://"))
-                    ][:clamped]
-                    if items:
-                        return items, "brave"
-            except Exception:
-                pass
-
-        try:
-            resp = await client.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": clean_query, "kl": "us-en"},
-                headers={**headers, "Referer": "https://html.duckduckgo.com/"},
-            )
-            if resp.status_code == 200 and resp.text:
-                parsed = _parse_ddg_html_results(resp.text, clamped)
-                if parsed:
-                    return parsed, "duckduckgo"
-        except Exception:
-            pass
-
-        try:
-            resp = await client.post(
-                "https://lite.duckduckgo.com/lite/",
-                data={"q": clean_query},
-                headers={**headers, "Referer": "https://lite.duckduckgo.com/"},
-            )
-            if resp.status_code == 200 and resp.text:
-                parsed = _parse_ddg_lite_results(resp.text, clamped)
-                if parsed:
-                    return parsed, "duckduckgo_lite"
-        except Exception:
-            pass
-
-        try:
-            resp = await client.get(
-                "https://en.wikipedia.org/w/api.php",
-                params={
-                    "action": "opensearch",
-                    "search": clean_query,
-                    "limit": clamped,
-                    "namespace": 0,
-                    "format": "json",
-                },
-                headers={"User-Agent": "NemofyAgentCore/2.0", "Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                arr = resp.json()
-                if isinstance(arr, list) and len(arr) >= 4:
-                    titles, descs, urls = arr[1], arr[2], arr[3]
-                    items = [
-                        {
-                            "title": str(t or u).strip(),
-                            "url": str(u).strip(),
-                            "snippet": str(d or "").strip(),
-                        }
-                        for t, d, u in zip(titles, descs, urls)
-                        if isinstance(u, str) and u.startswith(("http://", "https://"))
-                    ][:clamped]
-                    if items:
-                        return items, "wikipedia"
-        except Exception:
-            pass
-
-    return [], "duckduckgo"
-
-
-def format_search_results_markdown(
-    query: str,
-    results: list[dict[str, str]],
-    provider: str,
+    results: list[dict[str, object]],
 ) -> str:
-    """Format web search results into compact Markdown for the LLM."""
     if not results:
         return (
-            f"Web search for `{query}` returned no results (source={provider}). "
-            "Try rephrasing the query or fetch a known URL directly with `web_fetch`."
+            f"Firecrawl web search for `{query}` returned no results. "
+            "Try refining the search query or use `web_map` / `web_fetch` on a known URL."
         )
-    lines: list[str] = [f"Web search results for: **{query}** (source: {provider})\n"]
+    lines: list[str] = [f"Web search results for: **{query}** (source: firecrawl)\n"]
     for idx, item in enumerate(results, start=1):
-        title = item.get("title") or item.get("url") or f"Result {idx}"
-        url = item.get("url") or ""
-        snippet = item.get("snippet") or ""
+        title = str(item.get("title") or item.get("url") or f"Result {idx}").strip()
+        url = str(item.get("url") or "").strip()
+        description = str(item.get("description") or "").strip()
+        markdown = str(item.get("markdown") or "").strip()
         lines.append(f"{idx}. **{title}**")
-        lines.append(f"   URL: {url}")
-        if snippet:
-            lines.append(f"   {snippet}")
+        if url:
+            lines.append(f"   Source URL: {url}")
+        if description:
+            lines.append(f"   Summary: {description}")
+        if markdown:
+            excerpt = markdown[:700].rstrip()
+            if len(markdown) > 700:
+                excerpt += " ..."
+            lines.append(f"   Excerpt:\n   {excerpt.replace(chr(10), chr(10) + '   ')}")
     lines.append(
-        "\nTip: Call `web_fetch(url=...)` on any relevant URL above to read the full page content."
+        "\nCitation note: Cite the exact Source URL(s) above. Use `web_fetch(url=...)` to read a full page, "
+        "`web_map(url=...)` to discover site URLs, or `web_crawl(url=...)` for multi-page crawling."
     )
     return "\n".join(lines)
+
+
+def _format_firecrawl_scrape_markdown(scraped: dict[str, object]) -> str:
+    url = str(scraped.get("url") or "").strip()
+    title = str(scraped.get("title") or "").strip()
+    description = str(scraped.get("description") or "").strip()
+    markdown = str(scraped.get("markdown") or "").strip()
+    status_code = scraped.get("status_code")
+    engine = str(scraped.get("engine") or "").strip()
+    num_pages = scraped.get("num_pages")
+    content_type = str(scraped.get("content_type") or "").strip()
+    warning = str(scraped.get("warning") or "").strip()
+
+    header_lines: list[str] = [f"Source: {url} (via Firecrawl Local)"]
+    if engine:
+        header_lines.append(f"Engine: {engine}")
+    if title:
+        header_lines.append(f"Title: {title}")
+    if description:
+        header_lines.append(f"Description: {description}")
+    if content_type:
+        header_lines.append(f"Content-Type: {content_type}")
+    if isinstance(num_pages, int):
+        header_lines.append(f"Pages: {num_pages}")
+    if status_code is not None:
+        header_lines.append(f"HTTP Status: {status_code}")
+    if warning:
+        header_lines.append(f"Warning: {warning}")
+    header = "\n".join(header_lines)
+    body = markdown if markdown else "(No extractable textual content returned by Firecrawl.)"
+    return f"{header}\n\n{body}"
+
+
+def _format_paginated_document_markdown(
+    vpath: str,
+    parsed: dict[str, Any],
+    *,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    max_lines: int = 250,
+    max_chars: int = 24_000,
+) -> str:
+    """Format Firecrawl-parsed PDF/Office Markdown with deterministic line-range pagination."""
+    engine = str(parsed.get("engine") or "firecrawl-local").strip()
+    num_pages = parsed.get("num_pages")
+    title = str(parsed.get("title") or "").strip()
+    content_type = str(parsed.get("content_type") or "").strip()
+    warning = str(parsed.get("warning") or "").strip()
+    markdown = str(parsed.get("markdown") or "").strip()
+
+    meta_bits = [f"DOCUMENT: {vpath}", f"parser=firecrawl-local/{engine}"]
+    if isinstance(num_pages, int):
+        meta_bits.append(f"pages={num_pages}")
+    if content_type:
+        meta_bits.append(f"type={content_type}")
+    if title:
+        meta_bits.append(f"title={title!r}")
+
+    all_lines = markdown.splitlines()
+    total_lines = len(all_lines)
+    if total_lines == 0:
+        header = f"[{' | '.join(meta_bits)} | 0 extractable lines]"
+        if warning:
+            return f"{header}\nWarning: {warning}\n\n(No extractable text found in document.)"
+        return f"{header}\n\n(No extractable text found in document.)"
+
+    req_start = max(1, int(start_line)) if start_line is not None else 1
+    effective_max_lines = max(1, min(1000, int(max_lines)))
+    effective_max_chars = max(2_000, min(100_000, int(max_chars)))
+    if end_line is not None:
+        req_end = min(total_lines, max(req_start, int(end_line)))
+    else:
+        req_end = total_lines
+    target_end = min(req_end, req_start + effective_max_lines - 1)
+
+    if req_start > total_lines:
+        return (
+            f"[{' | '.join(meta_bits)} | requested start_line={req_start} exceeds "
+            f"total_lines={total_lines}. Valid line range is 1-{total_lines}.]"
+        )
+
+    line_width = max(4, len(str(total_lines)))
+    formatted_lines: list[str] = []
+    char_count = 0
+    returned_end = req_start - 1
+    for lineno in range(req_start, target_end + 1):
+        entry = f"{lineno:>{line_width}} | {all_lines[lineno - 1]}"
+        if formatted_lines and char_count + len(entry) + 1 > effective_max_chars:
+            break
+        formatted_lines.append(entry)
+        char_count += len(entry) + 1
+        returned_end = lineno
+
+    has_more = returned_end < total_lines
+    remaining = max(0, total_lines - returned_end)
+    status_str = f"has_more=true, next_start_line={returned_end + 1}, remaining_lines={remaining}" if has_more else "EOF reached"
+    meta_bits.append(f"lines {req_start}-{returned_end} of {total_lines}")
+    meta_bits.append(status_str)
+    header = f"[{' | '.join(meta_bits)}]"
+    warning_line = f"\nWarning: {warning}" if warning else ""
+    footer = (
+        f"\n[More document content remains: call read_file(path={vpath!r}, start_line={returned_end + 1}) to continue.]"
+        if has_more
+        else "\n[End of parsed document]"
+    )
+    return f"{header}{warning_line}\n" + "\n".join(formatted_lines) + footer
+
+
+def _strip_json_code_fences(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _parse_llm_json_payload(raw_text: str) -> Any:
+    cleaned = _strip_json_code_fences(raw_text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start_obj = cleaned.find("{")
+        start_arr = cleaned.find("[")
+        starts = [i for i in (start_obj, start_arr) if i != -1]
+        if not starts:
+            raise
+        start = min(starts)
+        end_char = "}" if cleaned[start] == "{" else "]"
+        end = cleaned.rfind(end_char)
+        if end == -1 or end <= start:
+            raise
+        return json.loads(cleaned[start : end + 1])
+
+
+async def extract_structured_with_llm(
+    fetched_pages: list[tuple[str, str]],
+    *,
+    prompt: str,
+    schema: dict[str, Any] | None,
+    model: Any,
+) -> Any:
+    """Extract strict structured JSON from Firecrawl Local scraped Markdown using the session's active LLM."""
+    combined_sections = []
+    for src_url, md in fetched_pages:
+        combined_sections.append(f"=== SOURCE: {src_url} ===\n{md[:12_000]}")
+    context_blob = "\n\n".join(combined_sections)[:32_000]
+
+    schema_instruction = (
+        f"\nYou MUST conform strictly to this JSON Schema:\n{json.dumps(schema, indent=2)}\n"
+        if schema
+        else ""
+    )
+    sys_msg = SystemMessage(
+        content=(
+            "You are a precise structured data extraction engine. "
+            "Extract ONLY facts explicitly present in the provided source pages. "
+            "Do not fabricate values; use null if a field is absent. "
+            "Return ONLY valid JSON with no surrounding commentary or markdown fences."
+            + schema_instruction
+        )
+    )
+    user_msg = HumanMessage(
+        content=f"Extraction instructions:\n{prompt}\n\nSource pages:\n{context_blob}"
+    )
+
+    response = await model.ainvoke([sys_msg, user_msg])
+    raw_content = getattr(response, "content", response)
+    if isinstance(raw_content, list):
+        raw_text = "".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part)
+            for part in raw_content
+        )
+    else:
+        raw_text = str(raw_content or "")
+
+    try:
+        return _parse_llm_json_payload(raw_text)
+    except Exception:  # noqa: BLE001
+        repair_msg = HumanMessage(
+            content=(
+                "Your previous response was not valid JSON. "
+                "Output ONLY the corrected valid JSON matching the requested extraction and schema.\n\n"
+                f"Previous output:\n{raw_text[:4000]}"
+            )
+        )
+        repaired = await model.ainvoke([sys_msg, repair_msg])
+        rep_content = getattr(repaired, "content", repaired)
+        rep_text = str(rep_content or "")
+        return _parse_llm_json_payload(rep_text)
 
 
 def build_local_tools(
     sandbox: SandboxManager,
     *,
     allow_private_web_fetch: bool = False,
+    firecrawl_client: FirecrawlClient | None = None,
+    extract_model_factory: Callable[[], Any] | None = None,
 ) -> list[BaseTool]:
-    """Create the 7 LangChain local execution tools bound to ``sandbox``."""
+    """Create local sandbox tools and official Firecrawl Local web research tools bound to ``sandbox``."""
+    fc_client = firecrawl_client or FirecrawlClient()
 
     @tool("bash_exec")
     async def bash_exec(command: str, timeout: int | None = None) -> str:
@@ -443,29 +348,83 @@ def build_local_tools(
         except (SandboxSecurityError, SandboxExecutionError) as exc:
             return f"ERROR: {exc}"
 
-    @tool("read_file")
-    def read_file(
+    def _read_file_sync(
         path: str,
         start_line: int | None = None,
         end_line: int | None = None,
+        max_lines: int = 250,
     ) -> str:
-        """Read a UTF-8 text file inside /workspace, optionally sliced by 1-indexed line numbers.
-
-        Args:
-            path: File path inside /workspace (e.g. 'app.py' or '/workspace/app.py').
-            start_line: Optional 1-indexed starting line number.
-            end_line: Optional 1-indexed ending line number (inclusive).
-        """
         session_id = current_session_id.get()
         try:
-            return sandbox.read_file(
+            ws = sandbox.get_session_workspace(session_id)
+            resolved = resolve_workspace_path(path, ws)
+            if resolved.is_file() and is_firecrawl_document_path(resolved):
+                vpath = to_virtual_workspace_path(resolved, ws)
+                parsed = asyncio.run(fc_client.parse_local_document(resolved))
+                return _format_paginated_document_markdown(
+                    vpath,
+                    parsed,
+                    start_line=start_line,
+                    end_line=end_line,
+                    max_lines=max_lines,
+                )
+            page = sandbox.read_file_paginated(
                 path,
                 session_id=session_id,
                 start_line=start_line,
                 end_line=end_line,
+                max_lines=max_lines,
             )
+            return str(page["formatted_output"])
         except (SandboxSecurityError, FileNotFoundError, IsADirectoryError, ValueError) as exc:
             return f"ERROR: {exc}"
+        except FirecrawlError as exc:
+            return f"ERROR [firecrawl/{exc.category}]: {exc}"
+
+    async def _read_file_async(
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        max_lines: int = 250,
+    ) -> str:
+        session_id = current_session_id.get()
+        try:
+            ws = sandbox.get_session_workspace(session_id)
+            resolved = resolve_workspace_path(path, ws)
+            if resolved.is_file() and is_firecrawl_document_path(resolved):
+                vpath = to_virtual_workspace_path(resolved, ws)
+                parsed = await fc_client.parse_local_document(resolved)
+                return _format_paginated_document_markdown(
+                    vpath,
+                    parsed,
+                    start_line=start_line,
+                    end_line=end_line,
+                    max_lines=max_lines,
+                )
+            page = sandbox.read_file_paginated(
+                path,
+                session_id=session_id,
+                start_line=start_line,
+                end_line=end_line,
+                max_lines=max_lines,
+            )
+            return str(page["formatted_output"])
+        except (SandboxSecurityError, FileNotFoundError, IsADirectoryError, ValueError) as exc:
+            return f"ERROR: {exc}"
+        except FirecrawlError as exc:
+            return f"ERROR [firecrawl/{exc.category}]: {exc}"
+
+    read_file = StructuredTool.from_function(
+        func=_read_file_sync,
+        coroutine=_read_file_async,
+        name="read_file",
+        description=(
+            "Read a UTF-8 text file or parse a PDF/Office document (.pdf, .docx, .doc, .xlsx, .xls, "
+            ".pptx, .ppt, .odt, .ods, .odp, .rtf, .epub) inside /workspace into numbered, paginated "
+            "Markdown via official Firecrawl Local. Returns explicit pagination metadata (lines shown, "
+            "total lines, has_more, next_start_line) without truncating mid-line."
+        ),
+    )
 
     @tool("write_file")
     def write_file(path: str, content: str) -> str:
@@ -519,41 +478,228 @@ def build_local_tools(
 
     @tool("web_search")
     async def web_search(query: str, max_results: int = 5) -> str:
-        """Search the live web for up-to-date information, documentation, news, and URLs.
+        """Search the live web using official Firecrawl Local (/v2/search).
 
         Args:
             query: Search query string (keywords or natural-language question).
-            max_results: Maximum number of results to return (1-10, defaults to 5).
+            max_results: Maximum number of results to return (1-15, defaults to 5).
         """
+        clean_query = (query or "").strip()
+        if not clean_query:
+            return "ERROR: Search query must not be empty."
         try:
-            results, provider = await search_web_results(query, max_results=max_results)
-            return format_search_results_markdown(query, results, provider)
+            results = await fc_client.search(clean_query, limit=max_results, scrape_content=False)
+            return _format_firecrawl_search_markdown(clean_query, results)
+        except FirecrawlError as exc:
+            return f"ERROR [firecrawl/{exc.category}]: {exc}"
         except ValueError as exc:
             return f"ERROR: {exc}"
-        except httpx.TimeoutException:
-            return f"ERROR: web_search timed out for query {query!r}"
-        except httpx.HTTPError as exc:
-            return f"ERROR: Network error searching for {query!r}: {type(exc).__name__}"
 
     @tool("web_fetch")
-    async def web_fetch(url: str) -> str:
-        """Fetch a webpage and extract clean Markdown text.
+    async def web_fetch(
+        url: str,
+        only_main_content: bool = True,
+        wait_for_ms: int | None = None,
+    ) -> str:
+        """Scrape a webpage, remote PDF, or remote Office document via official Firecrawl Local (/v2/scrape).
+
+        Natively parses HTML (with automatic Chromium JS rendering when needed), PDFs (.pdf via
+        pdf-inspector), and Office/ebook documents (.docx, .doc, .xlsx, .xls, .pptx, .ppt, .odt,
+        .ods, .odp, .rtf, .epub via anydoc) into clean GitHub-Flavored Markdown.
 
         Args:
-            url: Public http:// or https:// URL to fetch.
+            url: Public http:// or https:// URL to a webpage, PDF, or Office document.
+            only_main_content: When True, strip site chrome and focus on primary article/doc content.
+            wait_for_ms: Optional milliseconds to wait after page load in Chromium for JS-heavy SPAs.
         """
         try:
-            return await fetch_webpage_markdown(
+            validate_public_url(url, allow_private=allow_private_web_fetch)
+            scraped = await fc_client.scrape(
                 url,
-                allow_private=allow_private_web_fetch,
+                only_main_content=only_main_content,
+                wait_for=wait_for_ms,
             )
+            return _format_firecrawl_scrape_markdown(scraped)
         except (SandboxSecurityError, ValueError) as exc:
             return f"ERROR: {exc}"
-        except httpx.TimeoutException:
-            return f"ERROR: web_fetch timed out requesting {url}"
-        except httpx.HTTPStatusError as exc:
-            return f"ERROR: HTTP {exc.response.status_code} fetching {url}"
-        except httpx.HTTPError as exc:
-            return f"ERROR: Network error fetching {url}: {type(exc).__name__}"
+        except FirecrawlError as exc:
+            return f"ERROR [firecrawl/{exc.category}]: {exc}"
 
-    return [bash_exec, read_file, write_file, edit_file, list_dir, web_search, web_fetch]
+    @tool("web_map")
+    async def web_map(url: str, search: str | None = None, limit: int = 50) -> str:
+        """Discover and map URLs across a website using official Firecrawl Local (/v2/map).
+
+        Args:
+            url: Public root or section http(s) URL to map.
+            search: Optional keyword filter to prioritize matching URLs.
+            limit: Maximum number of URLs to return (1-500, defaults to 50).
+        """
+        try:
+            validate_public_url(url, allow_private=allow_private_web_fetch)
+            links = await fc_client.map_urls(url, search=search, limit=limit)
+            if not links:
+                return f"Firecrawl map for {url} discovered 0 URLs."
+            lines = [f"Discovered {len(links)} URL(s) under {url} (source: firecrawl/map):"]
+            for idx, link in enumerate(links, start=1):
+                lines.append(f"{idx}. {link}")
+            return "\n".join(lines)
+        except (SandboxSecurityError, ValueError) as exc:
+            return f"ERROR: {exc}"
+        except FirecrawlError as exc:
+            return f"ERROR [firecrawl/{exc.category}]: {exc}"
+
+    @tool("web_crawl")
+    async def web_crawl(
+        url: str,
+        limit: int = 5,
+        max_depth: int = 2,
+        include_paths: list[str] | None = None,
+        exclude_paths: list[str] | None = None,
+    ) -> str:
+        """Crawl multiple linked pages under a website using official Firecrawl Local (/v2/crawl).
+
+        Args:
+            url: Public starting http(s) URL to crawl.
+            limit: Maximum pages to crawl (1-50, defaults to 5).
+            max_depth: Maximum discovery depth from the starting URL (0-5, defaults to 2).
+            include_paths: Optional list of URL path regex patterns to include.
+            exclude_paths: Optional list of URL path regex patterns to exclude.
+        """
+        try:
+            validate_public_url(url, allow_private=allow_private_web_fetch)
+            res = await fc_client.crawl(
+                url,
+                limit=limit,
+                max_depth=max_depth,
+                include_paths=include_paths,
+                exclude_paths=exclude_paths,
+            )
+            pages = res.get("pages") or []
+            header = (
+                f"Firecrawl crawl of {url} — status={res.get('status')} "
+                f"({len(pages)} page(s) returned, completed={res.get('completed')}/{res.get('total')})"
+            )
+            if res.get("note"):
+                header += f"\nNote: {res['note']}"
+            if not pages:
+                return f"{header}\n\n(No crawlable pages returned.)"
+            sections: list[str] = [header]
+            for idx, page in enumerate(pages, start=1):
+                p_url = str(page.get("url") or url)
+                p_title = str(page.get("title") or p_url)
+                p_md = str(page.get("markdown") or "").strip()
+                excerpt = p_md[:4000].rstrip()
+                if len(p_md) > 4000:
+                    excerpt += "\n... [page excerpt truncated; use web_fetch on this exact URL for full page]"
+                sections.append(f"## {idx}. {p_title}\nSource URL: {p_url}\n\n{excerpt}")
+            return "\n\n---\n\n".join(sections)
+        except (SandboxSecurityError, ValueError) as exc:
+            return f"ERROR: {exc}"
+        except FirecrawlError as exc:
+            return f"ERROR [firecrawl/{exc.category}]: {exc}"
+
+    @tool("web_extract")
+    async def web_extract(
+        urls: list[str],
+        prompt: str,
+        schema_json: str | None = None,
+    ) -> str:
+        """Extract structured JSON data from one or more public URLs via Firecrawl Local.
+
+        Uses /v2/extract when Firecrawl Cloud credentials are configured; when running keyless
+        on Firecrawl Local, scrapes pages via Firecrawl Local /v2/scrape and structures JSON
+        using the active session LLM.
+
+        Args:
+            urls: List of public http(s) URLs (or wildcard URL patterns) to extract from.
+            prompt: Clear natural-language description of the structured facts to extract.
+            schema_json: Optional JSON Schema string constraining the extracted output object.
+        """
+        if not urls:
+            return "ERROR: At least one URL is required for web_extract."
+
+        cleaned_urls: list[str] = []
+        try:
+            for u in urls:
+                base_check = u.replace("/*", "")
+                validate_public_url(base_check, allow_private=allow_private_web_fetch)
+                cleaned_urls.append(base_check)
+            schema = parse_optional_json_schema(schema_json)
+        except (SandboxSecurityError, ValueError) as exc:
+            return f"ERROR: {exc}"
+
+        try:
+            res = await fc_client.extract(urls=urls, prompt=prompt, schema=schema)
+            sources = res.get("sources") or urls
+            data_str = json.dumps(res.get("data"), indent=2, ensure_ascii=False, default=str)
+            src_lines = "\n".join(f"- {s}" for s in sources)
+            return (
+                f"Firecrawl structured extraction (status={res.get('status')}):\n"
+                f"Sources:\n{src_lines}\n\n"
+                f"Extracted Data:\n```json\n{data_str}\n```"
+            )
+        except FirecrawlError as exc:
+            # On keyless firecrawl-local, /v2/extract returns 401 or 501 CLOUD_ONLY.
+            # Scrape via firecrawl-local /v2/scrape and extract structured JSON with the session LLM.
+            if exc.category not in ("cloud_only", "auth_error", "payment_required"):
+                return f"ERROR [firecrawl/{exc.category}]: {exc}"
+
+            scraped_pages: list[tuple[str, str]] = []
+            for target in cleaned_urls[:5]:
+                try:
+                    scraped = await fc_client.scrape(target, only_main_content=True)
+                    md = str(scraped.get("markdown") or "").strip()
+                    if md:
+                        scraped_pages.append((str(scraped.get("url") or target), md))
+                except FirecrawlError as scrape_exc:
+                    return f"ERROR [firecrawl/{scrape_exc.category}]: {scrape_exc}"
+
+            if not scraped_pages:
+                return f"ERROR [firecrawl/{exc.category}]: {exc}"
+
+            active_model = None
+            if extract_model_factory is not None:
+                try:
+                    active_model = extract_model_factory()
+                except Exception:  # noqa: BLE001
+                    active_model = None
+
+            if active_model is not None:
+                try:
+                    extracted_obj = await extract_structured_with_llm(
+                        scraped_pages,
+                        prompt=prompt,
+                        schema=schema,
+                        model=active_model,
+                    )
+                    data_str = json.dumps(extracted_obj, indent=2, ensure_ascii=False, default=str)
+                    src_lines = "\n".join(f"- {u}" for u, _ in scraped_pages)
+                    return (
+                        f"Structured extraction (source: firecrawl-local+llm, status=completed):\n"
+                        f"Sources:\n{src_lines}\n\n"
+                        f"Extracted Data:\n```json\n{data_str}\n```"
+                    )
+                except Exception as llm_exc:  # noqa: BLE001
+                    return f"ERROR [firecrawl-local+llm]: Structured extraction failed: {llm_exc}"
+
+            schema_section = f"\nRequested Schema:\n```json\n{schema_json}\n```\n" if schema_json else ""
+            blocks = [f"### Source: {u}\n\n{md}" for u, md in scraped_pages]
+            return (
+                f"Firecrawl Local scraped source Markdown (source: firecrawl-local/scrape):\n\n"
+                f"Extraction Prompt: {prompt}\n"
+                f"{schema_section}\n"
+                + "\n\n---\n\n".join(blocks)
+            )
+
+    return [
+        bash_exec,
+        read_file,
+        write_file,
+        edit_file,
+        list_dir,
+        web_search,
+        web_fetch,
+        web_map,
+        web_crawl,
+        web_extract,
+    ]

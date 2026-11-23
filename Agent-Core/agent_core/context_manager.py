@@ -212,17 +212,133 @@ def _build_model_match_candidates(raw_model: str | None) -> tuple[str, ...]:
     return tuple(seen)
 
 
+# Provider-specific overrides when identical model names have different limits per provider.
+# Checked BEFORE generic _MODEL_CONTEXT_WINDOWS.
+_PROVIDER_MODEL_CONTEXT_WINDOWS: dict[str, tuple[tuple[str, int], ...]] = {
+    "groq": (
+        ("llama-4-scout", 131_072),
+        ("llama-4-maverick", 131_072),
+        ("llama-3.3-70b", 131_072),
+        ("llama-3.1-8b", 131_072),
+        ("deepseek-r1-distill", 131_072),
+        ("qwen-qwq-32b", 131_072),
+        ("qwen/qwen3-32b", 131_072),
+        ("gemma2-9b", 8_192),
+        ("mixtral-8x7b", 32_768),
+    ),
+    "deepseek": (
+        ("deepseek-chat", 128_000),
+        ("deepseek-reasoner", 128_000),
+        ("deepseek-r1", 128_000),
+        ("deepseek-v3", 128_000),
+    ),
+    "openrouter": (
+        ("llama-4-scout", 1_048_576),
+        ("llama-4-maverick", 1_048_576),
+        ("deepseek-r1", 163_840),
+        ("deepseek-v3", 163_840),
+    ),
+    "together": (
+        ("llama-4-scout", 327_680),
+        ("llama-4-maverick", 524_288),
+        ("deepseek-r1", 163_840),
+        ("deepseek-v3", 131_072),
+    ),
+    "fireworks": (
+        ("llama-4-scout", 1_048_576),
+        ("llama-4-maverick", 1_048_576),
+        ("deepseek-r1", 163_840),
+        ("deepseek-v3.2", 163_840),
+        ("deepseek-v3.1", 163_840),
+        ("deepseek-v3", 128_000),
+    ),
+    "nvidia": (
+        ("deepseek-r1", 128_000),
+        ("llama-3.3-70b", 131_072),
+    ),
+}
+
+_PROVIDER_MODEL_MAX_OUTPUT_TOKENS: dict[str, tuple[tuple[str, int], ...]] = {
+    "groq": (
+        ("llama-4-scout", 8_192),
+        ("llama-4-maverick", 8_192),
+        ("llama-3.3-70b", 32_768),
+        ("llama-3.1-8b", 131_072),
+        ("deepseek-r1-distill", 16_384),
+    ),
+    "deepseek": (
+        ("deepseek-reasoner", 64_000),
+        ("deepseek-r1", 64_000),
+        ("deepseek-chat", 8_192),
+    ),
+    "together": (
+        ("deepseek-r1", 32_768),
+        ("deepseek-v3", 16_384),
+    ),
+    "fireworks": (
+        ("deepseek-r1", 32_768),
+        ("deepseek-v3", 16_384),
+    ),
+}
+
+_UNVERIFIED_CUSTOM_OR_LOCAL_PROVIDERS: frozenset[str] = frozenset(
+    {"custom", "ollama", "vllm", "local"}
+)
+
+
+def _normalize_provider_key(provider: str | None) -> str:
+    clean = (provider or "").strip().lower()
+    if clean in ("river",):
+        return "river_ai"
+    if clean in ("google",):
+        return "gemini"
+    if clean in ("nvidia_nim", "nim"):
+        return "nvidia"
+    return clean
+
+
+def _is_custom_or_local_provider(prov: str) -> bool:
+    return prov in _UNVERIFIED_CUSTOM_OR_LOCAL_PROVIDERS or prov.startswith("custom_")
+
+
 def resolve_model_context_window(
     provider: str | None,
     model: str | None,
     explicit_context_window: int | None = None,
+    *,
+    explicit_source: str | None = None,
+    manual_context_window: int | None = None,
 ) -> tuple[int | None, str]:
-    """Return `(context_window_tokens, source)` for the specified model, or `(None, 'unknown')`."""
+    """Return `(context_window_tokens, source)` for the specified provider+model, or `(None, 'unknown')`.
+
+    Precedence:
+    1. Explicit user manual override (`manual_context_window`) -> source `'manual'`
+    2. Explicit provider/custom catalog metadata (`explicit_context_window`) -> `explicit_source` or `'provider_catalog'`
+    3. Provider-specific verified registry (`_PROVIDER_MODEL_CONTEXT_WINDOWS`) -> `'provider_registry'`
+    4. Built-in model registry (`_MODEL_CONTEXT_WINDOWS`) for known cloud providers -> `'model_registry'`
+    5. Otherwise `(None, 'unknown')` — never silently assigns an arbitrary default.
+    """
+    if isinstance(manual_context_window, (int, float)) and manual_context_window >= MIN_CONTEXT_WINDOW:
+        return int(manual_context_window), "manual"
+
     if isinstance(explicit_context_window, (int, float)) and explicit_context_window >= MIN_CONTEXT_WINDOW:
-        return int(explicit_context_window), "provider_catalog"
+        src = (explicit_source or "").strip() or "provider_catalog"
+        return int(explicit_context_window), src
+
+    prov = _normalize_provider_key(provider)
+    # Self-hosted / custom endpoints can serve any model with arbitrary max_model_len/num_ctx;
+    # never pretend a cloud default applies unless explicit metadata or manual override was given.
+    if _is_custom_or_local_provider(prov):
+        return None, "unknown"
 
     candidates = _build_model_match_candidates(model)
     if candidates:
+        prov_rules = _PROVIDER_MODEL_CONTEXT_WINDOWS.get(prov)
+        if prov_rules:
+            for pattern, limit in prov_rules:
+                if any(pattern in target for target in candidates):
+                    return limit, "provider_registry"
+
         for pattern, limit in _MODEL_CONTEXT_WINDOWS:
             if any(pattern in target for target in candidates):
                 return limit, "model_registry"
@@ -357,16 +473,29 @@ def resolve_model_max_output_tokens(
     provider: str | None,
     model: str | None,
     explicit_max_output_tokens: int | None = None,
+    *,
+    explicit_source: str | None = None,
 ) -> tuple[int | None, str]:
-    """Return `(max_output_tokens, source)` for the specified model, or `(None, 'unknown')`."""
+    """Return `(max_output_tokens, source)` for the specified provider+model, or `(None, 'unknown')`."""
     if (
         isinstance(explicit_max_output_tokens, (int, float))
         and explicit_max_output_tokens >= MIN_MAX_OUTPUT_TOKENS
     ):
-        return int(explicit_max_output_tokens), "provider_catalog"
+        src = (explicit_source or "").strip() or "provider_catalog"
+        return int(explicit_max_output_tokens), src
+
+    prov = _normalize_provider_key(provider)
+    if _is_custom_or_local_provider(prov):
+        return None, "unknown"
 
     candidates = _build_model_match_candidates(model)
     if candidates:
+        prov_rules = _PROVIDER_MODEL_MAX_OUTPUT_TOKENS.get(prov)
+        if prov_rules:
+            for pattern, limit in prov_rules:
+                if any(pattern in target for target in candidates):
+                    return limit, "provider_registry"
+
         for pattern, limit in _MODEL_MAX_OUTPUT_TOKENS:
             if any(pattern in target for target in candidates):
                 return limit, "model_registry"
@@ -493,6 +622,8 @@ def compute_context_usage(
     provider: str | None,
     model: str | None,
     explicit_context_window: int | None = None,
+    explicit_context_window_source: str | None = None,
+    manual_context_window: int | None = None,
     explicit_max_output_tokens: int | None = None,
     configured_max_tokens: int | None = None,
     system_prompt_text: str = "",
@@ -508,7 +639,11 @@ def compute_context_usage(
 ) -> dict[str, Any]:
     """Compute a complete, categorized model-specific context usage snapshot."""
     context_window, source = resolve_model_context_window(
-        provider, model, explicit_context_window=explicit_context_window
+        provider,
+        model,
+        explicit_context_window=explicit_context_window,
+        explicit_source=explicit_context_window_source,
+        manual_context_window=manual_context_window,
     )
     max_output_tokens, max_output_source = resolve_model_max_output_tokens(
         provider, model, explicit_max_output_tokens=explicit_max_output_tokens
@@ -595,18 +730,39 @@ def compute_context_usage(
             calibrated = True
 
     used_tokens = max(0, int(estimated_total))
+    reserved_output_tokens: int | None = None
+    safety_buffer_tokens: int | None = None
+    usable_input_window: int | None = None
+    remaining_input_budget: int | None = None
+    input_budget_percent: float | None = None
+
     if context_window is not None and context_window >= MIN_CONTEXT_WINDOW:
         free_tokens: int | None = max(0, context_window - used_tokens)
         usage_percent: float | None = round(min(100.0, (used_tokens / max(1, context_window)) * 100.0), 1)
-        classification = classify_context_usage(usage_percent)
+        # Account for reserved output tokens & framing safety buffer without ever collapsing usable input <= 0
+        raw_out_reserve = int(effective_max_tokens) if effective_max_tokens is not None else 0
+        reserved_output_tokens = min(raw_out_reserve, max(0, context_window // 2))
+        safety_buffer_tokens = min(2_048, max(256, int(context_window * 0.02)))
+        usable_input_window = max(
+            MIN_CONTEXT_WINDOW,
+            context_window - reserved_output_tokens - safety_buffer_tokens,
+        )
+        remaining_input_budget = max(0, usable_input_window - used_tokens)
+        input_budget_percent = round(
+            min(100.0, (used_tokens / max(1, usable_input_window)) * 100.0), 1
+        )
+        classification = classify_context_usage(max(usage_percent, input_budget_percent))
     else:
         free_tokens = None
         usage_percent = None
         classification = {
             "level": "unknown",
             "label": "Unknown Window",
-            "description": "Context window metadata is unavailable for this model; token usage is tracked without assuming 128K.",
+            "description": "Context window metadata could not be verified for this provider/model. Configure a manual override or refresh provider metadata.",
         }
+
+    is_manual_override = source == "manual"
+    detection_mode = "manual" if is_manual_override else ("unknown" if context_window is None else "auto")
 
     category_meta = [
         ("system_prompt", "System Prompt", "Core agent instructions, guardrails, and active plan"),
@@ -643,9 +799,16 @@ def compute_context_usage(
         "provider": (provider or "").strip(),
         "context_window": context_window,
         "context_window_source": source,
+        "detection_mode": detection_mode,
+        "is_manual_override": is_manual_override,
         "max_output_tokens": max_output_tokens,
         "max_output_tokens_source": max_output_source,
         "configured_max_tokens": effective_max_tokens,
+        "reserved_output_tokens": reserved_output_tokens,
+        "safety_buffer_tokens": safety_buffer_tokens,
+        "usable_input_window": usable_input_window,
+        "remaining_input_budget": remaining_input_budget,
+        "input_budget_percent": input_budget_percent,
         "used_tokens": used_tokens,
         "free_tokens": free_tokens,
         "usage_percent": usage_percent,

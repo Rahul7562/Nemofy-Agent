@@ -91,14 +91,68 @@ export interface ContextCategoryBreakdown {
   share_of_used: number;
 }
 
+export type CustomProviderProtocol = 'openai_compatible' | 'anthropic_compatible';
+
+export interface CustomProviderModelConfig {
+  id: string;
+  name?: string;
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+}
+
+export interface CustomProviderConfig {
+  id: string;
+  name: string;
+  base_url: string;
+  protocol: CustomProviderProtocol;
+  enabled: boolean;
+  models: CustomProviderModelConfig[];
+  timeout_seconds?: number | null;
+  created_at?: string;
+  updated_at?: string;
+  api_key_configured?: boolean;
+  masked_key?: string | null;
+}
+
+export interface PlanningTimeoutConfig {
+  connect_timeout_seconds: number;
+  read_timeout_seconds: number;
+  max_retries: number;
+  fallback_on_timeout: boolean;
+  fallback_provider?: string | null;
+  fallback_model?: string | null;
+}
+
+export interface ThreadSessionConfig {
+  provider: string;
+  model: string;
+  base_url: string;
+  temperature: number;
+  max_tokens: number;
+  reasoning_effort: string;
+  context_window?: number | null;
+  context_window_source?: string | null;
+  manual_context_window?: number | null;
+  max_output_tokens?: number | null;
+  access_mode: ExecutionAccessMode;
+}
+
 export interface ContextUsageSnapshot {
   model: string;
   provider: string;
   context_window: number | null;
   context_window_source: string;
+  detection_mode?: 'auto' | 'manual' | 'unknown';
+  is_manual_override?: boolean;
+  manual_context_window?: number | null;
   max_output_tokens?: number | null;
   max_output_tokens_source?: string;
   configured_max_tokens?: number | null;
+  reserved_output_tokens?: number;
+  safety_buffer_tokens?: number;
+  usable_input_window?: number | null;
+  remaining_input_budget?: number | null;
+  input_budget_percent?: number | null;
   used_tokens: number;
   free_tokens: number | null;
   usage_percent: number | null;
@@ -142,6 +196,15 @@ export interface ActiveBackgroundJob {
   createdAt: number;
 }
 
+export type ContextWindowSourceType =
+  | 'manual'
+  | 'custom_provider_config'
+  | 'provider_catalog'
+  | 'provider_registry'
+  | 'reference_catalog'
+  | 'model_registry'
+  | 'unknown';
+
 export interface ModelResolutionResult {
   resolved: boolean;
   provider: string;
@@ -149,8 +212,8 @@ export interface ModelResolutionResult {
   matched_model: string | null;
   context_window: number | null;
   max_output_tokens: number | null;
-  context_window_source: 'provider_catalog' | 'reference_catalog' | 'model_registry' | 'unknown';
-  max_output_tokens_source: 'provider_catalog' | 'reference_catalog' | 'model_registry' | 'unknown';
+  context_window_source: ContextWindowSourceType;
+  max_output_tokens_source: ContextWindowSourceType;
 }
 
 export interface ChatMessage {
@@ -181,6 +244,7 @@ export interface ChatThread {
   messages: ChatMessage[];
   pendingApproval?: PendingApproval | null;
   contextUsage?: ContextUsageSnapshot | null;
+  sessionConfig?: ThreadSessionConfig;
 }
 
 export interface WorkspaceNode {
@@ -203,6 +267,8 @@ export interface RoleLLMConfig {
   max_tokens: number;
   reasoning_effort: string;
   context_window?: number | null;
+  context_window_source?: string | null;
+  manual_context_window?: number | null;
   max_output_tokens?: number | null;
 }
 
@@ -222,6 +288,10 @@ export interface PersistedLLMConfig {
   accessories?: AccessoriesConfig;
   max_turns: number;
   access_mode?: ExecutionAccessMode;
+  allow_unsafe_local_bash?: boolean;
+  firecrawl_api_url?: string;
+  custom_providers?: CustomProviderConfig[];
+  planning_timeout?: PlanningTimeoutConfig;
 }
 
 export interface ProviderAvailability {
@@ -232,6 +302,11 @@ export interface ProviderAvailability {
   masked_key?: string | null;
   requires_api_key: boolean;
   storage?: 'profile_vault' | 'env';
+  is_custom?: boolean;
+  name?: string;
+  enabled?: boolean;
+  protocol?: CustomProviderProtocol;
+  models?: CustomProviderModelConfig[];
 }
 
 export interface ProfileVaultEntry {
@@ -286,6 +361,17 @@ export interface MCPServerItem {
   timeout_seconds: number;
 }
 
+export interface FirecrawlHealthStatus {
+  healthy?: boolean;
+  reachable?: boolean;
+  mode?: string;
+  engine?: string | null;
+  version?: string | null;
+  api_url?: string;
+  status?: string;
+  detail?: string;
+}
+
 export interface AgentHealthResponse {
   connected: boolean;
   core: {
@@ -294,10 +380,13 @@ export interface AgentHealthResponse {
     primary_model?: string;
     worker_model?: string;
     sandbox_backend?: string;
+    allow_unsafe_local_bash?: boolean;
     sandbox?: {
       backend?: string;
       workspace_dir?: string;
+      allow_unsafe_local_bash?: boolean;
     };
+    firecrawl?: FirecrawlHealthStatus;
     skills_loaded?: string[];
     mcp?: Record<string, unknown>;
   } | null;

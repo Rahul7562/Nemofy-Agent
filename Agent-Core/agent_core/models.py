@@ -13,6 +13,7 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import socket
 import tempfile
@@ -107,12 +108,54 @@ PROVIDER_ALIASES: dict[str, str] = {
 
 LOCAL_NO_KEY_PROVIDERS: frozenset[str] = frozenset({"ollama", "vllm", "local"})
 
+# Provider-specific default (connect_timeout_s, read_timeout_s) profiles.
+# Reasoning models & planning steps frequently take > 90s before streaming tokens.
+PROVIDER_TIMEOUT_PROFILES: dict[str, tuple[float, float]] = {
+    "river_ai": (15.0, 180.0),
+    "openai": (15.0, 180.0),
+    "openrouter": (15.0, 180.0),
+    "nvidia": (15.0, 180.0),
+    "gemini": (15.0, 180.0),
+    "deepseek": (15.0, 180.0),
+    "anthropic": (15.0, 180.0),
+    "groq": (12.0, 120.0),
+    "together": (15.0, 150.0),
+    "fireworks": (15.0, 150.0),
+    "ollama": (15.0, 240.0),
+    "vllm": (15.0, 240.0),
+    "custom": (15.0, 180.0),
+}
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15.0
+DEFAULT_READ_TIMEOUT_SECONDS = 180.0
+DEFAULT_WRITE_TIMEOUT_SECONDS = 30.0
+DEFAULT_POOL_TIMEOUT_SECONDS = 15.0
+
 
 def canonicalize_provider(provider: str | None) -> str:
     clean = (provider or "").strip().lower()
     if not clean:
         return "river_ai"
     return PROVIDER_ALIASES.get(clean, clean)
+
+
+def is_custom_provider_id(provider: str | None) -> bool:
+    clean = canonicalize_provider(provider)
+    return clean == "custom" or clean.startswith("custom_")
+
+
+def custom_provider_env_var(provider_id: str) -> str:
+    safe = re.sub(r"[^A-Z0-9]+", "_", provider_id.strip().upper()).strip("_")
+    return f"CUSTOM_PROVIDER_{safe}_API_KEY"
+
+
+def get_provider_timeout_defaults(provider: str | None) -> tuple[float, float]:
+    prov = canonicalize_provider(provider)
+    if prov.startswith("custom_"):
+        return PROVIDER_TIMEOUT_PROFILES["custom"]
+    return PROVIDER_TIMEOUT_PROFILES.get(
+        prov, (DEFAULT_CONNECT_TIMEOUT_SECONDS, DEFAULT_READ_TIMEOUT_SECONDS)
+    )
+
 
 ModelRole = Literal["primary", "worker"]
 
@@ -182,17 +225,27 @@ class ModelSpec:
     api_key: str | None
     temperature: float = 0.2
     max_tokens: int = 16384
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    write_timeout_seconds: float = DEFAULT_WRITE_TIMEOUT_SECONDS
+    pool_timeout_seconds: float = DEFAULT_POOL_TIMEOUT_SECONDS
     max_retries: int = 2
     reasoning_effort: str | None = None
     context_window: int | None = None
+    context_window_source: str | None = None
+    manual_context_window: int | None = None
     max_output_tokens: int | None = None
+    protocol: str = "openai_compatible"
+    fallback_on_timeout: bool = False
+    fallback_provider: str | None = None
+    fallback_model: str | None = None
 
     def __repr__(self) -> str:
         return (
             f"ModelSpec(role={self.role!r}, provider={self.provider!r}, "
             f"model={self.model!r}, base_url={self.base_url!r}, "
             f"api_key={mask_secret(self.api_key)!r}, "
+            f"connect_timeout_seconds={self.connect_timeout_seconds!r}, "
             f"timeout_seconds={self.timeout_seconds!r})"
         )
 
@@ -207,10 +260,17 @@ class ModelSpec:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "timeout_seconds": self.timeout_seconds,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
             "max_retries": self.max_retries,
             "reasoning_effort": self.reasoning_effort,
             "context_window": self.context_window,
+            "context_window_source": self.context_window_source,
+            "manual_context_window": self.manual_context_window,
             "max_output_tokens": self.max_output_tokens,
+            "protocol": self.protocol,
+            "fallback_on_timeout": self.fallback_on_timeout,
+            "fallback_provider": self.fallback_provider,
+            "fallback_model": self.fallback_model,
         }
 
 
@@ -222,7 +282,18 @@ def _resolve_api_key(
     allow_explicit_fallback: bool = False,
 ) -> str | None:
     prov = canonicalize_provider(provider)
-    # For custom endpoints, check the role-specific env var (PRIMARY_API_KEY / WORKER_API_KEY) first
+    # Named custom providers (custom_<slug>) resolve their dedicated env var first
+    if prov.startswith("custom_"):
+        dedicated = env.get(custom_provider_env_var(prov), "").strip()
+        if dedicated:
+            return dedicated
+        if allow_explicit_fallback and explicit_env_var:
+            direct = env.get(explicit_env_var, "").strip()
+            if direct:
+                return direct
+        return None
+
+    # For legacy custom endpoints, check the role-specific env var (PRIMARY_API_KEY / WORKER_API_KEY) first
     if prov == "custom":
         if explicit_env_var:
             direct = env.get(explicit_env_var, "").strip()
@@ -248,9 +319,44 @@ def _resolve_api_key(
     return None
 
 
-def load_persisted_llm_config(config_path: Path | None = None) -> dict[str, Any]:
+def _resolve_llm_config_path(
+    config_path: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> Path:
+    if config_path is not None:
+        return config_path
+    raw = (env.get("LLM_CONFIG_PATH") if env is not None else os.getenv("LLM_CONFIG_PATH")) or ""
+    if raw.strip():
+        return Path(raw.strip()).resolve()
+    return DEFAULT_LLM_CONFIG_PATH
+
+
+def find_persisted_custom_provider(
+    provider_id: str,
+    config_path: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Look up a persisted user-managed custom provider definition by ID."""
+    clean_id = canonicalize_provider(provider_id)
+    if not is_custom_provider_id(clean_id):
+        return None
+    persisted = load_persisted_llm_config(config_path, env=env)
+    items = persisted.get("custom_providers")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and str(item.get("id") or "").strip().lower() == clean_id:
+            return item
+    return None
+
+
+def load_persisted_llm_config(
+    config_path: Path | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Load non-secret runtime LLM overrides saved from the Nemofy Agent Settings panel."""
-    path = config_path or DEFAULT_LLM_CONFIG_PATH
+    path = _resolve_llm_config_path(config_path, env=env)
     if not path.exists():
         return {}
     try:
@@ -289,6 +395,16 @@ def save_persisted_llm_config(
     if "access_mode" in config and config["access_mode"] is not None:
         raw_mode = str(config["access_mode"]).strip().lower()
         clean["access_mode"] = "full_access" if raw_mode == "full_access" else "default"
+    if "allow_unsafe_local_bash" in config and isinstance(config["allow_unsafe_local_bash"], bool):
+        clean["allow_unsafe_local_bash"] = config["allow_unsafe_local_bash"]
+    if isinstance(config.get("custom_providers"), list):
+        safe_custom: list[dict[str, Any]] = []
+        for cp in config["custom_providers"]:
+            if isinstance(cp, dict):
+                safe_custom.append({k: v for k, v in cp.items() if k != "api_key"})
+        clean["custom_providers"] = safe_custom
+    if isinstance(config.get("planning_timeout"), dict):
+        clean["planning_timeout"] = dict(config["planning_timeout"])
     payload_text = json.dumps(clean, indent=2) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=".llm_config.", suffix=".tmp", dir=str(path.parent))
     try:
@@ -402,11 +518,6 @@ def load_model_spec(
     """Resolve Primary or Worker model specification from environment variables."""
     source_env = dict(os.environ) if env is None else env
 
-    timeout_seconds = _parse_float(
-        source_env.get("MODEL_TIMEOUT_SECONDS"),
-        default=90.0,
-        min_val=1.0,
-    )
     max_retries = _parse_int(
         source_env.get("MODEL_MAX_RETRIES"),
         default=2,
@@ -423,7 +534,7 @@ def load_model_spec(
             provider,
             "PRIMARY_API_KEY",
             source_env,
-            allow_explicit_fallback=bool(raw_env_provider) or provider == "custom",
+            allow_explicit_fallback=bool(raw_env_provider) or is_custom_provider_id(provider),
         )
         temperature = _parse_float(source_env.get("PRIMARY_TEMPERATURE"), 0.2, min_val=0.0)
         max_tokens = _parse_int(source_env.get("PRIMARY_MAX_TOKENS"), 16384, min_val=64)
@@ -439,11 +550,32 @@ def load_model_spec(
             provider,
             "WORKER_API_KEY",
             source_env,
-            allow_explicit_fallback=bool(raw_env_worker) or provider == "custom",
+            allow_explicit_fallback=bool(raw_env_worker) or is_custom_provider_id(provider),
         )
         temperature = _parse_float(source_env.get("WORKER_TEMPERATURE"), 0.1, min_val=0.0)
         max_tokens = _parse_int(source_env.get("WORKER_MAX_TOKENS"), 8192, min_val=64)
         reasoning_effort = (source_env.get("WORKER_REASONING_EFFORT") or "").strip() or None
+
+    prof_connect, prof_read = get_provider_timeout_defaults(provider)
+    raw_read_env = source_env.get("MODEL_READ_TIMEOUT_SECONDS") or source_env.get(
+        "MODEL_TIMEOUT_SECONDS"
+    )
+    timeout_seconds = _parse_float(raw_read_env, default=prof_read, min_val=1.0)
+    connect_timeout_seconds = _parse_float(
+        source_env.get("MODEL_CONNECT_TIMEOUT_SECONDS"),
+        default=prof_connect,
+        min_val=1.0,
+    )
+    write_timeout_seconds = _parse_float(
+        source_env.get("MODEL_WRITE_TIMEOUT_SECONDS"),
+        default=DEFAULT_WRITE_TIMEOUT_SECONDS,
+        min_val=1.0,
+    )
+    pool_timeout_seconds = _parse_float(
+        source_env.get("MODEL_POOL_TIMEOUT_SECONDS"),
+        default=DEFAULT_POOL_TIMEOUT_SECONDS,
+        min_val=1.0,
+    )
 
     if not model:
         raise ModelConfigurationError(f"{role.upper()}_MODEL must not be empty.")
@@ -461,6 +593,9 @@ def load_model_spec(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        connect_timeout_seconds=connect_timeout_seconds,
+        write_timeout_seconds=write_timeout_seconds,
+        pool_timeout_seconds=pool_timeout_seconds,
         max_retries=max_retries,
         reasoning_effort=reasoning_effort,
     )
@@ -478,7 +613,7 @@ def load_model_spec(
 
 @dataclass(frozen=True)
 class ModelOverride:
-    """Per-request model override selected from UI Settings or API payload."""
+    """Per-request model override selected from UI Settings, Session Config, or API payload."""
 
     provider: str | None = None
     model: str | None = None
@@ -488,7 +623,16 @@ class ModelOverride:
     max_tokens: int | None = None
     reasoning_effort: str | None = None
     context_window: int | None = None
+    context_window_source: str | None = None
+    manual_context_window: int | None = None
     max_output_tokens: int | None = None
+    protocol: str | None = None
+    timeout_seconds: float | None = None
+    connect_timeout_seconds: float | None = None
+    max_retries: int | None = None
+    fallback_on_timeout: bool | None = None
+    fallback_provider: str | None = None
+    fallback_model: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -509,7 +653,16 @@ class ModelOverride:
                 self.max_tokens,
                 self.reasoning_effort,
                 self.context_window,
+                self.context_window_source,
+                self.manual_context_window,
                 self.max_output_tokens,
+                self.protocol,
+                self.timeout_seconds,
+                self.connect_timeout_seconds,
+                self.max_retries,
+                self.fallback_on_timeout,
+                self.fallback_provider,
+                self.fallback_model,
             )
         )
 
@@ -555,10 +708,54 @@ def resolve_model_spec_with_override(
                 and str(override.get("context_window")) != ""
                 else None
             ),
+            context_window_source=(
+                str(override["context_window_source"]).strip()
+                if override.get("context_window_source")
+                else None
+            ),
+            manual_context_window=(
+                int(override["manual_context_window"])
+                if override.get("manual_context_window") is not None
+                and str(override.get("manual_context_window")) != ""
+                else None
+            ),
             max_output_tokens=(
                 int(override["max_output_tokens"])
                 if override.get("max_output_tokens") is not None
                 and str(override.get("max_output_tokens")) != ""
+                else None
+            ),
+            protocol=(str(override["protocol"]).strip() if override.get("protocol") else None),
+            timeout_seconds=(
+                float(override["timeout_seconds"])
+                if override.get("timeout_seconds") is not None
+                and str(override.get("timeout_seconds")) != ""
+                else None
+            ),
+            connect_timeout_seconds=(
+                float(override["connect_timeout_seconds"])
+                if override.get("connect_timeout_seconds") is not None
+                and str(override.get("connect_timeout_seconds")) != ""
+                else None
+            ),
+            max_retries=(
+                int(override["max_retries"])
+                if override.get("max_retries") is not None and str(override.get("max_retries")) != ""
+                else None
+            ),
+            fallback_on_timeout=(
+                bool(override["fallback_on_timeout"])
+                if override.get("fallback_on_timeout") is not None
+                else None
+            ),
+            fallback_provider=(
+                str(override["fallback_provider"]).strip()
+                if override.get("fallback_provider")
+                else None
+            ),
+            fallback_model=(
+                str(override["fallback_model"]).strip()
+                if override.get("fallback_model")
                 else None
             ),
         )
@@ -570,9 +767,16 @@ def resolve_model_spec_with_override(
 
     provider = canonicalize_provider(ov.provider or base_spec.provider)
     provider_changed = provider != base_spec.provider
+    custom_cfg = (
+        find_persisted_custom_provider(provider, env=source_env)
+        if is_custom_provider_id(provider)
+        else None
+    )
 
     if ov.base_url and ov.base_url.strip():
         base_url = ov.base_url.strip().rstrip("/")
+    elif custom_cfg and str(custom_cfg.get("base_url") or "").strip():
+        base_url = str(custom_cfg["base_url"]).strip().rstrip("/")
     elif provider_changed:
         if provider not in PROVIDER_BASE_URLS:
             raise ModelConfigurationError(
@@ -594,8 +798,10 @@ def resolve_model_spec_with_override(
     role_env_var = "WORKER_API_KEY" if role == "worker" else "PRIMARY_API_KEY"
     if ov.api_key and ov.api_key.strip():
         api_key: str | None = ov.api_key.strip()
-    elif provider == "custom":
-        api_key = _resolve_api_key("custom", role_env_var, source_env, allow_explicit_fallback=True)
+    elif is_custom_provider_id(provider):
+        api_key = _resolve_api_key(
+            provider, role_env_var, source_env, allow_explicit_fallback=(provider == "custom")
+        )
     elif provider_changed:
         api_key = _resolve_api_key(provider, role_env_var, source_env, allow_explicit_fallback=False)
     else:
@@ -617,16 +823,75 @@ def resolve_model_spec_with_override(
     reasoning_effort = (
         ov.reasoning_effort if ov.reasoning_effort is not None else base_spec.reasoning_effort
     )
+
+    # Check persisted custom provider per-model metadata when explicit values are omitted
+    custom_model_ctx: int | None = None
+    custom_model_out: int | None = None
+    if custom_cfg and isinstance(custom_cfg.get("models"), list):
+        for cm in custom_cfg["models"]:
+            if isinstance(cm, dict) and str(cm.get("id") or "").strip() == model:
+                if isinstance(cm.get("context_window"), (int, float)) and cm["context_window"] >= 512:
+                    custom_model_ctx = int(cm["context_window"])
+                if (
+                    isinstance(cm.get("max_output_tokens"), (int, float))
+                    and cm["max_output_tokens"] >= 256
+                ):
+                    custom_model_out = int(cm["max_output_tokens"])
+                break
+
+    manual_context_window = (
+        ov.manual_context_window
+        if ov.manual_context_window is not None and ov.manual_context_window >= 512
+        else base_spec.manual_context_window
+    )
     context_window = (
         ov.context_window
         if ov.context_window is not None and ov.context_window >= 512
-        else base_spec.context_window
+        else (custom_model_ctx if custom_model_ctx is not None else base_spec.context_window)
+    )
+    context_window_source = (
+        "manual"
+        if manual_context_window is not None
+        else (
+            ov.context_window_source
+            or ("custom_provider_config" if custom_model_ctx is not None and ov.context_window is None else base_spec.context_window_source)
+        )
     )
     max_output_tokens = (
         ov.max_output_tokens
         if ov.max_output_tokens is not None and ov.max_output_tokens >= 256
-        else base_spec.max_output_tokens
+        else (custom_model_out if custom_model_out is not None else base_spec.max_output_tokens)
     )
+    protocol = (
+        ov.protocol
+        or (str(custom_cfg.get("protocol") or "").strip() if custom_cfg else "")
+        or base_spec.protocol
+        or "openai_compatible"
+    )
+
+    prof_connect, prof_read = get_provider_timeout_defaults(provider)
+    custom_timeout = (
+        float(custom_cfg["timeout_seconds"])
+        if custom_cfg
+        and isinstance(custom_cfg.get("timeout_seconds"), (int, float))
+        and float(custom_cfg["timeout_seconds"]) >= 5.0
+        else None
+    )
+    read_timeout = (
+        ov.timeout_seconds
+        if ov.timeout_seconds is not None and ov.timeout_seconds >= 5.0
+        else (
+            custom_timeout
+            if custom_timeout is not None
+            else (prof_read if provider_changed else base_spec.timeout_seconds)
+        )
+    )
+    connect_timeout = (
+        ov.connect_timeout_seconds
+        if ov.connect_timeout_seconds is not None and ov.connect_timeout_seconds >= 1.0
+        else (prof_connect if provider_changed else base_spec.connect_timeout_seconds)
+    )
+    max_retries = ov.max_retries if ov.max_retries is not None and ov.max_retries >= 0 else base_spec.max_retries
 
     return ModelSpec(
         role=role,
@@ -636,11 +901,24 @@ def resolve_model_spec_with_override(
         api_key=api_key,
         temperature=temperature,
         max_tokens=max_tokens,
-        timeout_seconds=base_spec.timeout_seconds,
-        max_retries=base_spec.max_retries,
+        timeout_seconds=read_timeout,
+        connect_timeout_seconds=connect_timeout,
+        write_timeout_seconds=base_spec.write_timeout_seconds,
+        pool_timeout_seconds=base_spec.pool_timeout_seconds,
+        max_retries=max_retries,
         reasoning_effort=reasoning_effort,
         context_window=context_window,
+        context_window_source=context_window_source,
+        manual_context_window=manual_context_window,
         max_output_tokens=max_output_tokens,
+        protocol=protocol,
+        fallback_on_timeout=(
+            ov.fallback_on_timeout
+            if ov.fallback_on_timeout is not None
+            else base_spec.fallback_on_timeout
+        ),
+        fallback_provider=ov.fallback_provider or base_spec.fallback_provider,
+        fallback_model=ov.fallback_model or base_spec.fallback_model,
     )
 
 
@@ -741,20 +1019,111 @@ def format_rate_limit_error_detail(exc: BaseException) -> str:
     return compact[:320]
 
 
-async def invoke_with_rate_limit_retry(
+def _walk_exception_chain(exc: BaseException, max_depth: int = 5) -> list[BaseException]:
+    chain: list[BaseException] = []
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and len(chain) < max_depth and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        nxt = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+    return chain
+
+
+def classify_model_error_category(exc: BaseException) -> str:
+    """Classify an LLM exception into a structured diagnostic category."""
+    if is_rate_limit_exception(exc):
+        return "rate_limit"
+    for item in _walk_exception_chain(exc):
+        cls_name = type(item).__name__.lower()
+        msg_lower = str(item).lower()
+        if isinstance(item, httpx.ConnectTimeout) or "connecttimeout" in cls_name:
+            return "connect_timeout"
+        if isinstance(item, httpx.ReadTimeout) or "readtimeout" in cls_name:
+            return "read_timeout"
+        if isinstance(item, httpx.WriteTimeout) or "writetimeout" in cls_name:
+            return "write_timeout"
+        if isinstance(item, httpx.PoolTimeout) or "pooltimeout" in cls_name:
+            return "pool_timeout"
+        if (
+            isinstance(item, (httpx.TimeoutException, TimeoutError, asyncio.TimeoutError))
+            or "timeout" in cls_name
+            or "timed out" in msg_lower
+            or "request timed out" in msg_lower
+        ):
+            return "read_timeout"
+        if (
+            isinstance(
+                item,
+                (
+                    httpx.ConnectError,
+                    httpx.RemoteProtocolError,
+                    httpx.ReadError,
+                    httpx.NetworkError,
+                    ConnectionError,
+                ),
+            )
+            or "apiconnectionerror" in cls_name
+            or "connection error" in msg_lower
+        ):
+            return "connection_error"
+        status_code = getattr(item, "status_code", None)
+        if status_code is None and isinstance(item, httpx.HTTPStatusError) and item.response is not None:
+            status_code = item.response.status_code
+        if status_code in (401, 403) or isinstance(item, ModelAuthenticationError):
+            return "auth_error"
+        if status_code == 400 or status_code == 422:
+            return "bad_request"
+        if status_code in (500, 502, 503, 504, 529) or (isinstance(status_code, int) and status_code >= 500):
+            return "server_error"
+    return "provider_error"
+
+
+def is_retryable_transient_model_error(exc: BaseException) -> bool:
+    """Return True if an exception is a transient timeout, network drop, or 5xx error safe to retry."""
+    cat = classify_model_error_category(exc)
+    return cat in {
+        "connect_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "connection_error",
+        "server_error",
+    }
+
+
+def is_timeout_model_error(exc: BaseException) -> bool:
+    return classify_model_error_category(exc) in {
+        "connect_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+    }
+
+
+async def invoke_with_resilient_retry(
     call_fn: Callable[[], Awaitable[_T]],
     *,
     label: str = "model",
+    provider: str | None = None,
+    model: str | None = None,
+    stage: str = "planning",
+    max_transient_retries: int = 2,
+    base_backoff_seconds: float = 1.5,
+    max_backoff_seconds: float = 12.0,
     retry_interval_seconds: float | None = None,
     max_wait_seconds: float | None = None,
     turn_count: int | None = None,
     on_retry: Callable[[int, float, float, BaseException], None] | None = None,
 ) -> _T:
-    """Invoke an async LLM call, retrying HTTP 429 rate limits every 3 seconds until success or timeout.
+    """Invoke an async LLM call with structured retry handling for 429 rate limits AND transient
+    timeouts / connection drops / 5xx server errors.
 
-    Keeps the active job alive by emitting progress heartbeats on each retry. If the upstream
-    provider continues returning HTTP 429 past the timeout budget, raises ``ModelRateLimitError``
-    containing both the timeout explanation and the HTTP 429 error detail.
+    - HTTP 429 rate limits retry every ``retry_interval_seconds`` (default 3s) up to ``max_wait_seconds``.
+    - Transient timeouts, connection drops, and 5xx errors retry up to ``max_transient_retries`` times
+      with bounded exponential backoff + jitter (never retrying auth/400/cancellation errors).
+    - Emits live progress heartbeats and structured diagnostic logs without leaking secrets or prompts.
     """
     from agent_core.jobs import (
         DEFAULT_STALL_TIMEOUT_SECONDS,
@@ -774,7 +1143,9 @@ async def invoke_with_rate_limit_retry(
     )
 
     first_429_at: float | None = None
-    attempt = 0
+    rate_limit_attempt = 0
+    transient_attempt = 0
+    call_started_at = time.monotonic()
 
     while True:
         try:
@@ -782,55 +1153,127 @@ async def invoke_with_rate_limit_retry(
         except (GraphInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001
-            if not is_rate_limit_exception(exc):
-                raise
-
-            now = time.monotonic()
-            if first_429_at is None:
-                first_429_at = now
-            attempt += 1
-            elapsed = now - first_429_at
-            remaining = timeout_budget - elapsed
+            category = classify_model_error_category(exc)
             detail = format_rate_limit_error_detail(exc)
 
-            if remaining <= 0.0:
-                err_msg = (
-                    f"Agent timed out after {elapsed:.1f}s (timeout={timeout_budget:.1f}s) "
-                    f"due to persistent HTTP 429 rate limit on {label} after {attempt} attempt(s) "
-                    f"(retrying every {interval:g}s): {detail}"
+            if category == "rate_limit":
+                now = time.monotonic()
+                if first_429_at is None:
+                    first_429_at = now
+                rate_limit_attempt += 1
+                elapsed = now - first_429_at
+                remaining = timeout_budget - elapsed
+
+                if remaining <= 0.0:
+                    err_msg = (
+                        f"Agent timed out after {elapsed:.1f}s (timeout={timeout_budget:.1f}s) "
+                        f"due to persistent HTTP 429 rate limit on {label} after {rate_limit_attempt} attempt(s) "
+                        f"(retrying every {interval:g}s): {detail}"
+                    )
+                    logger.error(err_msg)
+                    raise ModelRateLimitError(err_msg) from exc
+
+                sleep_s = min(interval, remaining)
+                logger.warning(
+                    "HTTP 429 rate limit on %s [stage=%s provider=%s model=%s] "
+                    "(attempt %d, %.1fs/%.1fs elapsed) — retrying in %.1fs: %s",
+                    label,
+                    stage,
+                    provider or "-",
+                    model or "-",
+                    rate_limit_attempt,
+                    elapsed,
+                    timeout_budget,
+                    sleep_s,
+                    detail,
                 )
-                logger.error(err_msg)
-                raise ModelRateLimitError(err_msg) from exc
+                progress_fields: dict[str, Any] = {
+                    "detail": (
+                        f"Rate limited (HTTP 429) on {label} — retrying in {sleep_s:g}s "
+                        f"(attempt {rate_limit_attempt}, {elapsed:.0f}s / {timeout_budget:.0f}s)"
+                    ),
+                    "retry_attempt": rate_limit_attempt,
+                    "rate_limit_error": detail,
+                }
+                if turn_count is not None:
+                    progress_fields["turn_count"] = turn_count
+                emit_progress("rate_limited", **progress_fields)
 
-            sleep_s = min(interval, remaining)
-            logger.warning(
-                "HTTP 429 rate limit on %s (attempt %d, %.1fs/%.1fs elapsed) — retrying in %.1fs: %s",
-                label,
-                attempt,
-                elapsed,
-                timeout_budget,
-                sleep_s,
-                detail,
-            )
-            progress_fields: dict[str, Any] = {
-                "detail": (
-                    f"Rate limited (HTTP 429) on {label} — retrying in {sleep_s:g}s "
-                    f"(attempt {attempt}, {elapsed:.0f}s / {timeout_budget:.0f}s)"
-                ),
-                "retry_attempt": attempt,
-                "rate_limit_error": detail,
-            }
-            if turn_count is not None:
-                progress_fields["turn_count"] = turn_count
-            emit_progress("rate_limited", **progress_fields)
+                if on_retry is not None:
+                    try:
+                        on_retry(rate_limit_attempt, elapsed, sleep_s, exc)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-            if on_retry is not None:
-                try:
-                    on_retry(attempt, elapsed, sleep_s, exc)
-                except Exception:  # noqa: BLE001
-                    pass
+                await asyncio.sleep(sleep_s)
+                continue
 
-            await asyncio.sleep(sleep_s)
+            if is_retryable_transient_model_error(exc) and transient_attempt < max(0, int(max_transient_retries)):
+                transient_attempt += 1
+                elapsed_total = time.monotonic() - call_started_at
+                raw_backoff = min(
+                    max_backoff_seconds,
+                    max(0.05, base_backoff_seconds) * (2 ** (transient_attempt - 1)),
+                )
+                jitter = random.uniform(0.0, min(0.5, raw_backoff * 0.2))
+                sleep_s = round(raw_backoff + jitter, 2)
+                logger.warning(
+                    "Transient %s during %s on %s [provider=%s model=%s] "
+                    "(attempt %d/%d, elapsed=%.1fs) — retrying in %.2fs: %s",
+                    category,
+                    stage,
+                    label,
+                    provider or "-",
+                    model or "-",
+                    transient_attempt,
+                    max_transient_retries + 1,
+                    elapsed_total,
+                    sleep_s,
+                    detail,
+                )
+                progress_fields = {
+                    "detail": (
+                        f"Model {category.replace('_', ' ')} during {stage} — "
+                        f"retrying in {sleep_s:g}s (attempt {transient_attempt + 1}/{max_transient_retries + 1})"
+                    ),
+                    "retry_attempt": transient_attempt,
+                    "error_category": category,
+                }
+                if turn_count is not None:
+                    progress_fields["turn_count"] = turn_count
+                emit_progress("thinking", **progress_fields)
+
+                if on_retry is not None:
+                    try:
+                        on_retry(transient_attempt, elapsed_total, sleep_s, exc)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                await asyncio.sleep(sleep_s)
+                continue
+
+            raise
+
+
+async def invoke_with_rate_limit_retry(
+    call_fn: Callable[[], Awaitable[_T]],
+    *,
+    label: str = "model",
+    retry_interval_seconds: float | None = None,
+    max_wait_seconds: float | None = None,
+    turn_count: int | None = None,
+    on_retry: Callable[[int, float, float, BaseException], None] | None = None,
+) -> _T:
+    """Backward-compatible wrapper retrying HTTP 429 rate limits (without retrying other errors)."""
+    return await invoke_with_resilient_retry(
+        call_fn,
+        label=label,
+        max_transient_retries=0,
+        retry_interval_seconds=retry_interval_seconds,
+        max_wait_seconds=max_wait_seconds,
+        turn_count=turn_count,
+        on_retry=on_retry,
+    )
 
 
 _REASONING_RANK: dict[str, int] = {
@@ -1189,17 +1632,29 @@ def build_chat_model(
         else configured_max
     )
 
+    http_timeout = httpx.Timeout(
+        connect=max(1.0, float(resolved.connect_timeout_seconds)),
+        read=max(5.0, float(resolved.timeout_seconds)),
+        write=max(5.0, float(resolved.write_timeout_seconds)),
+        pool=max(1.0, float(resolved.pool_timeout_seconds)),
+    )
+
     kwargs: dict[str, Any] = {
         "model": resolved.model,
         "api_key": SecretStr(resolved.api_key or "not-configured"),
         "base_url": resolved.base_url,
         "max_tokens": effective_max_tokens,
-        "timeout": resolved.timeout_seconds,
-        # Handle HTTP 429 retries at the agent layer every 3 seconds with live progress heartbeats
-        # so the OpenAI SDK does not silently sleep behind hidden exponential backoff.
+        "timeout": http_timeout,
+        # Handle HTTP 429 and transient timeout/5xx retries at the agent layer with live
+        # progress heartbeats so the OpenAI SDK never hides retries behind opaque sleeps.
         "max_retries": 0,
         "streaming": streaming,
     }
+    if resolved.protocol == "anthropic_compatible" and resolved.api_key:
+        kwargs["default_headers"] = {
+            "x-api-key": resolved.api_key,
+            "anthropic-version": "2023-06-01",
+        }
     if not omit_temp:
         kwargs["temperature"] = resolved.temperature
     if extra_body:
@@ -1516,7 +1971,7 @@ async def list_provider_models(
             prov,
             role_env_var,
             source_env,
-            allow_explicit_fallback=(prov == "custom"),
+            allow_explicit_fallback=is_custom_provider_id(prov),
         )
     )
 
@@ -1533,8 +1988,13 @@ async def list_provider_models(
             "error": url_err,
         }
 
-    # Never forward stored server-side API keys to a custom/non-canonical base URL origin.
-    if not explicit_key and server_env_key and not _is_server_key_allowed_for_url(prov, resolved_base):
+    # Never forward stored server-side API keys to a non-canonical base URL origin for built-in providers.
+    if (
+        not explicit_key
+        and server_env_key
+        and not is_custom_provider_id(prov)
+        and not _is_server_key_allowed_for_url(prov, resolved_base)
+    ):
         resolved_key = ""
     else:
         resolved_key = explicit_key or server_env_key
@@ -1640,12 +2100,12 @@ async def probe_model_connectivity(
     if (
         effective_key
         and resolved.provider not in LOCAL_NO_KEY_PROVIDERS
-        and resolved.provider != "custom"
+        and not is_custom_provider_id(resolved.provider)
         and not _is_server_key_allowed_for_url(resolved.provider, resolved.base_url)
     ):
         result["error"] = (
             f"Refusing to send stored '{resolved.provider}' API key to non-canonical base URL "
-            f"{resolved.base_url!r}. Use provider='custom' with an explicit key for custom endpoints."
+            f"{resolved.base_url!r}. Configure a custom provider for custom endpoints."
         )
         return result
 

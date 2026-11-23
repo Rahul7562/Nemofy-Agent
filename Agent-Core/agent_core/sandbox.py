@@ -106,6 +106,7 @@ class SandboxConfig:
             "1",
             "true",
             "yes",
+            "on",
         )
         default_timeout = max(1, int(src.get("SANDBOX_TIMEOUT_SECONDS") or "300"))
         max_timeout = max(default_timeout, int(src.get("SANDBOX_MAX_TIMEOUT_SECONDS") or "1800"))
@@ -303,8 +304,17 @@ class SandboxManager:
         self._docker_error: str | None = None
         self._containers: dict[str, Any] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._allow_unsafe_local_bash: bool = bool(self.config.allow_unsafe_local_bash)
 
         self._init_backend()
+
+    @property
+    def allow_unsafe_local_bash(self) -> bool:
+        return self._allow_unsafe_local_bash
+
+    def set_allow_unsafe_local_bash(self, enabled: bool) -> bool:
+        self._allow_unsafe_local_bash = bool(enabled)
+        return self._allow_unsafe_local_bash
 
     def _init_backend(self) -> None:
         if self.config.backend == "local_isolated":
@@ -511,10 +521,11 @@ class SandboxManager:
         ws = self.get_session_workspace(session_id)
         _check_local_command_boundaries(command, workspace_root=ws)
 
-        if self.config.backend == "auto" and not self.config.allow_unsafe_local_bash:
+        if self.config.backend == "auto" and not self.allow_unsafe_local_bash:
             raise SandboxSecurityError(
                 "Docker sandbox is unavailable and unisolated local bash fallback is disabled. "
-                "Start Docker or set ALLOW_UNSAFE_LOCAL_BASH=true for explicit local opt-in."
+                "Start Docker or enable ALLOW_UNSAFE_LOCAL_BASH in Settings → Appearance & Runtime "
+                "(or set ALLOW_UNSAFE_LOCAL_BASH=true in .env) for explicit local opt-in."
             )
 
         env = _sanitized_sandbox_env(ws)
@@ -657,6 +668,156 @@ class SandboxManager:
             return ""
         return "".join(lines[s - 1 : e])
 
+    def read_file_paginated(
+        self,
+        path: str,
+        *,
+        session_id: str = "default",
+        start_line: int | None = None,
+        end_line: int | None = None,
+        max_lines: int = 250,
+        max_chars: int = 24_000,
+    ) -> dict[str, Any]:
+        """Read a workspace file with deterministic line-range pagination and metadata.
+
+        Never silently truncates mid-line or presents a partial read as complete.
+        """
+        ws = self.get_session_workspace(session_id)
+        resolved = resolve_workspace_path(path, ws)
+        if not resolved.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        if resolved.is_dir():
+            raise IsADirectoryError(f"Path is a directory, not a file: {path}")
+
+        raw_bytes = resolved.read_bytes()
+        total_bytes = len(raw_bytes)
+        text = raw_bytes.decode("utf-8", errors="replace")
+        vpath = to_virtual_workspace_path(resolved, ws)
+
+        all_lines = text.splitlines()
+        total_lines = len(all_lines)
+
+        if total_lines == 0:
+            header = f"[FILE: {vpath} | empty file (0 lines, 0 bytes)]"
+            return {
+                "path": vpath,
+                "total_lines": 0,
+                "total_bytes": total_bytes,
+                "requested_start_line": 1,
+                "requested_end_line": 0,
+                "returned_start_line": 0,
+                "returned_end_line": 0,
+                "lines_returned": 0,
+                "has_more": False,
+                "next_start_line": None,
+                "remaining_lines": 0,
+                "chunk_capped_by": None,
+                "numbered_content": "",
+                "formatted_output": header,
+            }
+
+        req_start = max(1, int(start_line)) if start_line is not None else 1
+        effective_max_lines = max(1, min(1000, int(max_lines)))
+        effective_max_chars = max(2_000, min(100_000, int(max_chars)))
+
+        if end_line is not None:
+            req_end = min(total_lines, max(req_start, int(end_line)))
+            target_end = min(req_end, req_start + effective_max_lines - 1)
+            capped_by_lines = target_end < req_end
+        else:
+            req_end = total_lines
+            target_end = min(total_lines, req_start + effective_max_lines - 1)
+            capped_by_lines = target_end < total_lines
+
+        if req_start > total_lines:
+            msg = (
+                f"[FILE: {vpath} | requested start_line={req_start} exceeds total_lines={total_lines} "
+                f"({total_bytes:,} bytes). Valid line range is 1-{total_lines}.]"
+            )
+            return {
+                "path": vpath,
+                "total_lines": total_lines,
+                "total_bytes": total_bytes,
+                "requested_start_line": req_start,
+                "requested_end_line": req_end,
+                "returned_start_line": 0,
+                "returned_end_line": 0,
+                "lines_returned": 0,
+                "has_more": False,
+                "next_start_line": None,
+                "remaining_lines": 0,
+                "chunk_capped_by": None,
+                "numbered_content": "",
+                "formatted_output": msg,
+            }
+
+        line_width = max(4, len(str(total_lines)))
+        formatted_lines: list[str] = []
+        char_count = 0
+        returned_end = req_start - 1
+        capped_by_chars = False
+
+        for lineno in range(req_start, target_end + 1):
+            raw_line = all_lines[lineno - 1]
+            formatted_line = f"{lineno:>{line_width}} | {raw_line}"
+            line_cost = len(formatted_line) + 1
+            if formatted_lines and (char_count + line_cost) > effective_max_chars:
+                capped_by_chars = True
+                break
+            formatted_lines.append(formatted_line)
+            char_count += line_cost
+            returned_end = lineno
+
+        lines_returned = len(formatted_lines)
+        has_more = returned_end < total_lines
+        remaining_lines = max(0, total_lines - returned_end)
+        next_start = returned_end + 1 if has_more else None
+        chunk_capped_by: str | None = (
+            "max_chars"
+            if capped_by_chars
+            else ("max_lines" if capped_by_lines else None)
+        )
+
+        status_token = "PARTIAL — MORE LINES REMAIN" if has_more else "COMPLETE (END OF FILE)"
+        header_parts = [
+            f"FILE: {vpath}",
+            f"Lines {req_start}-{returned_end} of {total_lines}",
+            f"Returned: {lines_returned} lines",
+            f"Size: {total_bytes:,} bytes",
+            f"Status: {status_token}",
+        ]
+        if chunk_capped_by:
+            header_parts.append(f"Chunked by: {chunk_capped_by}")
+        header = "[" + " | ".join(header_parts) + "]"
+        numbered_content = "\n".join(formatted_lines)
+
+        if has_more and next_start is not None:
+            suggested_end = min(total_lines, next_start + effective_max_lines - 1)
+            footer = (
+                f"\n[EOF NOT REACHED: {remaining_lines} line(s) remaining (lines {next_start}-{total_lines}). "
+                f"Call read_file(path={vpath!r}, start_line={next_start}, end_line={suggested_end}) to continue reading.]"
+            )
+        else:
+            footer = f"\n[END OF FILE: All lines through line {total_lines} shown.]"
+
+        formatted_output = f"{header}\n{numbered_content}{footer}"
+        return {
+            "path": vpath,
+            "total_lines": total_lines,
+            "total_bytes": total_bytes,
+            "requested_start_line": req_start,
+            "requested_end_line": req_end,
+            "returned_start_line": req_start,
+            "returned_end_line": returned_end,
+            "lines_returned": lines_returned,
+            "has_more": has_more,
+            "next_start_line": next_start,
+            "remaining_lines": remaining_lines,
+            "chunk_capped_by": chunk_capped_by,
+            "numbered_content": numbered_content,
+            "formatted_output": formatted_output,
+        }
+
     def write_file(self, path: str, content: str, *, session_id: str = "default") -> str:
         ws = self.get_session_workspace(session_id)
         resolved = resolve_workspace_path(path, ws)
@@ -755,6 +916,7 @@ class SandboxManager:
         return {
             "backend": self.active_backend,
             "configured_mode": self.config.backend,
+            "allow_unsafe_local_bash": self.allow_unsafe_local_bash,
             "docker_available": self._docker_available,
             "docker_error": self._docker_error,
             "image": self.config.image,

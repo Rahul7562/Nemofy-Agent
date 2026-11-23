@@ -10,6 +10,7 @@ import {
 } from '../lib/llmPresets.ts';
 import { matchLiveModelOption, resolveModelLimits } from '../lib/contextUtils.ts';
 import type {
+  CustomProviderModelConfig,
   ModelResolutionResult,
   ModelRoleKey,
   ProviderModelOption,
@@ -19,6 +20,9 @@ interface ModelSelectorComboboxProps {
   id: string;
   role: ModelRoleKey;
   provider: string;
+  providerLabelOverride?: string;
+  customModels?: CustomProviderModelConfig[];
+  manualContextWindow?: number | null;
   baseUrl: string;
   apiKeyDraft: string;
   value: string;
@@ -34,6 +38,9 @@ export function ModelSelectorCombobox({
   id,
   role,
   provider,
+  providerLabelOverride,
+  customModels,
+  manualContextWindow,
   baseUrl,
   apiKeyDraft,
   value,
@@ -67,7 +74,7 @@ export function ModelSelectorCombobox({
   onModelResolvedRef.current = onModelResolved;
 
   const preset = getProviderPreset(provider);
-  const providerLabel = preset?.label || provider;
+  const providerLabel = providerLabelOverride || preset?.label || provider;
 
   const loadModels = useCallback(
     async (force = false) => {
@@ -87,6 +94,7 @@ export function ModelSelectorCombobox({
           base_url: baseUrl.trim() || undefined,
           api_key: trimmedKey || undefined,
           role,
+          force_refresh: force,
         });
         if (requestSeqRef.current !== seq) return;
 
@@ -176,6 +184,7 @@ export function ModelSelectorCombobox({
           base_url: baseUrl.trim() || undefined,
           api_key: apiKeyDraft.trim() || undefined,
           role,
+          manual_context_window: manualContextWindow ?? undefined,
         });
         if (resolveSeqRef.current !== seq) return;
         lastResolvedKeyRef.current = resolveKey;
@@ -183,7 +192,9 @@ export function ModelSelectorCombobox({
         onModelResolvedRef.current?.(resolved);
       } catch {
         if (resolveSeqRef.current !== seq) return;
-        const localLimits = resolveModelLimits(provider, trimmed);
+        const localLimits = resolveModelLimits(provider, trimmed, null, null, {
+          manualContextWindow: manualContextWindow ?? null,
+        });
         const fallbackRes: ModelResolutionResult = {
           resolved: localLimits.contextWindow !== null,
           provider,
@@ -203,7 +214,7 @@ export function ModelSelectorCombobox({
         }
       }
     },
-    [provider, baseUrl, apiKeyDraft, role, liveModels],
+    [provider, baseUrl, apiKeyDraft, role, liveModels, manualContextWindow],
   );
 
   // Reset cached catalog whenever provider or baseUrl changes
@@ -261,10 +272,25 @@ export function ModelSelectorCombobox({
     wasOpenRef.current = open;
   }, [open, loadModels]);
 
-  const mergedOptions = useMemo(
-    () => mergeProviderModels(liveModels, preset?.defaultModels || [], value),
-    [liveModels, preset?.defaultModels, value],
-  );
+  const mergedOptions = useMemo(() => {
+    const customMapped: ProviderModelOption[] = (customModels || []).map((m) => ({
+      id: m.id,
+      name: m.name || m.id,
+      context_length: m.context_window ?? null,
+      max_output_tokens: m.max_output_tokens ?? null,
+      source: 'custom',
+    }));
+    const combinedLive =
+      liveModels.length > 0
+        ? [
+            ...liveModels,
+            ...customMapped.filter(
+              (cm) => !liveModels.some((lm) => lm.id.toLowerCase() === cm.id.toLowerCase()),
+            ),
+          ]
+        : customMapped;
+    return mergeProviderModels(combinedLive, preset?.defaultModels || [], value);
+  }, [liveModels, customModels, preset?.defaultModels, value]);
 
   const filteredOptions = useMemo(
     () => filterProviderModels(mergedOptions, searchQuery),

@@ -95,7 +95,7 @@ test('resolveModelContextWindow returns model-specific context limits and prefer
   // Aliases & provider-specific identifiers resolve to actual context windows
   assert.deepEqual(resolveModelContextWindow('fireworks', 'accounts/fireworks/models/deepseek-v3'), {
     contextWindow: 128_000,
-    source: 'model_registry',
+    source: 'provider_registry',
   });
   assert.deepEqual(resolveModelContextWindow('gemini', 'models/gemini-2.5-flash'), {
     contextWindow: 1_048_576,
@@ -103,7 +103,7 @@ test('resolveModelContextWindow returns model-specific context limits and prefer
   });
   assert.deepEqual(resolveModelContextWindow('groq', 'llama-3.3-70b-versatile'), {
     contextWindow: 131_072,
-    source: 'model_registry',
+    source: 'provider_registry',
   });
   assert.deepEqual(resolveModelContextWindow('xai', 'grok-3'), {
     contextWindow: 131_072,
@@ -138,7 +138,7 @@ test('resolveModelMaxOutputTokens and resolveModelLimits return exact model-spec
   assert.equal(dsv4.maxOutputTokens, 131_072);
   assert.deepEqual(resolveModelMaxOutputTokens('deepseek', 'deepseek-chat'), {
     maxOutputTokens: 8_192,
-    source: 'model_registry',
+    source: 'provider_registry',
   });
 
   // Live provider catalog values override registry cleanly (no artificial cap, e.g. 2M ctx / 256k out)

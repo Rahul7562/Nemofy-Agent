@@ -50,7 +50,11 @@ def set_runtime_access_mode(mode: str | None) -> ExecutionAccessMode:
 
 
 def bind_run_access_mode(mode: str | None) -> Any:
-    """Bind a per-run access mode that automatically yields if runtime mode is toggled mid-run."""
+    """Bind a strictly session-isolated per-run access mode.
+
+    Once bound for an active session, changes to global defaults or other concurrent
+    sessions must never mutate this running session's execution access mode.
+    """
     if mode is None:
         return current_access_mode.set(None)
     return current_access_mode.set((normalize_access_mode(mode), _RUNTIME_ACCESS_MODE_VERSION))
@@ -60,10 +64,9 @@ def get_effective_access_mode() -> ExecutionAccessMode:
     bound = current_access_mode.get()
     if bound is None:
         return _RUNTIME_ACCESS_MODE
-    bound_mode, bound_version = bound
-    if _RUNTIME_ACCESS_MODE_VERSION > bound_version:
-        return _RUNTIME_ACCESS_MODE
+    bound_mode, _bound_version = bound
     return bound_mode
+
 
 EXPLICIT_SAFE_TOOLS: frozenset[str] = frozenset(
     {
@@ -71,6 +74,9 @@ EXPLICIT_SAFE_TOOLS: frozenset[str] = frozenset(
         "list_dir",
         "web_search",
         "web_fetch",
+        "web_crawl",
+        "web_map",
+        "web_extract",
         "load_skill",
         "write_file",
         "edit_file",

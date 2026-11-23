@@ -19,7 +19,25 @@ export const ALLOWED_PROFILE_SECRET_KEYS = new Set<string>([
   'VLLM_API_KEY',
   'PRIMARY_API_KEY',
   'WORKER_API_KEY',
+  'FIRECRAWL_API_KEY',
 ]);
+
+export const CUSTOM_PROVIDER_SECRET_KEY_PATTERN = /^CUSTOM_PROVIDER_[A-Z0-9_]{1,64}_API_KEY$/;
+
+export function deriveCustomProviderEnvVar(providerId: string): string {
+  const safe = (providerId || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return `CUSTOM_PROVIDER_${safe || 'CUSTOM'}_API_KEY`;
+}
+
+export function isAllowedProfileSecretKey(key: string): boolean {
+  const clean = (key || '').trim().toUpperCase();
+  return ALLOWED_PROFILE_SECRET_KEYS.has(clean) || CUSTOM_PROVIDER_SECRET_KEY_PATTERN.test(clean);
+}
 
 export const ENV_VAR_TO_PROVIDER_META: Record<string, { provider: string; label: string }> = {
   RIVER_AI_API: { provider: 'river_ai', label: 'River AI' },
@@ -37,6 +55,7 @@ export const ENV_VAR_TO_PROVIDER_META: Record<string, { provider: string; label:
   VLLM_API_KEY: { provider: 'vllm', label: 'vLLM' },
   PRIMARY_API_KEY: { provider: 'custom', label: 'Custom (Main Agent)' },
   WORKER_API_KEY: { provider: 'custom', label: 'Custom (Sub-Agent)' },
+  FIRECRAWL_API_KEY: { provider: 'firecrawl', label: 'Firecrawl Web Research' },
 };
 
 export interface ProfileSecretEntryMeta {
@@ -230,7 +249,7 @@ export class ProfileSecretVaultStore {
     const payload = this.readVaultPayload(username);
     const out: Record<string, string> = {};
     for (const [key, entry] of Object.entries(payload.secrets)) {
-      if (ALLOWED_PROFILE_SECRET_KEYS.has(key) && entry && typeof entry.value === 'string' && entry.value.trim()) {
+      if (isAllowedProfileSecretKey(key) && entry && typeof entry.value === 'string' && entry.value.trim()) {
         out[key] = entry.value.trim();
       }
     }
@@ -241,8 +260,19 @@ export class ProfileSecretVaultStore {
     const payload = this.readVaultPayload(username);
     const items: ProfileSecretEntryMeta[] = [];
     for (const [envVar, entry] of Object.entries(payload.secrets)) {
-      if (!ALLOWED_PROFILE_SECRET_KEYS.has(envVar) || !entry?.value?.trim()) continue;
-      const meta = ENV_VAR_TO_PROVIDER_META[envVar] || { provider: 'custom', label: envVar };
+      if (!isAllowedProfileSecretKey(envVar) || !entry?.value?.trim()) continue;
+      let meta = ENV_VAR_TO_PROVIDER_META[envVar];
+      if (!meta && CUSTOM_PROVIDER_SECRET_KEY_PATTERN.test(envVar)) {
+        const providerSlug = envVar
+          .replace(/^CUSTOM_PROVIDER_/, '')
+          .replace(/_API_KEY$/, '')
+          .toLowerCase();
+        meta = {
+          provider: providerSlug,
+          label: `Custom Provider (${providerSlug})`,
+        };
+      }
+      meta = meta || { provider: 'custom', label: envVar };
       items.push({
         env_var: envVar,
         provider: meta.provider,
@@ -263,7 +293,7 @@ export class ProfileSecretVaultStore {
     for (const [rawKey, rawVal] of Object.entries(updates)) {
       const envVar = rawKey.trim().toUpperCase();
       const val = (rawVal || '').trim();
-      if (!ALLOWED_PROFILE_SECRET_KEYS.has(envVar)) {
+      if (!isAllowedProfileSecretKey(envVar)) {
         throw new Error(`Unsupported API key variable: ${envVar}`);
       }
       if (!val) continue;
@@ -300,7 +330,7 @@ export class ProfileSecretVaultStore {
     options?: { resetIfUnreadable?: boolean },
   ): boolean {
     const envVar = (envVarRaw || '').trim().toUpperCase();
-    if (!ALLOWED_PROFILE_SECRET_KEYS.has(envVar)) {
+    if (!isAllowedProfileSecretKey(envVar)) {
       throw new Error(`Unsupported API key variable: ${envVar}`);
     }
     let payload: DecryptedVaultPayload;
@@ -346,7 +376,7 @@ export class ProfileSecretVaultStore {
           const eqIdx = line.indexOf('=');
           if (eqIdx <= 0) continue;
           const key = line.slice(0, eqIdx).trim();
-          if (!ALLOWED_PROFILE_SECRET_KEYS.has(key)) continue;
+          if (!isAllowedProfileSecretKey(key)) continue;
           let val = line.slice(eqIdx + 1).trim();
           if (
             (val.startsWith('"') && val.endsWith('"')) ||

@@ -292,10 +292,10 @@ class TestReliabilityFixes(unittest.IsolatedAsyncioTestCase):
             )
             headers = {"Authorization": "Bearer test-secret-token"}
             with TestClient(app) as client:
-                # 1. Start an async run that pauses for approval
+                # 1. Start an async run in default (HITL) access mode that pauses for approval
                 r_start = client.post(
                     "/agent/jobs/run",
-                    json={"task": "Remove temp.txt", "thread_id": "thread-hitl-1"},
+                    json={"task": "Remove temp.txt", "thread_id": "thread-hitl-1", "access_mode": "default"},
                     headers=headers,
                 )
                 self.assertEqual(r_start.status_code, 202)

@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   AudioLines,
   Blocks,
   CheckCircle2,
@@ -18,6 +19,7 @@ import {
   ShieldCheck,
   Sparkles,
   Sun,
+  Terminal,
   Trash2,
   Video as VideoIcon,
   Wifi,
@@ -39,6 +41,7 @@ import {
   saveProfileVaultKey,
   saveSkillDocument,
   setRemoteBackendUrl,
+  updateSandboxSettings,
 } from '../lib/apiClient.ts';
 import { validatePasswordChange } from '../lib/authValidation.ts';
 import {
@@ -49,26 +52,32 @@ import {
   canonicalizeProviderId,
   detectModelInputModalities,
   getDefaultAccessoriesConfig,
+  getProviderDisplayName,
   getProviderPreset,
+  isCustomProviderId,
   normalizeAccessoriesConfig,
   validateLLMConfig,
 } from '../lib/llmPresets.ts';
 import {
+  MIN_CONTEXT_WINDOW,
   formatTokenCount,
   matchLiveModelOption,
   resolveModelLimits,
 } from '../lib/contextUtils.ts';
 import { getThinkingProfile, normalizeThinkingLevel } from '../lib/thinkingModes.ts';
+import { CustomProvidersManager } from './CustomProvidersManager.tsx';
 import { ModelSelectorCombobox } from './ModelSelectorCombobox.tsx';
 import type {
   AccessoryLLMConfig,
   AgentHealthResponse,
+  CustomProviderConfig,
   ExecutionAccessMode,
   MCPServerItem,
   MediaModality,
   ModelResolutionResult,
   ModelRoleKey,
   PersistedLLMConfig,
+  PlanningTimeoutConfig,
   ProfileVaultSummary,
   ProviderAvailability,
   ProviderModelOption,
@@ -81,19 +90,52 @@ import type {
 interface SettingsViewProps {
   theme: ThemeMode;
   onSetTheme: (mode: ThemeMode) => void;
-  onLLMConfigSaved: (config: PersistedLLMConfig) => void;
+  onLLMConfigSaved: (
+    config: PersistedLLMConfig,
+    providers?: Record<string, ProviderAvailability>,
+  ) => void;
   initialTab?: SettingsTab;
   embedded?: boolean;
   activePrimaryReasoningEffort?: string;
   activeAccessMode?: ExecutionAccessMode;
 }
 
-const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; icon: typeof Cpu }> = [
-  { id: 'llm', label: 'LLM Config', icon: Cpu },
-  { id: 'accessories', label: 'Accessories', icon: Blocks },
-  { id: 'password', label: 'Change Password', icon: KeyRound },
-  { id: 'skills-mcps', label: 'Skills & MCPs', icon: Layers },
-  { id: 'appearance', label: 'Appearance & Runtime', icon: Palette },
+const SETTINGS_TABS: Array<{
+  id: SettingsTab;
+  label: string;
+  description: string;
+  icon: typeof Cpu;
+}> = [
+  {
+    id: 'llm',
+    label: 'LLM Config',
+    description: 'Configure Main Agent & Sub-Agent providers, timeouts, custom gateways, and your encrypted API key vault.',
+    icon: Cpu,
+  },
+  {
+    id: 'accessories',
+    label: 'Accessories',
+    description: 'Route image, video, and audio attachments to native models or specialist multimodal sub-agents.',
+    icon: Blocks,
+  },
+  {
+    id: 'password',
+    label: 'Change Password',
+    description: 'Rotate the administrator credentials protecting this Nemofy Agent portal.',
+    icon: KeyRound,
+  },
+  {
+    id: 'skills-mcps',
+    label: 'Skills & MCPs',
+    description: 'Manage dynamic agent playbooks and external Model Context Protocol tool servers.',
+    icon: Layers,
+  },
+  {
+    id: 'appearance',
+    label: 'Appearance & Runtime',
+    description: 'Customize light/dark theme, remote backend endpoint, and sandbox shell permissions.',
+    icon: Palette,
+  },
 ];
 
 const ACCESSORY_META: Array<{
@@ -128,6 +170,7 @@ function RoleConfigCard({
   roleKey,
   config,
   providers,
+  customProviders = [],
   apiKeyDraft,
   onApiKeyChange,
   onChange,
@@ -141,6 +184,7 @@ function RoleConfigCard({
   roleKey: ModelRoleKey;
   config: RoleLLMConfig;
   providers: Record<string, ProviderAvailability>;
+  customProviders?: CustomProviderConfig[];
   apiKeyDraft: string;
   onApiKeyChange: (val: string) => void;
   onChange: (next: RoleLLMConfig) => void;
@@ -152,6 +196,11 @@ function RoleConfigCard({
   const [showKey, setShowKey] = useState(false);
   const [tempDraft, setTempDraft] = useState(String(config.temperature));
   const [tokensDraft, setTokensDraft] = useState(String(config.max_tokens));
+  const [manualCtxDraft, setManualCtxDraft] = useState(
+    typeof config.manual_context_window === 'number' && config.manual_context_window >= MIN_CONTEXT_WINDOW
+      ? String(config.manual_context_window)
+      : '',
+  );
 
   useEffect(() => {
     setTempDraft(String(config.temperature));
@@ -161,9 +210,25 @@ function RoleConfigCard({
     setTokensDraft(String(config.max_tokens));
   }, [config.max_tokens]);
 
+  useEffect(() => {
+    setManualCtxDraft(
+      typeof config.manual_context_window === 'number' && config.manual_context_window >= MIN_CONTEXT_WINDOW
+        ? String(config.manual_context_window)
+        : '',
+    );
+  }, [config.manual_context_window]);
+
   const canonicalProvider = canonicalizeProviderId(config.provider);
+  const matchedCustomProvider = customProviders.find((p) => p.id === canonicalProvider) || null;
   const preset = getProviderPreset(canonicalProvider);
-  const selectValue = preset ? preset.id : 'custom';
+  const selectValue = matchedCustomProvider
+    ? matchedCustomProvider.id
+    : preset
+      ? preset.id
+      : isCustomProviderId(canonicalProvider)
+        ? canonicalProvider
+        : 'custom';
+  const providerDisplayLabel = getProviderDisplayName(canonicalProvider, customProviders, providers);
   const avail = providers[canonicalProvider] || providers[selectValue];
   const envVarName =
     selectValue === 'custom'
@@ -177,10 +242,26 @@ function RoleConfigCard({
   function handleModelChange(nextModel: string) {
     const nextProfile = getThinkingProfile(canonicalProvider, nextModel);
     const trimmed = nextModel.trim();
-    const resolved = trimmed ? resolveModelLimits(canonicalProvider, trimmed) : null;
+    const customModel = matchedCustomProvider?.models.find(
+      (m) => m.id.toLowerCase() === trimmed.toLowerCase(),
+    );
+    const resolved = trimmed
+      ? resolveModelLimits(
+          canonicalProvider,
+          trimmed,
+          customModel?.context_window ?? null,
+          customModel?.max_output_tokens ?? null,
+          {
+            manualContextWindow: config.manual_context_window ?? null,
+            explicitSource: customModel?.context_window ? 'custom_provider_config' : null,
+          },
+        )
+      : null;
     const autoMaxTokens =
       resolved &&
-      resolved.maxOutputTokensSource === 'model_registry' &&
+      (resolved.maxOutputTokensSource === 'model_registry' ||
+        resolved.maxOutputTokensSource === 'provider_registry' ||
+        resolved.maxOutputTokensSource === 'provider_catalog') &&
       typeof resolved.maxOutputTokens === 'number'
         ? resolved.maxOutputTokens
         : config.max_tokens;
@@ -189,6 +270,7 @@ function RoleConfigCard({
       provider: canonicalProvider,
       model: nextModel,
       context_window: resolved?.contextWindow ?? null,
+      context_window_source: resolved?.contextWindowSource ?? null,
       max_output_tokens: resolved?.maxOutputTokens ?? null,
       max_tokens: autoMaxTokens,
       reasoning_effort: normalizeThinkingLevel(nextProfile, config.reasoning_effort),
@@ -205,12 +287,15 @@ function RoleConfigCard({
       typeof option.max_output_tokens === 'number' && option.max_output_tokens > 0
         ? Math.round(option.max_output_tokens)
         : null;
-    const resolved = resolveModelLimits(canonicalProvider, option.id, explicitCtx, explicitOut);
+    const resolved = resolveModelLimits(canonicalProvider, option.id, explicitCtx, explicitOut, {
+      manualContextWindow: config.manual_context_window ?? null,
+    });
     onChange({
       ...config,
       provider: canonicalProvider,
       model: option.id,
       context_window: resolved.contextWindow,
+      context_window_source: resolved.contextWindowSource,
       max_output_tokens: resolved.maxOutputTokens,
       max_tokens: resolved.maxOutputTokens ?? config.max_tokens,
       reasoning_effort: normalizeThinkingLevel(nextProfile, config.reasoning_effort),
@@ -239,7 +324,8 @@ function RoleConfigCard({
     if (
       nextCtx === (config.context_window ?? null) &&
       nextOut === (config.max_output_tokens ?? null) &&
-      nextMaxTokens === config.max_tokens
+      nextMaxTokens === config.max_tokens &&
+      (resolution.context_window_source || null) === (config.context_window_source ?? null)
     ) {
       return;
     }
@@ -247,6 +333,7 @@ function RoleConfigCard({
     onChange({
       ...config,
       context_window: nextCtx,
+      context_window_source: resolution.context_window_source || null,
       max_output_tokens: nextOut,
       max_tokens: nextMaxTokens,
     });
@@ -279,6 +366,7 @@ function RoleConfigCard({
     onChange({
       ...config,
       context_window: nextCtx,
+      context_window_source: matched.context_length ? 'provider_catalog' : config.context_window_source,
       max_output_tokens: nextOut,
       max_tokens: nextMaxTokens,
     });
@@ -290,6 +378,10 @@ function RoleConfigCard({
         config.model,
         config.context_window,
         config.max_output_tokens,
+        {
+          manualContextWindow: config.manual_context_window ?? null,
+          explicitSource: config.context_window_source ?? null,
+        },
       )
     : null;
 
@@ -297,16 +389,16 @@ function RoleConfigCard({
 
   return (
     <section
-      className={`rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 sm:p-6 space-y-4 transition-opacity ${
+      className={`rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5 transition-opacity ${
         isDisabled ? 'opacity-70' : ''
       }`}
     >
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <h2 className="font-display text-base font-semibold text-[var(--ink)]">{title}</h2>
           {headerBadge && (
             <div
-              className={`mt-0.5 inline-flex items-center gap-1.5 text-[11px] font-medium ${
+              className={`mt-1 inline-flex items-center gap-1.5 text-[11px] font-medium ${
                 headerBadge.tone === 'native'
                   ? 'text-[var(--jade)]'
                   : headerBadge.tone === 'delegate'
@@ -326,9 +418,9 @@ function RoleConfigCard({
               <span>{headerBadge.text}</span>
             </div>
           )}
-          <p className="text-xs text-[var(--ink-soft)] mt-1">{subtitle}</p>
+          <p className="text-xs text-[var(--ink-soft)] mt-1.5 leading-relaxed">{subtitle}</p>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2.5 shrink-0">
           {enabledToggle && (
             <label className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--ink-soft)] cursor-pointer select-none">
               <input
@@ -344,7 +436,7 @@ function RoleConfigCard({
             type="button"
             disabled={probeState.loading || isDisabled}
             onClick={onProbe}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] disabled:opacity-45 text-xs font-medium text-[var(--ink)] transition-colors cursor-pointer shrink-0"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] disabled:opacity-45 text-xs font-medium text-[var(--ink)] transition-colors cursor-pointer shrink-0 whitespace-nowrap"
           >
             <Wifi className="w-3.5 h-3.5 text-[var(--signal)]" />
             <span>{probeState.loading ? 'Testing...' : 'Test'}</span>
@@ -356,7 +448,7 @@ function RoleConfigCard({
       <div>
         <label
           htmlFor={`${roleKey}-provider`}
-          className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+          className="block text-xs font-medium text-[var(--ink)] mb-2"
         >
           Model Provider
         </label>
@@ -367,16 +459,31 @@ function RoleConfigCard({
             onChange(
               applyProviderPreset(config, e.target.value, {
                 clearModelOnProviderSwitch: roleKey === 'primary',
+                customProviders,
               }),
             )
           }
           className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
         >
-          {LLM_PROVIDER_PRESETS.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.label}
-            </option>
-          ))}
+          {customProviders.length > 0 && (
+            <optgroup label="Custom Providers">
+              {customProviders.map((cp) => (
+                <option key={cp.id} value={cp.id} disabled={!cp.enabled}>
+                  {cp.name}
+                  {!cp.enabled ? ' (Disabled)' : ''}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          <optgroup label="Built-in Providers">
+            {LLM_PROVIDER_PRESETS.filter(
+              (p) => p.id !== 'custom' || selectValue === 'custom',
+            ).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </optgroup>
         </select>
       </div>
 
@@ -397,6 +504,7 @@ function RoleConfigCard({
               {resolvedLimits.contextWindow !== null ? (
                 <>
                   {formatTokenCount(resolvedLimits.contextWindow)} total
+                  {resolvedLimits.contextWindowSource === 'manual' ? ' (manual)' : ''}
                   {resolvedLimits.maxOutputTokens !== null
                     ? ` · ${formatTokenCount(resolvedLimits.maxOutputTokens)} out`
                     : ''}
@@ -412,6 +520,9 @@ function RoleConfigCard({
           id={`${roleKey}-model`}
           role={roleKey}
           provider={selectValue}
+          providerLabelOverride={providerDisplayLabel}
+          customModels={matchedCustomProvider?.models}
+          manualContextWindow={config.manual_context_window ?? null}
           baseUrl={config.base_url}
           apiKeyDraft={apiKeyDraft}
           value={config.model}
@@ -491,11 +602,11 @@ function RoleConfigCard({
       </div>
 
       {/* Numeric Controls (Thinking Mode lives exclusively in the Chat Bar) */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
           <label
             htmlFor={`${roleKey}-temp`}
-            className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+            className="block text-xs font-medium text-[var(--ink)] mb-2"
           >
             Temperature
           </label>
@@ -521,13 +632,13 @@ function RoleConfigCard({
                 setTempDraft(String(config.temperature));
               }
             }}
-            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
           />
         </div>
         <div>
           <label
             htmlFor={`${roleKey}-tokens`}
-            className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+            className="block text-xs font-medium text-[var(--ink)] mb-2"
           >
             Max Output Tokens
           </label>
@@ -553,10 +664,10 @@ function RoleConfigCard({
                 setTokensDraft(String(config.max_tokens));
               }
             }}
-            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
           />
           {resolvedLimits && (
-            <div className="mt-1 flex items-center justify-between gap-1.5 text-[10px] text-[var(--ink-faint)]">
+            <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-[var(--ink-faint)]">
               <span className="font-mono tabular-nums truncate">
                 {resolvedLimits.maxOutputTokens !== null
                   ? `Max: ${formatTokenCount(resolvedLimits.maxOutputTokens)}`
@@ -578,6 +689,62 @@ function RoleConfigCard({
           )}
         </div>
       </div>
+
+      {/* Optional Manual Context Window Override for Primary Model */}
+      {roleKey === 'primary' && (
+        <div>
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <label
+              htmlFor={`${roleKey}-manual-ctx`}
+              className="block text-xs font-medium text-[var(--ink)]"
+            >
+              Manual Context Window Override <span className="text-[var(--ink-faint)] font-normal">(optional)</span>
+            </label>
+            {typeof config.manual_context_window === 'number' && config.manual_context_window >= MIN_CONTEXT_WINDOW && (
+              <button
+                type="button"
+                onClick={() => {
+                  setManualCtxDraft('');
+                  onChange({
+                    ...config,
+                    manual_context_window: null,
+                    context_window_source: null,
+                  });
+                }}
+                className="text-[11px] font-medium text-[var(--signal)] hover:underline cursor-pointer"
+              >
+                Clear override
+              </button>
+            )}
+          </div>
+          <input
+            id={`${roleKey}-manual-ctx`}
+            type="text"
+            inputMode="numeric"
+            value={manualCtxDraft}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setManualCtxDraft(raw);
+              const cleaned = raw.trim().replace(/[_,]/g, '');
+              if (!cleaned) {
+                onChange({ ...config, manual_context_window: null });
+                return;
+              }
+              const num = Number(cleaned);
+              if (Number.isFinite(num) && num >= MIN_CONTEXT_WINDOW) {
+                onChange({
+                  ...config,
+                  manual_context_window: Math.round(num),
+                  context_window: Math.round(num),
+                  context_window_source: 'manual',
+                });
+              }
+            }}
+            placeholder="Leave blank for automatic provider detection"
+            className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+          />
+        </div>
+      )}
 
       {probeState.message && (
         <div
@@ -662,10 +829,15 @@ export function SettingsView({
   const [newMcpTransport, setNewMcpTransport] = useState<'streamable_http' | 'sse'>('streamable_http');
   const [mcpFeedback, setMcpFeedback] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
 
-  // Runtime & Remote URL State
+  // Runtime, Sandbox & Remote URL State
   const [health, setHealth] = useState<AgentHealthResponse | null>(null);
   const [remoteUrl, setRemoteUrl] = useState(() => getRemoteBackendUrl());
   const [remoteSaved, setRemoteSaved] = useState(false);
+  const [unsafeBashBusy, setUnsafeBashBusy] = useState(false);
+  const [unsafeBashFeedback, setUnsafeBashFeedback] = useState<{
+    type: 'ok' | 'error';
+    text: string;
+  } | null>(null);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -809,7 +981,7 @@ export function SettingsView({
       setPrimaryApiKey('');
       setWorkerApiKey('');
       setAccessoryApiKeys({ image: '', video: '', audio: '' });
-      onLLMConfigSaved(saved.config);
+      onLLMConfigSaved(saved.config, saved.providers);
       const envSummary =
         saved.savedEnvKeys && saved.savedEnvKeys.length > 0
           ? ` Encrypted & stored in profile vault: ${saved.savedEnvKeys.join(', ')}.`
@@ -1098,26 +1270,91 @@ export function SettingsView({
     setTimeout(() => setRemoteSaved(false), 3000);
   }
 
+  async function handleToggleAllowUnsafeLocalBash(nextEnabled: boolean) {
+    setUnsafeBashBusy(true);
+    setUnsafeBashFeedback(null);
+    try {
+      const res = await updateSandboxSettings(nextEnabled);
+      const updatedConfig = llmConfig
+        ? { ...llmConfig, allow_unsafe_local_bash: res.allow_unsafe_local_bash }
+        : null;
+      if (updatedConfig) {
+        setLlmConfig(updatedConfig);
+        onLLMConfigSaved(updatedConfig, providers);
+      }
+      setHealth((prev) =>
+        prev?.core
+          ? {
+              ...prev,
+              core: {
+                ...prev.core,
+                allow_unsafe_local_bash: res.allow_unsafe_local_bash,
+                sandbox: prev.core.sandbox
+                  ? { ...prev.core.sandbox, allow_unsafe_local_bash: res.allow_unsafe_local_bash }
+                  : prev.core.sandbox,
+              },
+            }
+          : prev,
+      );
+      const syncNote = res.syncWarning ? ` (${res.syncWarning})` : '';
+      setUnsafeBashFeedback({
+        type: 'ok',
+        text: res.allow_unsafe_local_bash
+          ? `ALLOW_UNSAFE_LOCAL_BASH enabled and persisted.${syncNote}`
+          : `ALLOW_UNSAFE_LOCAL_BASH disabled (safe default) and persisted.${syncNote}`,
+      });
+    } catch (err) {
+      setUnsafeBashFeedback({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Unable to update ALLOW_UNSAFE_LOCAL_BASH setting.',
+      });
+    } finally {
+      setUnsafeBashBusy(false);
+    }
+  }
+
+  function updatePlanningTimeout(patch: Partial<PlanningTimeoutConfig>) {
+    if (!llmConfig) return;
+    const current: PlanningTimeoutConfig = llmConfig.planning_timeout || {
+      connect_timeout_seconds: 20,
+      read_timeout_seconds: 180,
+      max_retries: 2,
+      fallback_on_timeout: false,
+      fallback_provider: null,
+      fallback_model: null,
+    };
+    setLlmConfig({
+      ...llmConfig,
+      planning_timeout: {
+        ...current,
+        ...patch,
+      },
+    });
+  }
+
+  const activeTabMeta = SETTINGS_TABS.find((t) => t.id === activeTab) || SETTINGS_TABS[0];
+
   return (
-    <div className="h-full overflow-y-auto overflow-x-hidden scrollbar-none bg-[var(--paper)]">
-      <div className={`max-w-5xl mx-auto ${embedded ? 'px-5 sm:px-6 py-5' : 'px-5 sm:px-8 py-6 sm:py-8'} space-y-6`}>
-        {/* Header */}
+    <div className="h-full flex flex-col md:flex-row overflow-hidden bg-[var(--paper)]">
+      {/* Pinned Navigation Sidebar (Desktop) / Horizontal Tab Bar (Mobile) */}
+      <aside className="shrink-0 md:w-60 lg:w-64 border-b md:border-b-0 md:border-r border-[var(--rule)] bg-[var(--paper-raised)]/45 flex flex-col">
         {!embedded && (
-          <div>
-            <h1 className="font-display text-2xl font-semibold tracking-tight text-[var(--ink)]">
+          <div className="px-5 pt-6 pb-3 hidden md:block">
+            <h1 className="font-display text-xl font-semibold tracking-tight text-[var(--ink)]">
               Settings
             </h1>
-            <p className="mt-1 text-sm text-[var(--ink-soft)]">
-              Configure Main Agent &amp; Sub-Agent LLMs, administrator security, dynamic skills, and MCP servers.
+            <p className="mt-1 text-xs text-[var(--ink-soft)] leading-relaxed">
+              Manage models, security, skills, and runtime behavior.
             </p>
           </div>
         )}
-
-        {/* Sub-navigation Tabs */}
         <div
           role="tablist"
           aria-label="Settings sections"
-          className="flex flex-wrap gap-1.5 border-b border-[var(--rule)] pb-3"
+          className="flex md:flex-col gap-1.5 px-4 py-3 md:px-4 md:py-6 overflow-x-auto md:overflow-x-visible scrollbar-none"
         >
           {SETTINGS_TABS.map((tab) => {
             const Icon = tab.icon;
@@ -1129,268 +1366,419 @@ export function SettingsView({
                 type="button"
                 aria-selected={active}
                 onClick={() => setActiveTab(tab.id)}
-                className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors cursor-pointer ${
+                className={`inline-flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg text-xs sm:text-sm font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 md:w-full text-left ${
                   active
                     ? 'bg-[var(--blush)] text-[var(--signal)] font-semibold'
                     : 'text-[var(--ink-soft)] hover:bg-[var(--paper-sunk)] hover:text-[var(--ink)]'
                 }`}
               >
-                <Icon className="w-4 h-4" />
+                <Icon className="w-4 h-4 shrink-0" />
                 <span>{tab.label}</span>
               </button>
             );
           })}
         </div>
+      </aside>
 
-        {/* TAB 1: LLM CONFIG (Main Agent & Sub-Agent) */}
-        {activeTab === 'llm' && (
-          <form onSubmit={(e) => void handleSaveLLM(e, 'llm')} noValidate className="space-y-5">
-            {llmConfig ? (
-              <>
-                {llmMessage && (
-                  <div
-                    role={llmMessage.type === 'error' ? 'alert' : 'status'}
-                    className={`rounded-lg px-4 py-3 text-sm border ${
-                      llmMessage.type === 'ok'
-                        ? 'border-[var(--jade)]/35 bg-[var(--jade)]/10 text-[var(--jade)]'
-                        : 'border-[var(--flare)]/35 bg-[var(--flare)]/10 text-[var(--flare)]'
-                    }`}
-                  >
-                    {llmMessage.text}
-                  </div>
-                )}
+      {/* Scrollable Main Settings Content */}
+      <div className="flex-1 min-w-0 h-full overflow-y-auto overflow-x-hidden scrollbar-none bg-[var(--paper)]">
+        <div className="max-w-5xl mx-auto px-6 sm:px-9 lg:px-10 py-7 sm:py-9 space-y-7">
+          {/* Active Section Header */}
+          <div className="pb-4 border-b border-[var(--rule)]">
+            <h2 className="font-display text-xl font-semibold tracking-tight text-[var(--ink)]">
+              {activeTabMeta.label}
+            </h2>
+            <p className="mt-1 text-sm text-[var(--ink-soft)] leading-relaxed">
+              {activeTabMeta.description}
+            </p>
+          </div>
 
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-                  <RoleConfigCard
-                    title="Main Agent (Nemo)"
-                    subtitle="Handles conversation, planning, reasoning, and final responses."
-                    roleKey="primary"
-                    config={llmConfig.primary}
-                    providers={providers}
-                    apiKeyDraft={primaryApiKey}
-                    onApiKeyChange={(val) => {
-                      setPrimaryApiKey(val);
-                      setPrimaryProbe({ loading: false });
-                    }}
-                    onChange={(next) => {
-                      setLlmConfig({ ...llmConfig, primary: next });
-                      setPrimaryProbe({ loading: false });
-                    }}
-                    onProbe={() => void handleProbe('primary')}
-                    probeState={primaryProbe}
-                  />
-                  <RoleConfigCard
-                    title="Sub-Agent (Worker)"
-                    subtitle="Executes delegated research, coding, and parallel sub-tasks."
-                    roleKey="worker"
-                    config={llmConfig.worker}
-                    providers={providers}
-                    apiKeyDraft={workerApiKey}
-                    onApiKeyChange={(val) => {
-                      setWorkerApiKey(val);
-                      setWorkerProbe({ loading: false });
-                    }}
-                    onChange={(next) => {
-                      setLlmConfig({ ...llmConfig, worker: next });
-                      setWorkerProbe({ loading: false });
-                    }}
-                    onProbe={() => void handleProbe('worker')}
-                    probeState={workerProbe}
-                  />
-                </div>
-
-                <div className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-4">
-                      <div>
-                        <label
-                          htmlFor="max-turns-input"
-                          className="block text-xs font-medium text-[var(--ink)]"
-                        >
-                          Max Execution Turns
-                        </label>
-                        <p className="text-[11px] text-[var(--ink-faint)]">
-                          Upper bound on autonomous tool loops per request ({MIN_MAX_TURNS}–{MAX_MAX_TURNS}).
-                        </p>
-                      </div>
-                      <input
-                        id="max-turns-input"
-                        data-testid="max-turns-input"
-                        type="text"
-                        inputMode="numeric"
-                        aria-invalid={Boolean(maxTurnsError)}
-                        aria-describedby={maxTurnsError ? 'max-turns-error' : undefined}
-                        value={maxTurnsDraft}
-                        onChange={(e) => {
-                          const raw = e.target.value;
-                          setMaxTurnsDraft(raw);
-                          const check = parseMaxTurnsDraft(raw);
-                          if (check.valid && check.value !== undefined) {
-                            setMaxTurnsError(null);
-                            setLlmConfig({ ...llmConfig, max_turns: check.value });
-                          } else {
-                            setMaxTurnsError(check.error || null);
-                          }
-                        }}
-                        className={`w-24 h-10 px-3 rounded-lg border bg-[var(--paper)] font-mono text-sm text-[var(--ink)] focus:outline-none ${
-                          maxTurnsError
-                            ? 'border-[var(--flare)] focus:border-[var(--flare)]'
-                            : 'border-[var(--rule-strong)] focus:border-[var(--signal)]'
-                        }`}
-                      />
-                    </div>
-                    {maxTurnsError && (
-                      <p
-                        id="max-turns-error"
-                        data-testid="max-turns-error"
-                        role="alert"
-                        className="text-xs text-[var(--flare)]"
-                      >
-                        {maxTurnsError}
-                      </p>
-                    )}
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={llmSaving}
-                    className="h-10 px-5 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer shrink-0"
-                  >
-                    <Save className="w-4 h-4" />
-                    <span>{llmSaving ? 'Saving...' : 'Save LLM Config'}</span>
-                  </button>
-                </div>
-
-                {/* Per-Profile Encrypted API Key Vault */}
-                <section
-                  aria-label="Profile API Key Vault"
-                  className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 sm:p-6 space-y-4"
-                >
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <h2 className="font-display text-base font-semibold text-[var(--ink)] flex items-center gap-2">
-                        <ShieldCheck className="w-4 h-4 text-[var(--jade)]" />
-                        <span>
-                          Profile API Key Vault ({vault?.username || 'admin'})
-                        </span>
-                      </h2>
-                      <p className="text-xs text-[var(--ink-soft)] mt-0.5">
-                        API keys are encrypted at rest on the server and automatically loaded whenever you sign in as{' '}
-                        <span className="font-mono text-[var(--ink)]">{vault?.username || 'admin'}</span>.
-                      </p>
-                    </div>
-                    <span className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[var(--jade)]">
-                      <Lock className="w-3 h-3" />
-                      <span>AES-256-GCM · Auto-loaded</span>
-                    </span>
-                  </div>
-
-                  {vaultMessage && (
+          {/* TAB 1: LLM CONFIG (Main Agent & Sub-Agent) */}
+          {activeTab === 'llm' && (
+            <form onSubmit={(e) => void handleSaveLLM(e, 'llm')} noValidate className="space-y-7">
+              {llmConfig ? (
+                <>
+                  {llmMessage && (
                     <div
-                      role={vaultMessage.type === 'error' ? 'alert' : 'status'}
-                      className={`rounded-lg px-3.5 py-2 text-xs border ${
-                        vaultMessage.type === 'ok'
+                      role={llmMessage.type === 'error' ? 'alert' : 'status'}
+                      className={`rounded-lg px-4 py-3 text-sm border ${
+                        llmMessage.type === 'ok'
                           ? 'border-[var(--jade)]/35 bg-[var(--jade)]/10 text-[var(--jade)]'
                           : 'border-[var(--flare)]/35 bg-[var(--flare)]/10 text-[var(--flare)]'
                       }`}
                     >
-                      {vaultMessage.text}
+                      {llmMessage.text}
                     </div>
                   )}
 
-                  {vault && vault.entries.length > 0 ? (
-                    <div className="divide-y divide-[var(--rule)] border border-[var(--rule)] rounded-lg overflow-hidden">
-                      {vault.entries.map((entry) => (
-                        <div
-                          key={entry.env_var}
-                          className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 bg-[var(--paper)]"
-                        >
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs font-semibold text-[var(--ink)]">
-                                {entry.provider_label}
-                              </span>
-                              <span className="font-mono text-[11px] text-[var(--ink-faint)]">
-                                {entry.env_var}
-                              </span>
-                            </div>
-                            <div className="font-mono text-xs text-[var(--jade)] mt-0.5">
-                              {entry.masked_key}
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            disabled={vaultBusy}
-                            onClick={() => void handleDeleteVaultKey(entry.env_var)}
-                            aria-label={`Remove ${entry.env_var} from profile vault`}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-[var(--rule)] text-xs text-[var(--ink-soft)] hover:text-[var(--flare)] hover:border-[var(--flare)]/40 disabled:opacity-50 transition-colors cursor-pointer"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>Remove</span>
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-[var(--ink-faint)]">
-                      No API keys stored in this profile vault yet. Add a provider key below or save one from either agent card above.
-                    </p>
-                  )}
-
-                  {/* Quick-Add Provider Key to Profile Vault */}
-                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 pt-1">
-                    <div className="sm:col-span-4">
-                      <label htmlFor="vault-provider-select" className="sr-only">
-                        Provider for new vault API key
-                      </label>
-                      <select
-                        id="vault-provider-select"
-                        value={vaultProvider}
-                        onChange={(e) => setVaultProvider(e.target.value)}
-                        className="w-full h-9 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
-                      >
-                        {LLM_PROVIDER_PRESETS.filter((p) => p.requiresApiKey).map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.label} ({p.envVars[0] || 'PRIMARY_API_KEY'})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="sm:col-span-6 relative">
-                      <label htmlFor="vault-apikey-input" className="sr-only">
-                        API Key value
-                      </label>
-                      <input
-                        id="vault-apikey-input"
-                        type={showVaultKeyInput ? 'text' : 'password'}
-                        autoComplete="off"
-                        value={vaultKeyInput}
-                        onChange={(e) => setVaultKeyInput(e.target.value)}
-                        placeholder="Paste API key to store securely in your profile"
-                        className="w-full h-9 pl-3 pr-9 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowVaultKeyInput((v) => !v)}
-                        aria-label={showVaultKeyInput ? 'Hide vault API key' : 'Show vault API key'}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink-faint)] hover:text-[var(--ink)] cursor-pointer"
-                      >
-                        {showVaultKeyInput ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      </button>
-                    </div>
-                    <div className="sm:col-span-2">
-                      <button
-                        type="button"
-                        disabled={vaultBusy || !vaultKeyInput.trim()}
-                        onClick={() => void handleSaveVaultKey()}
-                        className="w-full h-9 px-3 inline-flex items-center justify-center gap-1.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] hover:text-[var(--signal)] disabled:opacity-45 text-xs font-semibold text-[var(--ink)] transition-colors cursor-pointer"
-                      >
-                        <KeyRound className="w-3.5 h-3.5" />
-                        <span>Store Key</span>
-                      </button>
-                    </div>
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                    <RoleConfigCard
+                      title="Main Agent (Nemo)"
+                      subtitle="Default model for new sessions. Existing sessions keep their own independent provider and model."
+                      roleKey="primary"
+                      config={llmConfig.primary}
+                      providers={providers}
+                      customProviders={llmConfig.custom_providers || []}
+                      apiKeyDraft={primaryApiKey}
+                      onApiKeyChange={(val) => {
+                        setPrimaryApiKey(val);
+                        setPrimaryProbe({ loading: false });
+                      }}
+                      onChange={(next) => {
+                        setLlmConfig({ ...llmConfig, primary: next });
+                        setPrimaryProbe({ loading: false });
+                      }}
+                      onProbe={() => void handleProbe('primary')}
+                      probeState={primaryProbe}
+                    />
+                    <RoleConfigCard
+                      title="Sub-Agent (Worker)"
+                      subtitle="Executes delegated research, coding, and parallel sub-tasks."
+                      roleKey="worker"
+                      config={llmConfig.worker}
+                      providers={providers}
+                      customProviders={llmConfig.custom_providers || []}
+                      apiKeyDraft={workerApiKey}
+                      onApiKeyChange={(val) => {
+                        setWorkerApiKey(val);
+                        setWorkerProbe({ loading: false });
+                      }}
+                      onChange={(next) => {
+                        setLlmConfig({ ...llmConfig, worker: next });
+                        setWorkerProbe({ loading: false });
+                      }}
+                      onProbe={() => void handleProbe('worker')}
+                      probeState={workerProbe}
+                    />
                   </div>
-                </section>
+
+                  {/* Planning Timeout & Fallback Resilience */}
+                  <section
+                    data-testid="planning-timeout-section"
+                    className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5"
+                  >
+                    <div>
+                      <h3 className="font-display text-base font-semibold text-[var(--ink)]">
+                        Planning Timeout &amp; Resilience
+                      </h3>
+                      <p className="text-xs text-[var(--ink-soft)] mt-1 leading-relaxed">
+                        Controls connect/read timeouts, transient retry backoff, and optional fallback when a primary planning call times out.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                      <div>
+                        <label
+                          htmlFor="connect-timeout-seconds"
+                          className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+                        >
+                          Connect Timeout (s)
+                        </label>
+                        <input
+                          id="connect-timeout-seconds"
+                          type="number"
+                          min={5}
+                          max={120}
+                          value={llmConfig.planning_timeout?.connect_timeout_seconds ?? 20}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v)) {
+                              updatePlanningTimeout({ connect_timeout_seconds: Math.round(v) });
+                            }
+                          }}
+                          className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor="read-timeout-seconds"
+                          className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+                        >
+                          Read Timeout (s)
+                        </label>
+                        <input
+                          id="read-timeout-seconds"
+                          type="number"
+                          min={15}
+                          max={900}
+                          value={llmConfig.planning_timeout?.read_timeout_seconds ?? 180}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v)) {
+                              updatePlanningTimeout({ read_timeout_seconds: Math.round(v) });
+                            }
+                          }}
+                          className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor="timeout-max-retries"
+                          className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+                        >
+                          Max Transient Retries
+                        </label>
+                        <input
+                          id="timeout-max-retries"
+                          type="number"
+                          min={0}
+                          max={5}
+                          value={llmConfig.planning_timeout?.max_retries ?? 2}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v)) {
+                              updatePlanningTimeout({ max_retries: Math.round(v) });
+                            }
+                          }}
+                          className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs tabular-nums text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3 pt-1">
+                      <label className="inline-flex items-center gap-2.5 text-xs text-[var(--ink)] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(llmConfig.planning_timeout?.fallback_on_timeout)}
+                          onChange={(e) =>
+                            updatePlanningTimeout({ fallback_on_timeout: e.target.checked })
+                          }
+                          className="accent-[var(--signal)] w-4 h-4 cursor-pointer"
+                        />
+                        <span>Fallback to secondary model if primary planning times out</span>
+                      </label>
+                    </div>
+                    {llmConfig.planning_timeout?.fallback_on_timeout && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+                        <input
+                          type="text"
+                          value={llmConfig.planning_timeout.fallback_provider || ''}
+                          onChange={(e) =>
+                            updatePlanningTimeout({ fallback_provider: e.target.value || null })
+                          }
+                          placeholder="Fallback provider ID (blank = Sub-Agent provider)"
+                          aria-label="Fallback provider ID"
+                          className="h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                        />
+                        <input
+                          type="text"
+                          value={llmConfig.planning_timeout.fallback_model || ''}
+                          onChange={(e) =>
+                            updatePlanningTimeout({ fallback_model: e.target.value || null })
+                          }
+                          placeholder="Fallback model ID (blank = Sub-Agent model)"
+                          aria-label="Fallback model ID"
+                          className="h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                        />
+                      </div>
+                    )}
+                  </section>
+
+                  <div className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 flex flex-col sm:flex-row sm:items-center justify-between gap-5">
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-5">
+                        <div>
+                          <label
+                            htmlFor="max-turns-input"
+                            className="block text-sm font-medium text-[var(--ink)]"
+                          >
+                            Max Execution Turns
+                          </label>
+                          <p className="text-xs text-[var(--ink-faint)] mt-0.5">
+                            Upper bound on autonomous tool loops per request ({MIN_MAX_TURNS}–{MAX_MAX_TURNS}).
+                          </p>
+                        </div>
+                        <input
+                          id="max-turns-input"
+                          data-testid="max-turns-input"
+                          type="text"
+                          inputMode="numeric"
+                          aria-invalid={Boolean(maxTurnsError)}
+                          aria-describedby={maxTurnsError ? 'max-turns-error' : undefined}
+                          value={maxTurnsDraft}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setMaxTurnsDraft(raw);
+                            const check = parseMaxTurnsDraft(raw);
+                            if (check.valid && check.value !== undefined) {
+                              setMaxTurnsError(null);
+                              setLlmConfig({ ...llmConfig, max_turns: check.value });
+                            } else {
+                              setMaxTurnsError(check.error || null);
+                            }
+                          }}
+                          className={`w-28 h-10 px-3 rounded-lg border bg-[var(--paper)] font-mono text-sm tabular-nums text-[var(--ink)] focus:outline-none ${
+                            maxTurnsError
+                              ? 'border-[var(--flare)] focus:border-[var(--flare)]'
+                              : 'border-[var(--rule-strong)] focus:border-[var(--signal)]'
+                          }`}
+                        />
+                      </div>
+                      {maxTurnsError && (
+                        <p
+                          id="max-turns-error"
+                          data-testid="max-turns-error"
+                          role="alert"
+                          className="text-xs text-[var(--flare)]"
+                        >
+                          {maxTurnsError}
+                        </p>
+                      )}
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={llmSaving}
+                      className="h-10 px-6 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      <Save className="w-4 h-4" />
+                      <span>{llmSaving ? 'Saving...' : 'Save LLM Config'}</span>
+                    </button>
+                  </div>
+
+                  {/* Multiple Independent Custom Model Providers */}
+                  <CustomProvidersManager
+                    customProviders={llmConfig.custom_providers || []}
+                    onUpdated={({ custom_providers, providers: nextProviders, vault: nextVault }) => {
+                      const updatedConfig: PersistedLLMConfig = {
+                        ...llmConfig,
+                        custom_providers,
+                      };
+                      setLlmConfig(updatedConfig);
+                      setProviders(nextProviders);
+                      if (nextVault) setVault(nextVault);
+                      onLLMConfigSaved(updatedConfig, nextProviders);
+                    }}
+                  />
+
+                  {/* Per-Profile Encrypted API Key Vault */}
+                  <section
+                    aria-label="Profile API Key Vault"
+                    className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div>
+                        <h2 className="font-display text-base font-semibold text-[var(--ink)] flex items-center gap-2">
+                          <ShieldCheck className="w-4 h-4 text-[var(--jade)]" />
+                          <span>
+                            Profile API Key Vault ({vault?.username || 'admin'})
+                          </span>
+                        </h2>
+                        <p className="text-xs text-[var(--ink-soft)] mt-1 leading-relaxed">
+                          API keys are encrypted at rest on the server and automatically loaded whenever you sign in as{' '}
+                          <span className="font-mono text-[var(--ink)]">{vault?.username || 'admin'}</span>.
+                        </p>
+                      </div>
+                      <span className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[var(--jade)]">
+                        <Lock className="w-3 h-3" />
+                        <span>AES-256-GCM · Auto-loaded</span>
+                      </span>
+                    </div>
+
+                    {vaultMessage && (
+                      <div
+                        role={vaultMessage.type === 'error' ? 'alert' : 'status'}
+                        className={`rounded-lg px-4 py-2.5 text-xs border ${
+                          vaultMessage.type === 'ok'
+                            ? 'border-[var(--jade)]/35 bg-[var(--jade)]/10 text-[var(--jade)]'
+                            : 'border-[var(--flare)]/35 bg-[var(--flare)]/10 text-[var(--flare)]'
+                        }`}
+                      >
+                        {vaultMessage.text}
+                      </div>
+                    )}
+
+                    {vault && vault.entries.length > 0 ? (
+                      <div className="divide-y divide-[var(--rule)] border border-[var(--rule)] rounded-lg overflow-hidden">
+                        {vault.entries.map((entry) => (
+                          <div
+                            key={entry.env_var}
+                            className="px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 bg-[var(--paper)]"
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2.5">
+                                <span className="text-xs font-semibold text-[var(--ink)]">
+                                  {entry.provider_label}
+                                </span>
+                                <span className="font-mono text-[11px] text-[var(--ink-faint)]">
+                                  {entry.env_var}
+                                </span>
+                              </div>
+                              <div className="font-mono text-xs text-[var(--jade)] mt-1">
+                                {entry.masked_key}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={vaultBusy}
+                              onClick={() => void handleDeleteVaultKey(entry.env_var)}
+                              aria-label={`Remove ${entry.env_var} from profile vault`}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-[var(--rule)] text-xs text-[var(--ink-soft)] hover:text-[var(--flare)] hover:border-[var(--flare)]/40 disabled:opacity-50 transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Remove</span>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-[var(--ink-faint)]">
+                        No API keys stored in this profile vault yet. Add a provider key below or save one from either agent card above.
+                      </p>
+                    )}
+
+                    {/* Quick-Add Provider Key to Profile Vault */}
+                    <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-1">
+                      <div className="sm:col-span-4">
+                        <label htmlFor="vault-provider-select" className="sr-only">
+                          Provider for new vault API key
+                        </label>
+                        <select
+                          id="vault-provider-select"
+                          value={vaultProvider}
+                          onChange={(e) => setVaultProvider(e.target.value)}
+                          className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                        >
+                          {LLM_PROVIDER_PRESETS.filter((p) => p.requiresApiKey).map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.label} ({p.envVars[0] || 'PRIMARY_API_KEY'})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="sm:col-span-6 relative">
+                        <label htmlFor="vault-apikey-input" className="sr-only">
+                          API Key value
+                        </label>
+                        <input
+                          id="vault-apikey-input"
+                          type={showVaultKeyInput ? 'text' : 'password'}
+                          autoComplete="off"
+                          value={vaultKeyInput}
+                          onChange={(e) => setVaultKeyInput(e.target.value)}
+                          placeholder="Paste API key to store securely in your profile"
+                          className="w-full h-10 pl-3 pr-10 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] placeholder:text-[var(--ink-faint)] focus:outline-none focus:border-[var(--signal)]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowVaultKeyInput((v) => !v)}
+                          aria-label={showVaultKeyInput ? 'Hide vault API key' : 'Show vault API key'}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-[var(--ink-faint)] hover:text-[var(--ink)] cursor-pointer"
+                        >
+                          {showVaultKeyInput ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                      </div>
+                      <div className="sm:col-span-2">
+                        <button
+                          type="button"
+                          disabled={vaultBusy || !vaultKeyInput.trim()}
+                          onClick={() => void handleSaveVaultKey()}
+                          className="w-full h-10 px-3 inline-flex items-center justify-center gap-1.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] hover:text-[var(--signal)] disabled:opacity-45 text-xs font-semibold text-[var(--ink)] transition-colors cursor-pointer whitespace-nowrap"
+                        >
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>Store Key</span>
+                        </button>
+                      </div>
+                    </div>
+                  </section>
               </>
             ) : llmLoadError ? (
               <div
@@ -1414,7 +1802,7 @@ export function SettingsView({
 
         {/* TAB 2: ACCESSORIES (Multimodal Image / Video / Audio Sub-Agents) */}
         {activeTab === 'accessories' && (
-          <form onSubmit={(e) => void handleSaveLLM(e, 'accessories')} noValidate className="space-y-5">
+          <form onSubmit={(e) => void handleSaveLLM(e, 'accessories')} noValidate className="space-y-7">
             {llmConfig ? (
               (() => {
                 const accessories = normalizeAccessoriesConfig(llmConfig.accessories);
@@ -1438,13 +1826,13 @@ export function SettingsView({
                     )}
 
                     {/* Primary Model Multimodal Routing Overview */}
-                    <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 space-y-3.5">
-                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                    <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5">
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
                         <div className="min-w-0 flex-1">
                           <h2 className="font-display text-base font-semibold text-[var(--ink)]">
                             Multimodal Input Routing
                           </h2>
-                          <p className="text-xs text-[var(--ink-soft)] mt-0.5 leading-relaxed">
+                          <p className="text-xs text-[var(--ink-soft)] mt-1 leading-relaxed">
                             When you attach images, video, or audio in chat, Nemo sends supported modalities directly to your active Main Agent
                             {llmConfig.primary.model.trim() ? (
                               <>
@@ -1459,21 +1847,21 @@ export function SettingsView({
                         <button
                           type="button"
                           onClick={handleResetAccessoriesToDefault}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] text-xs font-medium text-[var(--ink)] transition-colors cursor-pointer shrink-0 self-start"
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] hover:border-[var(--signal)] text-xs font-medium text-[var(--ink)] transition-colors cursor-pointer shrink-0 self-start whitespace-nowrap"
                         >
                           <RotateCcw className="w-3.5 h-3.5 text-[var(--signal)]" />
                           <span>Use Nemotron Omni for all 3</span>
                         </button>
                       </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-1">
                         {ACCESSORY_META.map(({ modality, icon: ModIcon }) => {
                           const native = primaryModalities.has(modality);
                           const accEntry = accessories[modality];
                           return (
                             <div
                               key={modality}
-                              className="rounded-lg border border-[var(--rule)] bg-[var(--paper)] px-3.5 py-2.5 flex items-center justify-between gap-2"
+                              className="rounded-lg border border-[var(--rule)] bg-[var(--paper)] px-4 py-3.5 flex items-center justify-between gap-2.5"
                             >
                               <div className="flex items-center gap-2 min-w-0">
                                 <ModIcon className="w-4 h-4 text-[var(--signal)] shrink-0" />
@@ -1503,7 +1891,7 @@ export function SettingsView({
                     </section>
 
                     {/* Per-Modality Accessory Configuration Cards */}
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                       {ACCESSORY_META.map(({ modality, title, subtitle }) => {
                         const accCfg = accessories[modality];
                         const nativeSupported = primaryModalities.has(modality);
@@ -1521,6 +1909,7 @@ export function SettingsView({
                             roleKey={modality}
                             config={accCfg}
                             providers={providers}
+                            customProviders={llmConfig.custom_providers || []}
                             apiKeyDraft={accessoryApiKeys[modality]}
                             onApiKeyChange={(val) => {
                               setAccessoryApiKeys((prev) => ({ ...prev, [modality]: val }));
@@ -1545,14 +1934,14 @@ export function SettingsView({
                       })}
                     </div>
 
-                    <div className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 flex flex-col sm:flex-row sm:items-center justify-between gap-5">
                       <p className="text-xs text-[var(--ink-soft)] leading-relaxed">
                         Accessory API keys are encrypted in your signed-in profile vault ({vault?.username || 'admin'}) and reused automatically whenever a specialist sub-agent runs.
                       </p>
                       <button
                         type="submit"
                         disabled={llmSaving}
-                        className="h-10 px-5 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer shrink-0"
+                        className="h-10 px-6 inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer shrink-0 whitespace-nowrap"
                       >
                         <Save className="w-4 h-4" />
                         <span>{llmSaving ? 'Saving...' : 'Save Accessories'}</span>
@@ -1564,13 +1953,13 @@ export function SettingsView({
             ) : llmLoadError ? (
               <div
                 role="alert"
-                className="rounded-xl border border-[var(--flare)]/35 bg-[var(--flare)]/10 p-4 flex items-center justify-between gap-3 text-sm text-[var(--flare)]"
+                className="rounded-xl border border-[var(--flare)]/35 bg-[var(--flare)]/10 p-5 flex items-center justify-between gap-4 text-sm text-[var(--flare)]"
               >
                 <span>{llmLoadError}</span>
                 <button
                   type="button"
                   onClick={() => void loadAllSettings()}
-                  className="px-3 py-1.5 rounded-lg border border-[var(--flare)]/40 bg-[var(--paper)] text-xs font-medium text-[var(--ink)] hover:border-[var(--signal)] cursor-pointer shrink-0"
+                  className="px-3.5 py-2 rounded-lg border border-[var(--flare)]/40 bg-[var(--paper)] text-xs font-medium text-[var(--ink)] hover:border-[var(--signal)] cursor-pointer shrink-0"
                 >
                   Retry
                 </button>
@@ -1583,21 +1972,21 @@ export function SettingsView({
 
         {/* TAB 3: CHANGE PASSWORD */}
         {activeTab === 'password' && (
-          <section className="max-w-lg rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 space-y-5">
+          <section className="max-w-xl rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-7 sm:p-8 space-y-6">
             <div>
               <h2 className="font-display text-base font-semibold text-[var(--ink)]">
                 Change Administrator Password
               </h2>
-              <p className="mt-1 text-xs text-[var(--ink-soft)] leading-relaxed">
+              <p className="mt-1.5 text-xs text-[var(--ink-soft)] leading-relaxed">
                 Update the credentials protecting this public Nemofy Agent portal. Changing the password rotates active session tokens immediately.
               </p>
             </div>
 
-            <form onSubmit={handlePasswordSubmit} className="space-y-4">
+            <form onSubmit={handlePasswordSubmit} className="space-y-5">
               <div>
                 <label
                   htmlFor="current-password"
-                  className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+                  className="block text-xs font-medium text-[var(--ink)] mb-2"
                 >
                   Current Password
                 </label>
@@ -1609,7 +1998,7 @@ export function SettingsView({
                     value={currentPassword}
                     onChange={(e) => setCurrentPassword(e.target.value)}
                     placeholder="Enter current password"
-                    className="w-full h-10 pl-3 pr-10 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                    className="w-full h-11 pl-3.5 pr-10 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                   />
                   <button
                     type="button"
@@ -1625,7 +2014,7 @@ export function SettingsView({
               <div>
                 <label
                   htmlFor="new-password"
-                  className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+                  className="block text-xs font-medium text-[var(--ink)] mb-2"
                 >
                   New Password
                 </label>
@@ -1636,14 +2025,14 @@ export function SettingsView({
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   placeholder="At least 8 characters"
-                  className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                  className="w-full h-11 px-3.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                 />
               </div>
 
               <div>
                 <label
                   htmlFor="confirm-password"
-                  className="block text-xs font-medium text-[var(--ink)] mb-1.5"
+                  className="block text-xs font-medium text-[var(--ink)] mb-2"
                 >
                   Confirm New Password
                 </label>
@@ -1654,14 +2043,14 @@ export function SettingsView({
                   value={confirmPassword}
                   onChange={(e) => setConfirmPassword(e.target.value)}
                   placeholder="Re-enter new password"
-                  className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                  className="w-full h-11 px-3.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-sm text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                 />
               </div>
 
               {pwFeedback && (
                 <div
                   role={pwFeedback.type === 'error' ? 'alert' : 'status'}
-                  className={`rounded-lg px-3.5 py-2.5 text-xs border ${
+                  className={`rounded-lg px-4 py-3 text-xs border ${
                     pwFeedback.type === 'ok'
                       ? 'border-[var(--jade)]/35 bg-[var(--jade)]/10 text-[var(--jade)]'
                       : 'border-[var(--flare)]/35 bg-[var(--flare)]/10 text-[var(--flare)]'
@@ -1671,30 +2060,32 @@ export function SettingsView({
                 </div>
               )}
 
-              <button
-                type="submit"
-                disabled={pwSaving}
-                className="h-10 px-5 inline-flex items-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer"
-              >
-                <KeyRound className="w-4 h-4" />
-                <span>{pwSaving ? 'Updating...' : 'Update Password'}</span>
-              </button>
+              <div className="pt-1">
+                <button
+                  type="submit"
+                  disabled={pwSaving}
+                  className="h-10 px-6 inline-flex items-center gap-2 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer"
+                >
+                  <KeyRound className="w-4 h-4" />
+                  <span>{pwSaving ? 'Updating...' : 'Update Password'}</span>
+                </button>
+              </div>
             </form>
           </section>
         )}
 
-        {/* TAB 3: SKILLS & MCPS */}
+        {/* TAB 4: SKILLS & MCPS */}
         {activeTab === 'skills-mcps' && (
-          <div className="space-y-6">
+          <div className="space-y-7">
             {/* Dynamic Skills */}
-            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 sm:p-6 space-y-4">
-              <div className="flex items-center justify-between gap-3">
+            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5">
+              <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
                   <h2 className="font-display text-base font-semibold text-[var(--ink)] flex items-center gap-2">
                     <Sparkles className="w-4 h-4 text-[var(--signal)]" />
                     <span>Agent Skills (/Skills)</span>
                   </h2>
-                  <p className="text-xs text-[var(--ink-soft)] mt-0.5">
+                  <p className="text-xs text-[var(--ink-soft)] mt-1">
                     Markdown playbooks loaded dynamically by the Python agent runtime.
                   </p>
                 </div>
@@ -1707,19 +2098,19 @@ export function SettingsView({
                       '---\nname: custom_skill\ndescription: Describe when the agent should load this skill.\n---\n\n# Custom Skill Instructions\n\n- Step 1\n- Step 2\n',
                     );
                   }}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--rule-strong)] text-xs font-medium text-[var(--ink)] hover:border-[var(--signal)] cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs font-medium text-[var(--ink)] hover:border-[var(--signal)] cursor-pointer whitespace-nowrap"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>New Skill</span>
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className="space-y-1.5">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="space-y-2">
                   {skills.map((s) => (
                     <div
                       key={s.name}
-                      className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs ${
+                      className={`flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-lg border text-xs ${
                         selectedSkillName === s.name
                           ? 'border-[var(--signal)] bg-[var(--blush)] text-[var(--signal)] font-medium'
                           : 'border-[var(--rule)] bg-[var(--paper)] text-[var(--ink-soft)]'
@@ -1751,9 +2142,9 @@ export function SettingsView({
                   )}
                 </div>
 
-                <form onSubmit={handleSaveSkill} className="md:col-span-2 space-y-3">
+                <form onSubmit={handleSaveSkill} className="md:col-span-2 space-y-4">
                   <div>
-                    <label htmlFor="skill-name" className="block text-xs font-medium text-[var(--ink)] mb-1">
+                    <label htmlFor="skill-name" className="block text-xs font-medium text-[var(--ink)] mb-1.5">
                       Skill Name
                     </label>
                     <input
@@ -1761,19 +2152,19 @@ export function SettingsView({
                       type="text"
                       value={skillDraftName}
                       onChange={(e) => setSkillDraftName(e.target.value)}
-                      className="w-full h-9 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                      className="w-full h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                     />
                   </div>
                   <div>
-                    <label htmlFor="skill-body" className="block text-xs font-medium text-[var(--ink)] mb-1">
+                    <label htmlFor="skill-body" className="block text-xs font-medium text-[var(--ink)] mb-1.5">
                       Markdown Content
                     </label>
                     <textarea
                       id="skill-body"
-                      rows={8}
+                      rows={10}
                       value={skillDraftContent}
                       onChange={(e) => setSkillDraftContent(e.target.value)}
-                      className="w-full p-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)] scrollbar-none"
+                      className="w-full p-3.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs leading-relaxed text-[var(--ink)] focus:outline-none focus:border-[var(--signal)] scrollbar-none"
                     />
                   </div>
                   <div className="flex items-center justify-between gap-3">
@@ -1785,7 +2176,7 @@ export function SettingsView({
                     </span>
                     <button
                       type="submit"
-                      className="h-9 px-4 inline-flex items-center gap-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer"
+                      className="h-10 px-5 inline-flex items-center gap-1.5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
                     >
                       <Save className="w-3.5 h-3.5" />
                       <span>Save Skill</span>
@@ -1796,13 +2187,13 @@ export function SettingsView({
             </section>
 
             {/* Pure-Python MCP Servers */}
-            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-5 sm:p-6 space-y-4">
+            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5">
               <div>
                 <h2 className="font-display text-base font-semibold text-[var(--ink)] flex items-center gap-2">
                   <Server className="w-4 h-4 text-[var(--signal)]" />
                   <span>MCP Servers (/MCPs/servers.json)</span>
                 </h2>
-                <p className="text-xs text-[var(--ink-soft)] mt-0.5">
+                <p className="text-xs text-[var(--ink-soft)] mt-1">
                   Attach external Model Context Protocol (MCP) tool servers directly to the pure-Python Agent-Core.
                 </p>
               </div>
@@ -1812,19 +2203,19 @@ export function SettingsView({
                   {mcpServers.map((srv, idx) => (
                     <div
                       key={`${srv.name}-${idx}`}
-                      className="px-4 py-3 flex flex-wrap items-center justify-between gap-3 bg-[var(--paper)]"
+                      className="px-5 py-4 flex flex-wrap items-center justify-between gap-4 bg-[var(--paper)]"
                     >
                       <div className="min-w-0">
                         <div className="text-sm font-medium text-[var(--ink)]">{srv.name}</div>
-                        <div className="font-mono text-xs text-[var(--ink-faint)] truncate">
+                        <div className="font-mono text-xs text-[var(--ink-faint)] truncate mt-0.5">
                           {srv.url} ({srv.transport})
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2.5">
                         <button
                           type="button"
                           onClick={() => void handleToggleMcp(idx)}
-                          className={`px-2.5 py-1 rounded-md text-xs font-medium border cursor-pointer ${
+                          className={`px-3 py-1.5 rounded-md text-xs font-medium border cursor-pointer ${
                             srv.enabled
                               ? 'border-[var(--jade)]/40 bg-[var(--jade)]/10 text-[var(--jade)]'
                               : 'border-[var(--rule)] text-[var(--ink-faint)]'
@@ -1857,7 +2248,7 @@ export function SettingsView({
                   onChange={(e) => setNewMcpName(e.target.value)}
                   placeholder="Server name (e.g. github)"
                   aria-label="MCP server name"
-                  className="h-9 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                  className="h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                 />
                 <input
                   type="url"
@@ -1865,21 +2256,21 @@ export function SettingsView({
                   onChange={(e) => setNewMcpUrl(e.target.value)}
                   placeholder="https://mcp.example.com/mcp"
                   aria-label="MCP server URL"
-                  className="sm:col-span-2 h-9 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                  className="sm:col-span-2 h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                 />
                 <div className="flex gap-2">
                   <select
                     value={newMcpTransport}
                     onChange={(e) => setNewMcpTransport(e.target.value as 'streamable_http' | 'sse')}
                     aria-label="MCP transport"
-                    className="flex-1 h-9 px-2 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)]"
+                    className="flex-1 h-10 px-2.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] text-xs text-[var(--ink)]"
                   >
                     <option value="streamable_http">HTTP</option>
                     <option value="sse">SSE</option>
                   </select>
                   <button
                     type="submit"
-                    className="h-9 px-3 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer"
+                    className="h-10 px-4 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
                   >
                     Add
                   </button>
@@ -1897,63 +2288,63 @@ export function SettingsView({
           </div>
         )}
 
-        {/* TAB 4: APPEARANCE & RUNTIME */}
+        {/* TAB 5: APPEARANCE & RUNTIME */}
         {activeTab === 'appearance' && (
-          <div className="space-y-6 max-w-2xl">
-            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 space-y-4">
+          <div className="space-y-7 max-w-3xl">
+            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5">
               <div>
                 <h2 className="font-display text-base font-semibold text-[var(--ink)]">
                   Theme Appearance
                 </h2>
-                <p className="text-xs text-[var(--ink-soft)] mt-0.5">
+                <p className="text-xs text-[var(--ink-soft)] mt-1">
                   Synced with the Nemofy brand light and dark palettes.
                 </p>
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <button
                   type="button"
                   onClick={() => onSetTheme('light')}
-                  className={`p-4 rounded-xl border text-left transition-colors cursor-pointer ${
+                  className={`p-5 rounded-xl border text-left transition-colors cursor-pointer ${
                     theme === 'light'
                       ? 'border-[var(--signal)] bg-[var(--blush)]'
                       : 'border-[var(--rule)] bg-[var(--paper)] hover:border-[var(--rule-strong)]'
                   }`}
                 >
-                  <Sun className="w-5 h-5 text-[var(--honey)] mb-2" />
+                  <Sun className="w-5 h-5 text-[var(--honey)] mb-2.5" />
                   <div className="text-sm font-semibold text-[var(--ink)]">Light Mode</div>
-                  <div className="text-xs text-[var(--ink-soft)] mt-0.5">
+                  <div className="text-xs text-[var(--ink-soft)] mt-1">
                     Crisp paper canvas &amp; indigo signal
                   </div>
                 </button>
                 <button
                   type="button"
                   onClick={() => onSetTheme('dark')}
-                  className={`p-4 rounded-xl border text-left transition-colors cursor-pointer ${
+                  className={`p-5 rounded-xl border text-left transition-colors cursor-pointer ${
                     theme === 'dark'
                       ? 'border-[var(--signal)] bg-[var(--blush)]'
                       : 'border-[var(--rule)] bg-[var(--paper)] hover:border-[var(--rule-strong)]'
                   }`}
                 >
-                  <Moon className="w-5 h-5 text-[var(--signal)] mb-2" />
+                  <Moon className="w-5 h-5 text-[var(--signal)] mb-2.5" />
                   <div className="text-sm font-semibold text-[var(--ink)]">Dark Mode</div>
-                  <div className="text-xs text-[var(--ink-soft)] mt-0.5">
+                  <div className="text-xs text-[var(--ink-soft)] mt-1">
                     Deep navy surface &amp; bright slate ink
                   </div>
                 </button>
               </div>
             </section>
 
-            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 space-y-4">
+            <section className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5">
               <div>
                 <h2 className="font-display text-base font-semibold text-[var(--ink)]">
                   Python Agent-Core Backend
                 </h2>
-                <p className="text-xs text-[var(--ink-soft)] mt-0.5">
+                <p className="text-xs text-[var(--ink-soft)] mt-1 leading-relaxed">
                   When deploying this Nemofy Agent web folder on Vercel, set your hosted Agent-Core server URL below (or leave blank when served from the unified server).
                 </p>
               </div>
 
-              <form onSubmit={handleSaveRemoteBackend} className="flex flex-col sm:flex-row gap-2.5">
+              <form onSubmit={handleSaveRemoteBackend} className="flex flex-col sm:flex-row gap-3">
                 <label htmlFor="remote-backend-url" className="sr-only">
                   Remote Agent-Core Backend URL
                 </label>
@@ -1963,11 +2354,11 @@ export function SettingsView({
                   value={remoteUrl}
                   onChange={(e) => setRemoteUrl(e.target.value)}
                   placeholder="https://agent-api.yourdomain.com (leave empty for same-origin)"
-                  className="flex-1 h-10 px-3 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
+                  className="flex-1 h-10 px-3.5 rounded-lg border border-[var(--rule-strong)] bg-[var(--paper)] font-mono text-xs text-[var(--ink)] focus:outline-none focus:border-[var(--signal)]"
                 />
                 <button
                   type="submit"
-                  className="h-10 px-4 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer"
+                  className="h-10 px-5 rounded-lg bg-[var(--signal)] hover:bg-[var(--signal-hover)] text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
                 >
                   Save Endpoint
                 </button>
@@ -1980,16 +2371,16 @@ export function SettingsView({
                 </p>
               )}
 
-              <div className="pt-3 border-t border-[var(--rule)] grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div className="pt-4 border-t border-[var(--rule)] grid grid-cols-1 sm:grid-cols-2 gap-5 text-xs">
                 <div>
                   <div className="text-[var(--ink-faint)]">Deployment Mode</div>
-                  <div className="font-mono text-[var(--ink)] mt-0.5">
-                    {isStandaloneMode() ? 'Standalone Frontend (Vercel)' : 'Full-Stack Server + Agent-Core'}
+                  <div className="font-mono text-[var(--ink)] mt-1">
+                    {isStandaloneMode() ? 'Standalone Frontend' : 'Full-Stack Server + Agent-Core'}
                   </div>
                 </div>
                 <div>
                   <div className="text-[var(--ink-faint)]">Python Sandbox Backend</div>
-                  <div className="font-mono text-[var(--ink)] mt-0.5">
+                  <div className="font-mono text-[var(--ink)] mt-1">
                     {health?.core?.sandbox?.backend ||
                       health?.core?.sandbox_backend ||
                       (health?.connected ? 'Connected' : 'Standby')}
@@ -1997,8 +2388,88 @@ export function SettingsView({
                 </div>
               </div>
             </section>
+
+            {/* Sandbox Local Shell Execution Permission (ALLOW_UNSAFE_LOCAL_BASH) */}
+            <section
+              data-testid="sandbox-unsafe-bash-section"
+              className="rounded-xl border border-[var(--rule)] bg-[var(--paper-raised)] p-6 sm:p-7 space-y-5"
+            >
+              <div className="flex items-start justify-between gap-5">
+                <div className="min-w-0">
+                  <h2 className="font-display text-base font-semibold text-[var(--ink)] flex items-center gap-2">
+                    <Terminal className="w-4 h-4 text-[var(--flare)]" />
+                    <span>Unsafe Local Shell Execution</span>
+                  </h2>
+                  <p className="text-xs text-[var(--ink-soft)] mt-1.5 leading-relaxed">
+                    Controls <code className="font-mono text-[var(--ink)]">ALLOW_UNSAFE_LOCAL_BASH</code> on the backend Python sandbox runtime. Disabled by default unless explicitly enabled here or in your environment configuration.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={Boolean(llmConfig?.allow_unsafe_local_bash)}
+                  aria-label="Toggle ALLOW_UNSAFE_LOCAL_BASH"
+                  data-testid="toggle-allow-unsafe-local-bash"
+                  disabled={unsafeBashBusy || !llmConfig}
+                  onClick={() =>
+                    void handleToggleAllowUnsafeLocalBash(!Boolean(llmConfig?.allow_unsafe_local_bash))
+                  }
+                  className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors cursor-pointer disabled:opacity-50 ${
+                    llmConfig?.allow_unsafe_local_bash
+                      ? 'bg-[var(--flare)] border-[var(--flare)]'
+                      : 'bg-[var(--paper-sunk)] border-[var(--rule-strong)]'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                      llmConfig?.allow_unsafe_local_bash ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="rounded-lg border border-[var(--flare)]/40 bg-[var(--flare)]/8 px-4 py-3.5 flex items-start gap-3 text-xs text-[var(--ink-soft)] leading-relaxed">
+                <AlertTriangle className="w-4 h-4 text-[var(--flare)] shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold text-[var(--flare)]">Security Warning:</span> Enabling{' '}
+                  <code className="font-mono text-[var(--ink)]">ALLOW_UNSAFE_LOCAL_BASH</code> permits the agent to run local host shell commands directly when Docker sandbox isolation is unavailable. Potentially dangerous commands could modify host files or expose local environment state. Leave this disabled unless you explicitly trust the workspace and prompts.
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 text-xs pt-0.5">
+                <span className="font-mono text-[var(--ink-faint)]">
+                  Current state:{' '}
+                  <span
+                    data-testid="unsafe-bash-status-label"
+                    className={
+                      llmConfig?.allow_unsafe_local_bash
+                        ? 'text-[var(--flare)] font-semibold'
+                        : 'text-[var(--jade)] font-semibold'
+                    }
+                  >
+                    {llmConfig?.allow_unsafe_local_bash
+                      ? 'Enabled (Local Shell Permitted)'
+                      : 'Disabled (Safe Default)'}
+                  </span>
+                </span>
+                {unsafeBashFeedback && (
+                  <span
+                    role={unsafeBashFeedback.type === 'error' ? 'alert' : 'status'}
+                    className={
+                      unsafeBashFeedback.type === 'ok'
+                        ? 'text-[var(--jade)]'
+                        : 'text-[var(--flare)]'
+                    }
+                  >
+                    {unsafeBashFeedback.text}
+                  </span>
+                )}
+              </div>
+            </section>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

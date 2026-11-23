@@ -6,10 +6,21 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
-    "build": "vite build",
+    "build": "bash scripts/build-runtime-deps.sh && vite build",
+    "build:frontend": "vite build",
+    "build:host": "npm run build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f --tail=100",
+    "docker:config": "docker compose config",
+    "firecrawl:install": "bash scripts/install-firecrawl-local.sh",
+    "firecrawl:rebuild": "FIRECRAWL_FORCE_REBUILD=1 bash scripts/install-firecrawl-local.sh",
+    "firecrawl:serve": "bash scripts/run-firecrawl-local.sh",
+    "firecrawl:check": "bash scripts/check-firecrawl.sh",
+    "chromium:install": "bash scripts/install-chromium.sh"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
