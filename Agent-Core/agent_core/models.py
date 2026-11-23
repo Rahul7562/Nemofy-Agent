@@ -223,7 +223,7 @@ class ModelSpec:
     model: str
     base_url: str
     api_key: str | None
-    temperature: float = 0.2
+    temperature: float = 1.0
     max_tokens: int = 16384
     timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -536,7 +536,7 @@ def load_model_spec(
             source_env,
             allow_explicit_fallback=bool(raw_env_provider) or is_custom_provider_id(provider),
         )
-        temperature = _parse_float(source_env.get("PRIMARY_TEMPERATURE"), 0.2, min_val=0.0)
+        temperature = _parse_float(source_env.get("PRIMARY_TEMPERATURE"), 1.0, min_val=0.0)
         max_tokens = _parse_int(source_env.get("PRIMARY_MAX_TOKENS"), 16384, min_val=64)
         reasoning_effort = (source_env.get("PRIMARY_REASONING_EFFORT") or "").strip() or None
     else:
@@ -552,7 +552,7 @@ def load_model_spec(
             source_env,
             allow_explicit_fallback=bool(raw_env_worker) or is_custom_provider_id(provider),
         )
-        temperature = _parse_float(source_env.get("WORKER_TEMPERATURE"), 0.1, min_val=0.0)
+        temperature = _parse_float(source_env.get("WORKER_TEMPERATURE"), 0.2, min_val=0.0)
         max_tokens = _parse_int(source_env.get("WORKER_MAX_TOKENS"), 8192, min_val=64)
         reasoning_effort = (source_env.get("WORKER_REASONING_EFFORT") or "").strip() or None
 

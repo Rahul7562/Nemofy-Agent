@@ -1297,7 +1297,7 @@ export class WorkspaceAndConfigStore {
           process.env.PRIMARY_BASE_URL ||
           PROVIDER_DEFAULTS[defaultPrimaryProvider]?.baseUrl ||
           'https://api.river.ai/v1',
-        temperature: Number(process.env.PRIMARY_TEMPERATURE || '0.2'),
+        temperature: Number(process.env.PRIMARY_TEMPERATURE || '1.0'),
         max_tokens: Number(process.env.PRIMARY_MAX_TOKENS || '16384'),
         reasoning_effort: process.env.PRIMARY_REASONING_EFFORT || 'off',
       },
@@ -1308,7 +1308,7 @@ export class WorkspaceAndConfigStore {
           process.env.WORKER_BASE_URL ||
           PROVIDER_DEFAULTS[defaultWorkerProvider]?.baseUrl ||
           'https://api.river.ai/v1',
-        temperature: Number(process.env.WORKER_TEMPERATURE || '0.1'),
+        temperature: Number(process.env.WORKER_TEMPERATURE || '0.2'),
         max_tokens: Number(process.env.WORKER_MAX_TOKENS || '8192'),
         reasoning_effort: process.env.WORKER_REASONING_EFFORT || 'off',
       },
