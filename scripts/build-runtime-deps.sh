@@ -14,5 +14,12 @@ if [ "${SKIP_RUNTIME_DEPS_BUILD:-0}" = "1" ]; then
   exit 0
 fi
 
-bash "${ROOT_DIR}/scripts/install-firecrawl-local.sh"
+if command -v firecrawl-local >/dev/null 2>&1 \
+  || [ -x "${ROOT_DIR}/.firecrawl/bin/firecrawl-local" ] \
+  || command -v cargo >/dev/null 2>&1 \
+  || [ "${FORCE_INSTALL_RUNTIME_DEPS:-0}" = "1" ]; then
+  bash "${ROOT_DIR}/scripts/install-firecrawl-local.sh"
+else
+  echo "[build-runtime-deps] firecrawl-local & cargo not found; skipping Rust build (run 'bash scripts/install-firecrawl-local.sh' or set FORCE_INSTALL_RUNTIME_DEPS=1 to install)."
+fi
 bash "${ROOT_DIR}/scripts/install-chromium.sh"

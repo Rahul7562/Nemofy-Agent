@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool, StructuredTool, tool
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_core.firecrawl import (
     FirecrawlClient,
@@ -318,14 +319,35 @@ async def extract_structured_with_llm(
         return _parse_llm_json_payload(rep_text)
 
 
+class _WebExtractArgs(BaseModel):
+    """Input schema for ``web_extract`` using alias ``schema_json`` to avoid Pydantic v2 BaseModel shadowing."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    urls: list[str] = Field(
+        ...,
+        description="List of public http(s) URLs (or wildcard URL patterns) to extract from.",
+    )
+    prompt: str = Field(
+        ...,
+        description="Clear natural-language description of the structured facts to extract.",
+    )
+    json_schema: str | None = Field(
+        default=None,
+        alias="schema_json",
+        description="Optional JSON Schema string constraining the extracted output object.",
+    )
+
+
 def build_local_tools(
     sandbox: SandboxManager,
     *,
     allow_private_web_fetch: bool = False,
     firecrawl_client: FirecrawlClient | None = None,
     extract_model_factory: Callable[[], Any] | None = None,
+    include_web_tools: bool = True,
 ) -> list[BaseTool]:
-    """Create local sandbox tools and official Firecrawl Local web research tools bound to ``sandbox``."""
+    """Create local sandbox tools and (optionally) official Firecrawl Local web research tools bound to ``sandbox``."""
     fc_client = firecrawl_client or FirecrawlClient()
 
     @tool("bash_exec")
@@ -607,23 +629,12 @@ def build_local_tools(
         except FirecrawlError as exc:
             return f"ERROR [firecrawl/{exc.category}]: {exc}"
 
-    @tool("web_extract")
-    async def web_extract(
+    async def _web_extract(
         urls: list[str],
         prompt: str,
-        schema_json: str | None = None,
+        json_schema: str | None = None,
     ) -> str:
-        """Extract structured JSON data from one or more public URLs via Firecrawl Local.
-
-        Uses /v2/extract when Firecrawl Cloud credentials are configured; when running keyless
-        on Firecrawl Local, scrapes pages via Firecrawl Local /v2/scrape and structures JSON
-        using the active session LLM.
-
-        Args:
-            urls: List of public http(s) URLs (or wildcard URL patterns) to extract from.
-            prompt: Clear natural-language description of the structured facts to extract.
-            schema_json: Optional JSON Schema string constraining the extracted output object.
-        """
+        schema_json = json_schema
         if not urls:
             return "ERROR: At least one URL is required for web_extract."
 
@@ -700,12 +711,28 @@ def build_local_tools(
                 + "\n\n---\n\n".join(blocks)
             )
 
-    return [
+    web_extract = StructuredTool.from_function(
+        coroutine=_web_extract,
+        name="web_extract",
+        description=(
+            "Extract structured JSON data from one or more public URLs via Firecrawl Local. "
+            "Uses /v2/extract when Firecrawl Cloud credentials are configured; when running keyless "
+            "on Firecrawl Local, scrapes pages via /v2/scrape and structures JSON using the active session LLM."
+        ),
+        args_schema=_WebExtractArgs,
+    )
+
+    workspace_tools: list[BaseTool] = [
         bash_exec,
         read_file,
         write_file,
         edit_file,
         list_dir,
+    ]
+    if not include_web_tools:
+        return workspace_tools
+    return [
+        *workspace_tools,
         web_search,
         web_fetch,
         web_map,

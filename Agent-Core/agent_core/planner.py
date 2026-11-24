@@ -168,80 +168,162 @@ def build_supervisor_system_prompt(
     plan: list[PlanStep],
     turn_count: int,
     max_turns: int,
+    persona: Any | None = None,
+    enable_skills: bool = True,
 ) -> str:
-    """Build the LangGraph supervisor system prompt with compact skill catalog injection."""
+    """Build the LangGraph supervisor system prompt with compact skill catalog injection.
+
+    When ``persona`` is omitted (or is the default Nemofy persona), emits the exact
+    Nemofy production prompt. External consumers can supply a custom ``AgentPersona``
+    (with ``name``/``organization``/``role_description``, ``custom_system_prompt``, or
+    a full ``system_prompt_builder`` callback) to reuse the supervisor in any domain.
+    """
+    if persona is not None and getattr(persona, "system_prompt_builder", None) is not None:
+        return str(
+            persona.system_prompt_builder(
+                skill_catalog_text=skill_catalog_text,
+                loaded_skills_text=loaded_skills_text,
+                available_tool_names=list(available_tool_names),
+                plan=list(plan),
+                turn_count=turn_count,
+                max_turns=max_turns,
+                persona=persona,
+            )
+        )
+
     tools_line = ", ".join(sorted(available_tool_names)) if available_tool_names else "(none)"
     plan_text = format_plan_for_prompt(plan)
 
-    sections = [
-        (
-            "You are Nemo, the AI assistant working inside Nemofy Agent. "
-            "You are diligent, honest, warm, and friendly, capable of helping with everything "
-            "from quick everyday questions and writing to complex multi-step research, data "
-            "analysis, coding, and workspace automation. Never introduce yourself as a 'pure-Python "
-            "agent' or describe internal graph plumbing unless the user specifically asks about "
-            "the underlying architecture."
-        ),
-        (
-            "Workspace & capabilities:\n"
-            "- Workspace & host tools: bash_exec, read_file, write_file, edit_file, and list_dir start "
-            "with the workspace root (/workspace) as the default working directory. File tools accept "
-            "relative paths (e.g. 'src/app.py'), '/workspace/...', or absolute host paths (including "
-            "'/root/...') when ALLOW_UNSAFE_LOCAL_BASH is enabled. read_file returns numbered lines with "
-            "explicit pagination metadata (lines shown, total lines, and next start_line when more content "
-            "remains) AND automatically parses local PDF and Office documents (.pdf, .docx, .doc, .xlsx, "
-            ".xls, .pptx, .ppt, .odt, .ods, .odp, .rtf, .epub) into clean Markdown via Firecrawl Local; "
-            "use start_line and end_line to read large files sequentially without missing content. Inside "
-            "scripts or code run via bash_exec, the current working directory (CWD) is already the workspace "
-            "root and $WORKSPACE points to it — use relative paths (e.g. 'data.txt') or "
-            "os.environ.get('WORKSPACE', '.') rather than hardcoding literal '/workspace/...' paths.\n"
-            "- Web & document tools (Firecrawl Local): Use web_search(query, max_results) to search the live web, "
-            "web_fetch(url) to scrape webpages (including JS-rendered pages via Chromium), remote PDFs, and "
-            "remote Office documents (.docx, .xlsx, .pptx, .odt, .rtf, .epub) into Markdown, web_map(url, search) "
-            "to discover URLs on a site, web_crawl(url, limit, max_depth) to crawl linked pages, and "
-            "web_extract(urls, prompt, schema_json) to extract structured data. Always preserve and cite exact source URLs.\n"
-            "- Multimodal inputs: When images, videos, or audio are attached, modalities your model "
-            "accepts natively are embedded directly in the user message; unsupported modalities are "
-            "analyzed automatically by a specialist Accessory sub-agent whose verified findings appear "
-            "under [MULTIMODAL ACCESSORY SUB-AGENT REPORTS]. Use those findings directly to answer.\n"
-            "- External integrations: Connected Model Context Protocol (MCP) tools handle live "
-            "external services when configured.\n"
-            "- Skills: Call load_skill(name) FIRST whenever a task matches a skill in the catalog "
-            "and follow its instructions carefully.\n"
-            "- Delegation: Use spawn_subagent for large independent workstreams (deep research, "
-            "repo audits, code review, data analysis, documentation).\n"
-            "- Safety & honesty: Never fabricate tool outputs, file contents, or facts. If "
-            "something is uncertain or fails, say so honestly and clearly. Sensitive actions pause "
-            "for explicit human approval."
-        ),
-        f"Turn budget: {turn_count}/{max_turns}\nAvailable tools: {tools_line}",
-        f"Available skills (metadata only — call load_skill(name) to load full instructions):\n"
-        f"{skill_catalog_text}",
-    ]
+    use_default_nemofy = persona is None or bool(getattr(persona, "is_default_nemofy", False))
+    if use_default_nemofy:
+        sections = [
+            (
+                "You are Nemo, the AI assistant working inside Nemofy Agent. "
+                "You are diligent, honest, warm, and friendly, capable of helping with everything "
+                "from quick everyday questions and writing to complex multi-step research, data "
+                "analysis, coding, and workspace automation. Never introduce yourself as a 'pure-Python "
+                "agent' or describe internal graph plumbing unless the user specifically asks about "
+                "the underlying architecture."
+            ),
+            (
+                "Workspace & capabilities:\n"
+                "- Workspace & host tools: bash_exec, read_file, write_file, edit_file, and list_dir start "
+                "with the workspace root (/workspace) as the default working directory. File tools accept "
+                "relative paths (e.g. 'src/app.py'), '/workspace/...', or absolute host paths (including "
+                "'/root/...') when ALLOW_UNSAFE_LOCAL_BASH is enabled. read_file returns numbered lines with "
+                "explicit pagination metadata (lines shown, total lines, and next start_line when more content "
+                "remains) AND automatically parses local PDF and Office documents (.pdf, .docx, .doc, .xlsx, "
+                ".xls, .pptx, .ppt, .odt, .ods, .odp, .rtf, .epub) into clean Markdown via Firecrawl Local; "
+                "use start_line and end_line to read large files sequentially without missing content. Inside "
+                "scripts or code run via bash_exec, the current working directory (CWD) is already the workspace "
+                "root and $WORKSPACE points to it — use relative paths (e.g. 'data.txt') or "
+                "os.environ.get('WORKSPACE', '.') rather than hardcoding literal '/workspace/...' paths.\n"
+                "- Web & document tools (Firecrawl Local): Use web_search(query, max_results) to search the live web, "
+                "web_fetch(url) to scrape webpages (including JS-rendered pages via Chromium), remote PDFs, and "
+                "remote Office documents (.docx, .xlsx, .pptx, .odt, .rtf, .epub) into Markdown, web_map(url, search) "
+                "to discover URLs on a site, web_crawl(url, limit, max_depth) to crawl linked pages, and "
+                "web_extract(urls, prompt, schema_json) to extract structured data. Always preserve and cite exact source URLs.\n"
+                "- Multimodal inputs: When images, videos, or audio are attached, modalities your model "
+                "accepts natively are embedded directly in the user message; unsupported modalities are "
+                "analyzed automatically by a specialist Accessory sub-agent whose verified findings appear "
+                "under [MULTIMODAL ACCESSORY SUB-AGENT REPORTS]. Use those findings directly to answer.\n"
+                "- External integrations: Connected Model Context Protocol (MCP) tools handle live "
+                "external services when configured.\n"
+                "- Skills: Call load_skill(name) FIRST whenever a task matches a skill in the catalog "
+                "and follow its instructions carefully.\n"
+                "- Delegation: Use spawn_subagent for large independent workstreams (deep research, "
+                "repo audits, code review, data analysis, documentation).\n"
+                "- Safety & honesty: Never fabricate tool outputs, file contents, or facts. If "
+                "something is uncertain or fails, say so honestly and clearly. Sensitive actions pause "
+                "for explicit human approval."
+            ),
+            f"Turn budget: {turn_count}/{max_turns}\nAvailable tools: {tools_line}",
+            f"Available skills (metadata only — call load_skill(name) to load full instructions):\n"
+            f"{skill_catalog_text}",
+        ]
+        if loaded_skills_text:
+            sections.append(f"Currently loaded skill instructions:\n{loaded_skills_text}")
+        sections.append(f"Current execution plan:\n{plan_text}")
+        sections.append(
+            "Execution, accuracy & presentation rules:\n"
+            "1. Do not re-execute steps already marked COMPLETED.\n"
+            "2. Verify non-trivial math, statistics, parsing, or code logic with bash_exec (Python) "
+            "instead of guessing mentally.\n"
+            "3. Never fabricate tool outputs, file contents, or external facts; ground every claim "
+            "in observed tool output or mark uncertainty explicitly.\n"
+            "4. Only call tools needed for the active step; if a tool fails, inspect the error and "
+            "recover within bounded retries.\n"
+            "5. Keep individual write_file calls concise so they never truncate mid-JSON; for large "
+            "files (>200 lines), write a clean base with write_file and extend with edit_file or a "
+            "short Python script via bash_exec. Before compiling/simulating in specialized toolchains, "
+            "check tool availability with `which` and if unavailable, report honestly or verify with "
+            "a Python reference model/testbench.\n"
+            "6. Format final responses clearly in GitHub-Flavored Markdown: use **bold** for key "
+            "points, concise headings, bullet/numbered lists, Markdown data tables (`| col | col |`) "
+            "for comparisons or structured datasets, fenced code blocks with language tags for code, "
+            "and clean monospace ASCII charts/diagrams (fenced with ```ascii or ```chart) whenever "
+            "visualizing trends, architectures, or distributions helps the user."
+        )
+        return "\n\n".join(sections)
 
+    # Generalized custom persona prompt (adapts capability sections to registered tools)
+    tool_set = set(available_tool_names)
+    custom_prompt = getattr(persona, "custom_system_prompt", None)
+    sections = []
+    if isinstance(custom_prompt, str) and custom_prompt.strip():
+        sections.append(custom_prompt.strip())
+    else:
+        p_name = str(getattr(persona, "name", "Assistant")).strip() or "Assistant"
+        p_org = str(getattr(persona, "organization", "")).strip()
+        p_role = str(getattr(persona, "role_description", "")).strip()
+        ws_label = str(getattr(persona, "workspace_label", "/workspace")).strip() or "/workspace"
+        intro = f"You are {p_name}" + (f", operating inside {p_org}." if p_org else ".")
+        if p_role:
+            intro = f"{intro} {p_role}"
+        sections.append(intro)
+
+        cap_lines: list[str] = []
+        if tool_set & {"bash_exec", "read_file", "write_file", "edit_file", "list_dir"}:
+            cap_lines.append(
+                f"- Workspace tools: Operate cleanly inside {ws_label} using the registered "
+                "file and shell tools. Never fabricate file contents or command output."
+            )
+        if tool_set & {"web_search", "web_fetch", "web_map", "web_crawl", "web_extract"}:
+            cap_lines.append(
+                "- Web research tools: Use registered web tools for live discovery and always cite exact source URLs."
+            )
+        if enable_skills and "load_skill" in tool_set:
+            cap_lines.append(
+                "- Skills: Call load_skill(name) first whenever a task matches an available skill."
+            )
+        if "spawn_subagent" in tool_set:
+            cap_lines.append(
+                "- Delegation: Use spawn_subagent for large independent workstreams."
+            )
+        cap_lines.append(
+            "- Safety & honesty: Ground every claim in observed tool output, report failures "
+            "honestly, and respect human-in-the-loop approval gates for sensitive actions."
+        )
+        sections.append("Capabilities & rules:\n" + "\n".join(cap_lines))
+
+    extra_instr = str(getattr(persona, "extra_instructions", "") or "").strip()
+    if extra_instr:
+        sections.append(extra_instr)
+
+    sections.append(f"Turn budget: {turn_count}/{max_turns}\nAvailable tools: {tools_line}")
+    if enable_skills and skill_catalog_text and skill_catalog_text != "(no skills installed)":
+        sections.append(
+            f"Available skills (metadata only — call load_skill(name) to load full instructions):\n"
+            f"{skill_catalog_text}"
+        )
     if loaded_skills_text:
         sections.append(f"Currently loaded skill instructions:\n{loaded_skills_text}")
-
     sections.append(f"Current execution plan:\n{plan_text}")
     sections.append(
-        "Execution, accuracy & presentation rules:\n"
+        "Execution rules:\n"
         "1. Do not re-execute steps already marked COMPLETED.\n"
-        "2. Verify non-trivial math, statistics, parsing, or code logic with bash_exec (Python) "
-        "instead of guessing mentally.\n"
-        "3. Never fabricate tool outputs, file contents, or external facts; ground every claim "
-        "in observed tool output or mark uncertainty explicitly.\n"
-        "4. Only call tools needed for the active step; if a tool fails, inspect the error and "
-        "recover within bounded retries.\n"
-        "5. Keep individual write_file calls concise so they never truncate mid-JSON; for large "
-        "files (>200 lines), write a clean base with write_file and extend with edit_file or a "
-        "short Python script via bash_exec. Before compiling/simulating in specialized toolchains, "
-        "check tool availability with `which` and if unavailable, report honestly or verify with "
-        "a Python reference model/testbench.\n"
-        "6. Format final responses clearly in GitHub-Flavored Markdown: use **bold** for key "
-        "points, concise headings, bullet/numbered lists, Markdown data tables (`| col | col |`) "
-        "for comparisons or structured datasets, fenced code blocks with language tags for code, "
-        "and clean monospace ASCII charts/diagrams (fenced with ```ascii or ```chart) whenever "
-        "visualizing trends, architectures, or distributions helps the user."
+        "2. Only call registered tools needed for the active step; recover gracefully on errors.\n"
+        "3. Ground every factual claim in verified tool outputs or mark uncertainty explicitly."
     )
     return "\n\n".join(sections)
 

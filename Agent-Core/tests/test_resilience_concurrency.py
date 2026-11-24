@@ -7,10 +7,11 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage
+from MCPs.manager import MCPRegistryManager, MCPServerConfig
+
 from agent_core.graph import create_agent_runtime
 from agent_core.sandbox import SandboxConfig, SandboxManager
 from agent_core.skills import SkillRegistry
-from MCPs.manager import MCPRegistryManager, MCPServerConfig
 from tests.conftest import ScriptedChatModel
 
 
@@ -19,10 +20,14 @@ async def test_failure_injection_model_unavailable_empty_response_and_mcp_offlin
     isolated_sandbox: SandboxManager,
     repo_skills: SkillRegistry,
     tmp_checkpoint_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify safe degradation when model fails, returns empty content, or MCP server is offline."""
-    # 1. Model raises connection error -> handled cleanly without unhandled crash
-    broken_model = ScriptedChatModel(responses=[ConnectionError("River AI unreachable")])
+    # 1. Persistent connection error across all retry attempts -> handled cleanly without unhandled crash
+    monkeypatch.setenv("MODEL_MAX_RETRIES", "0")
+    broken_model = ScriptedChatModel(
+        handler=lambda _msgs, _idx: ConnectionError("River AI unreachable"),
+    )
     async with create_agent_runtime(
         primary_model=broken_model,
         worker_model=broken_model,
@@ -54,7 +59,7 @@ async def test_failure_injection_model_unavailable_empty_response_and_mcp_offlin
         servers=[
             MCPServerConfig(
                 name="offline_ext",
-                url="http://127.0.0.1:19998/mcp",
+                url="https://offline-mcp.example.invalid/mcp",
                 transport="streamable_http",
                 timeout_seconds=2.0,
             )

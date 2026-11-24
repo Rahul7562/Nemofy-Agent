@@ -21,6 +21,7 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
+
 from agent_core.graph import create_agent_runtime
 from agent_core.guardrails import classify_tool_call
 from agent_core.sandbox import SandboxManager
@@ -308,8 +309,8 @@ async def test_hitl_scenario_4_process_restart_during_pending_approval(
                 tool_calls=[
                     {
                         "id": "tc-safe-1",
-                        "name": "bash_exec",
-                        "args": {"command": "echo step1 >> /workspace/step1.log"},
+                        "name": "write_file",
+                        "args": {"path": "/workspace/step1.log", "content": "step1\n"},
                     }
                 ],
             ),

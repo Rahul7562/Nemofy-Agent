@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import resource
-import shutil
+import shutil  # noqa: F401
 import signal
 import subprocess
 import sys
@@ -410,8 +410,8 @@ class SandboxManager:
                     return existing, False
                 try:
                     existing.remove(force=True)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as rm_exc:  # noqa: BLE001
+                    logger.debug("Ignored stale sandbox container remove error: %s", rm_exc)
                 recovered = True
             except Exception:  # noqa: BLE001
                 recovered = True
@@ -940,12 +940,12 @@ class SandboxManager:
         if container is not None:
             try:
                 container.stop(timeout=2)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as stop_exc:  # noqa: BLE001
+                logger.debug("Ignored sandbox container stop error: %s", stop_exc)
             try:
                 container.remove(force=True)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as rm_exc:  # noqa: BLE001
+                logger.debug("Ignored sandbox container remove error: %s", rm_exc)
 
     def cleanup_all(self) -> None:
         for sid in list(self._containers.keys()):

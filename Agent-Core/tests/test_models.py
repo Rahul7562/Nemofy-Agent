@@ -6,6 +6,7 @@ import os
 
 import httpx
 import pytest
+
 from agent_core.models import (
     DEFAULT_PRIMARY_MODEL,
     DEFAULT_RIVER_AI_BASE_URL,
@@ -160,7 +161,11 @@ async def test_live_river_ai_endpoint_probe_and_invalid_key_rejection() -> None:
 
 def test_dynamic_model_override_supports_any_provider_and_local_ollama() -> None:
     """Verify Brain and Sub-Agent models can shift freely away from River AI per request."""
-    from agent_core.models import ModelOverride, get_provider_presets, resolve_model_spec_with_override
+    from agent_core.models import (
+        ModelOverride,
+        get_provider_presets,
+        resolve_model_spec_with_override,
+    )
 
     base_env = {
         "RIVER_AI_API": "rv-test-primary-1234",
@@ -400,6 +405,7 @@ def test_openrouter_reasoning_details_extraction() -> None:
 def test_gemini3_tool_call_thought_signature_roundtrip() -> None:
     """Verify ReasoningChatOpenAI captures Gemini 3 extra_content.google.thought_signature and re-attaches it on Turn 2."""
     from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+
     from agent_core.models import ReasoningChatOpenAI
 
     llm = ReasoningChatOpenAI(

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
+
 from agent_core.graph import create_agent_runtime
 from agent_core.sandbox import SandboxManager
 from agent_core.skills import SkillRegistry
@@ -58,6 +59,7 @@ async def test_cyclic_plan_act_observe_reflect_multistep_and_local_tools(
         res = await runtime.run_task(
             "Create calc.py printing 21*2 and execute it.",
             thread_id="brain-multistep-1",
+            access_mode="full_access",
         )
 
     assert res["status"] == "completed"
@@ -171,13 +173,9 @@ async def test_context_compaction_archives_over_4000_chars_to_workspace_logs(
     assert saved_vpath in summary
     assert isolated_sandbox.read_file(saved_vpath) == huge_payload
 
-    # End-to-end inside LangGraph ACT node
-    @tool("emit_large_output")
-    def emit_large_output() -> str:
-        """Return a >4,000 character payload."""
-        return huge_payload
-
-    # Note: custom tool name defaults to SENSITIVE; test with read_file on a >4,000 char file (SAFE)
+    # End-to-end inside LangGraph ACT node:
+    # read_file is intentionally exempt from 4,000-char compaction so full source files stay intact;
+    # test automatic compaction with SAFE bash_exec emitting >4,000 chars.
     isolated_sandbox.write_file("/workspace/large_input.txt", huge_payload)
 
     seen_tool_msg_content: list[str] = []
@@ -189,8 +187,8 @@ async def test_context_compaction_archives_over_4000_chars_to_workspace_logs(
                 tool_calls=[
                     {
                         "id": "tc-big",
-                        "name": "read_file",
-                        "args": {"path": "/workspace/large_input.txt"},
+                        "name": "bash_exec",
+                        "args": {"command": "cat /workspace/large_input.txt"},
                     }
                 ],
             )
@@ -249,7 +247,11 @@ async def test_sqlite_checkpoint_survives_restart_and_never_reexecutes_completed
         skills=repo_skills,
         connect_mcp=False,
     ) as runtime_1:
-        res1 = await runtime_1.run_task("Log run1", thread_id="persist-thread-1")
+        res1 = await runtime_1.run_task(
+            "Log run1",
+            thread_id="persist-thread-1",
+            access_mode="full_access",
+        )
         assert res1["status"] == "completed"
 
     assert isolated_sandbox.read_file("/workspace/counter.log").strip().splitlines() == ["run1"]
@@ -353,6 +355,7 @@ async def test_live_activity_tracks_thinking_tools_and_workspace_file_dir_change
         res = await runtime.run_task(
             "Create reports/summary.txt, update it, then delete it.",
             thread_id="activity-thread-1",
+            access_mode="full_access",
             progress_callback=job.record_progress,
         )
 
@@ -388,6 +391,7 @@ async def test_live_activity_tracks_thinking_tools_and_workspace_file_dir_change
 def test_reasoning_chat_openai_preserves_reasoning_content_and_streams_to_job() -> None:
     """Verify ReasoningChatOpenAI preserves reasoning_content chunks and AgentJob streams thinking_delta + activity_feed."""
     from langchain_core.messages import AIMessageChunk
+
     from agent_core.jobs import AgentJob
     from agent_core.models import ReasoningChatOpenAI
 
@@ -440,8 +444,9 @@ async def test_self_healing_recovery_on_truncated_tool_call_and_length_limit(
     tmp_checkpoint_db: Path,
 ) -> None:
     """Verify finish_reason=length mid-tool-call recovers automatically without poisoning thread history."""
-    from agent_core.graph import _sanitize_messages_for_llm
     from langchain_core.messages import HumanMessage
+
+    from agent_core.graph import _sanitize_messages_for_llm
 
     seen_prompts: list[list] = []
 
@@ -636,6 +641,7 @@ async def test_streamed_duplicate_finish_reason_unclosed_think_and_escalating_re
 ) -> None:
     """Verify OpenRouter duplicate finish_reason='lengthlength', unclosed <think>, role-safe nudge, and escalating max_tokens + lowered reasoning."""
     from collections.abc import AsyncIterator
+
     from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 
     from agent_core.graph import (
@@ -860,8 +866,9 @@ async def test_bash_exec_nonzero_exit_marked_error_and_stream_fallback(
     tmp_checkpoint_db: Path,
 ) -> None:
     """Verify non-zero bash_exec exit codes record status='error', enforce bounded retries, and stream errors fall back to ainvoke."""
-    import httpx
     from collections.abc import AsyncIterator
+
+    import httpx
     from langchain_core.messages import AIMessageChunk, HumanMessage
 
     from agent_core.graph import _invoke_model_with_live_thinking
@@ -896,7 +903,11 @@ async def test_bash_exec_nonzero_exit_marked_error_and_stream_fallback(
         connect_mcp=False,
         max_tool_retries=2,
     ) as runtime:
-        res = await runtime.run_task("Run failing python command", thread_id="bash-err-1")
+        res = await runtime.run_task(
+            "Run failing python command",
+            thread_id="bash-err-1",
+            access_mode="full_access",
+        )
 
     assert res["status"] == "completed"
     # First 2 executions ran and returned status="error"; 3rd hit RETRY LIMIT EXCEEDED

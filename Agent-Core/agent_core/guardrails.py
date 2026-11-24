@@ -10,8 +10,9 @@ import json
 import re
 import shlex
 import uuid
+from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from langchain_core.tools import BaseTool
@@ -280,7 +281,12 @@ def _split_shell_segments(cmd: str) -> list[str] | None:
     return segments
 
 
-def _is_readonly_safe_bash(cmd: str) -> tuple[bool, str]:
+def _is_readonly_safe_bash(
+    cmd: str,
+    *,
+    safe_commands: frozenset[str] = SAFE_READONLY_BASH_COMMANDS,
+    safe_git_subcommands: frozenset[str] = SAFE_READONLY_GIT_SUBCOMMANDS,
+) -> tuple[bool, str]:
     """Fail-closed check: return (True, reason) ONLY for strictly read-only shell commands."""
     stripped = cmd.strip()
     if not stripped:
@@ -310,7 +316,7 @@ def _is_readonly_safe_bash(cmd: str) -> tuple[bool, str]:
             else:
                 return False, f"Executing binary path '{argv[0]}' requires approval."
 
-        if binary not in SAFE_READONLY_BASH_COMMANDS:
+        if binary not in safe_commands:
             return (
                 False,
                 f"Shell command '{binary}' may mutate files, execute code, or access the network and requires approval.",
@@ -327,7 +333,7 @@ def _is_readonly_safe_bash(cmd: str) -> tuple[bool, str]:
                     return False, f"find option '{arg}' can mutate files or run commands and requires approval."
         elif binary == "git":
             subcmd = next((a for a in args if not a.startswith("-")), "")
-            if subcmd not in SAFE_READONLY_GIT_SUBCOMMANDS:
+            if subcmd not in safe_git_subcommands:
                 return False, f"git subcommand '{subcmd or '(none)'}' requires approval."
             for arg in args:
                 if arg in ("-c", "--config") or arg.startswith("--config="):
@@ -342,6 +348,69 @@ class ToolClassification:
     safety_level: SafetyLevel
     risk_reason: str
     expected_effect: str
+
+
+@dataclass(frozen=True)
+class GuardrailPolicy:
+    """Configurable safety policy for classifying tool calls as SAFE or SENSITIVE.
+
+    Defaults preserve strict fail-closed classification: unknown tools and non-readonly
+    shell commands require explicit human approval unless overridden.
+    """
+
+    safe_tools: frozenset[str] = EXPLICIT_SAFE_TOOLS
+    sensitive_tools: frozenset[str] = frozenset()
+    sensitive_tool_patterns: tuple[re.Pattern[str], ...] = SENSITIVE_TOOL_PATTERNS
+    destructive_bash_patterns: tuple[tuple[re.Pattern[str], str], ...] = DESTRUCTIVE_BASH_PATTERNS
+    safe_readonly_bash_commands: frozenset[str] = SAFE_READONLY_BASH_COMMANDS
+    safe_readonly_git_subcommands: frozenset[str] = SAFE_READONLY_GIT_SUBCOMMANDS
+    default_unknown_tool_level: SafetyLevel = "SENSITIVE"
+    custom_classifier: Callable[[str, dict[str, Any], bool], ToolClassification | None] | None = (
+        None
+    )
+
+    def extend(
+        self,
+        *,
+        add_safe_tools: tuple[str, ...] | list[str] | set[str] | frozenset[str] = (),
+        add_sensitive_tools: tuple[str, ...] | list[str] | set[str] | frozenset[str] = (),
+        add_safe_bash_commands: tuple[str, ...] | list[str] | set[str] | frozenset[str] = (),
+        custom_classifier: Callable[[str, dict[str, Any], bool], ToolClassification | None]
+        | None = None,
+        default_unknown_tool_level: SafetyLevel | None = None,
+    ) -> GuardrailPolicy:
+        """Return a derived policy adding domain-specific safe/sensitive tools or a custom classifier."""
+        norm_safe = {t.strip().lower() for t in add_safe_tools if t.strip()}
+        norm_sens = {t.strip().lower() for t in add_sensitive_tools if t.strip()}
+        norm_bash = {c.strip() for c in add_safe_bash_commands if c.strip()}
+        return replace(
+            self,
+            safe_tools=(self.safe_tools | norm_safe) - norm_sens,
+            sensitive_tools=self.sensitive_tools | norm_sens,
+            safe_readonly_bash_commands=self.safe_readonly_bash_commands | norm_bash,
+            custom_classifier=custom_classifier
+            if custom_classifier is not None
+            else self.custom_classifier,
+            default_unknown_tool_level=(
+                default_unknown_tool_level
+                if default_unknown_tool_level is not None
+                else self.default_unknown_tool_level
+            ),
+        )
+
+
+DEFAULT_GUARDRAIL_POLICY = GuardrailPolicy()
+current_guardrail_policy: ContextVar[GuardrailPolicy | None] = ContextVar(
+    "guardrails_policy",
+    default=None,
+)
+
+
+def get_effective_guardrail_policy(policy: GuardrailPolicy | None = None) -> GuardrailPolicy:
+    if policy is not None:
+        return policy
+    bound = current_guardrail_policy.get()
+    return bound if bound is not None else DEFAULT_GUARDRAIL_POLICY
 
 
 @dataclass(frozen=True)
@@ -381,14 +450,29 @@ def classify_tool_call(
     arguments: dict[str, Any] | None = None,
     *,
     is_mcp_tool: bool = False,
+    policy: GuardrailPolicy | None = None,
 ) -> ToolClassification:
-    """Centrally classify any tool call as SAFE or SENSITIVE."""
+    """Centrally classify any tool call as SAFE or SENSITIVE using ``policy``."""
+    active_policy = get_effective_guardrail_policy(policy)
     args = normalize_tool_arguments(tool_name, arguments or {})
     normalized = tool_name.strip().lower()
 
+    if active_policy.custom_classifier is not None:
+        custom = active_policy.custom_classifier(tool_name, args, is_mcp_tool)
+        if custom is not None:
+            return custom
+
+    if normalized in active_policy.sensitive_tools:
+        return ToolClassification(
+            tool_name=tool_name,
+            safety_level="SENSITIVE",
+            risk_reason=f"Tool '{tool_name}' is explicitly marked SENSITIVE by guardrail policy.",
+            expected_effect=_describe_expected_effect(tool_name, args),
+        )
+
     if normalized == "bash_exec":
         cmd = str(args.get("command", ""))
-        for pattern, reason in DESTRUCTIVE_BASH_PATTERNS:
+        for pattern, reason in active_policy.destructive_bash_patterns:
             if pattern.search(cmd):
                 return ToolClassification(
                     tool_name=tool_name,
@@ -396,7 +480,11 @@ def classify_tool_call(
                     risk_reason=f"Destructive or mutating shell command detected: {reason}",
                     expected_effect=_describe_expected_effect(tool_name, args),
                 )
-        is_safe, reason = _is_readonly_safe_bash(cmd)
+        is_safe, reason = _is_readonly_safe_bash(
+            cmd,
+            safe_commands=active_policy.safe_readonly_bash_commands,
+            safe_git_subcommands=active_policy.safe_readonly_git_subcommands,
+        )
         if not is_safe:
             return ToolClassification(
                 tool_name=tool_name,
@@ -411,7 +499,7 @@ def classify_tool_call(
             expected_effect=_describe_expected_effect(tool_name, args),
         )
 
-    if normalized in EXPLICIT_SAFE_TOOLS:
+    if normalized in active_policy.safe_tools:
         return ToolClassification(
             tool_name=tool_name,
             safety_level="SAFE",
@@ -419,7 +507,7 @@ def classify_tool_call(
             expected_effect=_describe_expected_effect(tool_name, args),
         )
 
-    for pattern in SENSITIVE_TOOL_PATTERNS:
+    for pattern in active_policy.sensitive_tool_patterns:
         if pattern.search(normalized):
             return ToolClassification(
                 tool_name=tool_name,
@@ -429,7 +517,7 @@ def classify_tool_call(
             )
 
     if is_mcp_tool:
-        if any(normalized.endswith(f"_{safe}") for safe in EXPLICIT_SAFE_TOOLS) or re.search(
+        if any(normalized.endswith(f"_{safe}") for safe in active_policy.safe_tools) or re.search(
             r"(?:^|_)(?:get|list|search|read|find|fetch|describe|lookup|query|inspect|count|check|status|ping|echo|health|whoami|info)(?:_|$)",
             normalized,
         ):
@@ -448,8 +536,12 @@ def classify_tool_call(
 
     return ToolClassification(
         tool_name=tool_name,
-        safety_level="SENSITIVE",
-        risk_reason=f"Unclassified tool '{tool_name}' requires approval by fail-safe default.",
+        safety_level=active_policy.default_unknown_tool_level,
+        risk_reason=(
+            f"Unclassified tool '{tool_name}' requires approval by fail-safe default."
+            if active_policy.default_unknown_tool_level == "SENSITIVE"
+            else f"Unclassified tool '{tool_name}' allowed by configured guardrail policy."
+        ),
         expected_effect=_describe_expected_effect(tool_name, args),
     )
 
@@ -678,11 +770,13 @@ async def execute_tool_with_guardrails(
     *,
     is_mcp_tool: bool = False,
     source: str = "supervisor",
+    policy: GuardrailPolicy | None = None,
 ) -> tuple[str, dict[str, Any]]:
     classification = classify_tool_call(
         tool_obj.name,
         arguments,
         is_mcp_tool=is_mcp_tool,
+        policy=policy,
     )
 
     effective_access_mode = get_effective_access_mode()

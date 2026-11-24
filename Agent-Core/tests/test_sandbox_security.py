@@ -8,13 +8,14 @@ from typing import Any
 
 import httpx
 import pytest
+
+from agent_core.firecrawl import FirecrawlClient, FirecrawlConfig
 from agent_core.sandbox import (
     SandboxConfig,
     SandboxManager,
     SandboxSecurityError,
     resolve_workspace_path,
 )
-from agent_core.firecrawl import FirecrawlClient, FirecrawlConfig
 from agent_core.tools.local import (
     build_local_tools,
     validate_public_url,
@@ -277,6 +278,7 @@ async def test_local_sandbox_node_venv_path_rewrite_and_env_scrubbing(
 ) -> None:
     """Verify Node/V8 does not OOM under sandbox limits, venv Python stays on PATH, and /workspace rewriting is boundary-safe."""
     import shutil
+
     from agent_core.sandbox import rewrite_workspace_paths_in_command
 
     monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret-test-999")

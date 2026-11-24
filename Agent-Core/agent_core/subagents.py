@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal, TypedDict
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
@@ -18,7 +19,11 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
-from agent_core.guardrails import execute_tool_with_guardrails, normalize_tool_arguments
+from agent_core.guardrails import (
+    GuardrailPolicy,
+    execute_tool_with_guardrails,
+    normalize_tool_arguments,
+)
 from agent_core.jobs import emit_progress, track_active_task
 from agent_core.models import invoke_with_rate_limit_retry
 from agent_core.state import compact_tool_output
@@ -233,6 +238,8 @@ async def run_isolated_subagent(
     context: str = "",
     max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
     workspace_dir: str | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+    guardrail_policy: GuardrailPolicy | None = None,
 ) -> SubagentReport:
     normalized_role = role.strip().lower() or "general"
     requested_names = (
@@ -480,6 +487,7 @@ async def run_isolated_subagent(
                 tc_args,
                 is_mcp_tool=(tc_name in mcp_names),
                 source=f"subagent:{normalized_role}",
+                policy=guardrail_policy,
             )
         except GraphInterrupt:
             raise
@@ -529,7 +537,10 @@ async def run_isolated_subagent(
         route_after_worker_act,
         {"worker_act": "worker_act", "worker_reason": "worker_reason"},
     )
-    worker_graph = builder.compile(checkpointer=_WORKER_CHECKPOINTER)
+    active_checkpointer: BaseCheckpointSaver[Any] = (
+        checkpointer if checkpointer is not None else _WORKER_CHECKPOINTER
+    )
+    worker_graph = builder.compile(checkpointer=active_checkpointer)
 
     sys_prompt = (
         f"You are an isolated specialist sub-agent (role='{normalized_role}') executing a "
@@ -576,15 +587,15 @@ async def run_isolated_subagent(
 
     def _clear_worker_checkpoint() -> None:
         try:
-            delete_fn = getattr(_WORKER_CHECKPOINTER, "delete_thread", None)
+            delete_fn = getattr(active_checkpointer, "delete_thread", None)
             if callable(delete_fn):
                 delete_fn(sub_thread_id)
             else:
-                storage = getattr(_WORKER_CHECKPOINTER, "storage", None)
+                storage = getattr(active_checkpointer, "storage", None)
                 if isinstance(storage, dict):
                     storage.pop(sub_thread_id, None)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.debug("Ignored sub-agent checkpoint cleanup error: %s", cleanup_exc)
 
     subagent_label = f"Sub-agent ({normalized_role})"
     try:
@@ -645,6 +656,8 @@ def make_spawn_subagent_tool(
     available_tools: dict[str, BaseTool] | Any,
     mcp_tool_names: set[str] | Any | None = None,
     workspace_dir: str | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+    guardrail_policy: GuardrailPolicy | None = None,
 ) -> BaseTool:
     @tool("spawn_subagent")
     async def spawn_subagent(
@@ -674,6 +687,8 @@ def make_spawn_subagent_tool(
             context=context,
             max_turns=max_turns,
             workspace_dir=workspace_dir,
+            checkpointer=checkpointer,
+            guardrail_policy=guardrail_policy,
         )
         return report.model_dump_json(indent=2)
 

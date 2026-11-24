@@ -250,7 +250,7 @@ async def test_runtime_auto_compacts_strictly_at_80_percent_and_not_below(tmp_pa
     ws.mkdir()
     db_path = tmp_path / "checkpoints.db"
 
-    model = _TinyWindowChatModel(context_window=6_000)
+    model = _TinyWindowChatModel(context_window=8_000)
     sandbox = SandboxManager(SandboxConfig(workspace_dir=ws, backend="local_isolated"))
     skills = SkillRegistry(skills_dir=tmp_path / "skills")
 
@@ -263,19 +263,19 @@ async def test_runtime_auto_compacts_strictly_at_80_percent_and_not_below(tmp_pa
         connect_mcp=False,
         model_override_resolver=lambda role, spec: _TinyWindowChatModel(
             model_name=spec.model,
-            context_window=spec.context_window or 6_000,
+            context_window=spec.context_window or 8_000,
         ),
     ) as runtime:
         thread_id = "ctx-auto-compact-test"
 
-        # Turn 1: Well below 80% of 6,000 tokens -> MUST NOT compact
+        # Turn 1: Well below 80% of 8,000 tokens -> MUST NOT compact
         spec = ModelSpec(
             role="primary",
             provider="custom",
             model="tiny-ctx-test",
             base_url="http://localhost:9999/v1",
             api_key="test",
-            context_window=6_000,
+            context_window=8_000,
         )
         r1 = await runtime.run_task(
             "Hello! Remember project codename APOLLO-42.",
@@ -285,7 +285,7 @@ async def test_runtime_auto_compacts_strictly_at_80_percent_and_not_below(tmp_pa
         assert r1["status"] == "completed"
         ctx1 = r1["context_usage"]
         assert ctx1 is not None
-        assert ctx1["context_window"] == 6_000
+        assert ctx1["context_window"] == 8_000
         assert ctx1["usage_percent"] < 80.0
         assert ctx1["compacted_count"] == 0
 
@@ -299,8 +299,8 @@ async def test_runtime_auto_compacts_strictly_at_80_percent_and_not_below(tmp_pa
         assert ctx2["usage_percent"] < 80.0
         assert ctx2["compacted_count"] == 0
 
-        # Turn 3: Push total context >= 80% of 6,000 tokens -> MUST auto-compact!
-        large_payload = "Detailed benchmark record line with diagnostics and telemetry values. " * 140
+        # Turn 3: Push total context >= 80% of 8,000 tokens -> MUST auto-compact!
+        large_payload = "Detailed benchmark record line with diagnostics and telemetry values. " * 220
         r3 = await runtime.run_task(
             f"Third turn heavy input:\n{large_payload}",
             thread_id=thread_id,

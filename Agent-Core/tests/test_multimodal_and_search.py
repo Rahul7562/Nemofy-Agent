@@ -12,6 +12,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
+from agent_core.firecrawl import FirecrawlClient, FirecrawlConfig
 from agent_core.graph import create_agent_runtime
 from agent_core.guardrails import classify_tool_call, normalize_tool_arguments
 from agent_core.multimodal import (
@@ -23,7 +24,6 @@ from agent_core.multimodal import (
 )
 from agent_core.sandbox import SandboxConfig, SandboxManager
 from agent_core.subagents import ROLE_DEFAULT_TOOLS
-from agent_core.firecrawl import FirecrawlClient, FirecrawlConfig
 from agent_core.tools.local import (
     _format_firecrawl_search_markdown,
     build_local_tools,

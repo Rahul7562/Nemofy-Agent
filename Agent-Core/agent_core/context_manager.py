@@ -269,7 +269,6 @@ _PROVIDER_MODEL_MAX_OUTPUT_TOKENS: dict[str, tuple[tuple[str, int], ...]] = {
     "deepseek": (
         ("deepseek-reasoner", 64_000),
         ("deepseek-r1", 64_000),
-        ("deepseek-chat", 8_192),
     ),
     "together": (
         ("deepseek-r1", 32_768),
@@ -636,6 +635,7 @@ def compute_context_usage(
     compaction_count: int = 0,
     last_compacted_at: str | None = None,
     tokens_saved_last_compaction: int = 0,
+    auto_compact_threshold: float = AUTO_COMPACT_THRESHOLD,
 ) -> dict[str, Any]:
     """Compute a complete, categorized model-specific context usage snapshot."""
     context_window, source = resolve_model_context_window(
@@ -812,7 +812,9 @@ def compute_context_usage(
         "used_tokens": used_tokens,
         "free_tokens": free_tokens,
         "usage_percent": usage_percent,
-        "auto_compact_threshold_percent": AUTO_COMPACT_THRESHOLD_PERCENT,
+        "auto_compact_threshold_percent": round(float(auto_compact_threshold) * 100.0, 1)
+        if auto_compact_threshold != AUTO_COMPACT_THRESHOLD
+        else AUTO_COMPACT_THRESHOLD_PERCENT,
         "classification": classification,
         "categories": categories,
         "compacted_count": max(0, int(compaction_count)),
@@ -822,9 +824,14 @@ def compute_context_usage(
     }
 
 
-def should_auto_compact(usage_ratio: float, message_count: int) -> bool:
-    """Strictly trigger auto-compaction ONLY when context usage reaches >= 80%."""
-    return float(usage_ratio) >= AUTO_COMPACT_THRESHOLD and message_count >= 2
+def should_auto_compact(
+    usage_ratio: float,
+    message_count: int,
+    *,
+    threshold: float = AUTO_COMPACT_THRESHOLD,
+) -> bool:
+    """Strictly trigger auto-compaction ONLY when context usage reaches ``threshold`` (default >= 80%)."""
+    return float(usage_ratio) >= float(threshold) and message_count >= 2
 
 
 def find_safe_compaction_split(messages: list[BaseMessage], keep_recent_turns: int = 2) -> int:
@@ -1002,13 +1009,15 @@ async def compact_conversation_history(
             f"EARLIER CONVERSATION TURNS TO COMPACT:\n{transcript}"
         )
         try:
-            from agent_core.models import invoke_with_rate_limit_retry
+            from agent_core.models import invoke_with_resilient_retry
 
-            reply = await invoke_with_rate_limit_retry(
+            reply = await invoke_with_resilient_retry(
                 lambda: summarizer_model.ainvoke(
                     [SystemMessage(content=prompt), HumanMessage(content=user_body)]
                 ),
                 label="context summarizer",
+                stage="compaction",
+                max_transient_retries=1,
             )
             raw_content = getattr(reply, "content", "")
             if isinstance(raw_content, str):

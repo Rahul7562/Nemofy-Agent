@@ -371,7 +371,7 @@ def save_persisted_llm_config(
     config_path: Path | None = None,
 ) -> Path:
     """Persist non-secret Main Agent, Sub-Agent, and Accessories LLM configuration cleanly to disk."""
-    path = config_path or DEFAULT_LLM_CONFIG_PATH
+    path = _resolve_llm_config_path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Strip any accidental secret fields before persisting
     clean: dict[str, Any] = {}
@@ -397,6 +397,10 @@ def save_persisted_llm_config(
         clean["access_mode"] = "full_access" if raw_mode == "full_access" else "default"
     if "allow_unsafe_local_bash" in config and isinstance(config["allow_unsafe_local_bash"], bool):
         clean["allow_unsafe_local_bash"] = config["allow_unsafe_local_bash"]
+    if "firecrawl_api_url" in config and isinstance(config["firecrawl_api_url"], str):
+        fc_url = config["firecrawl_api_url"].strip().rstrip("/")
+        if not fc_url or fc_url.startswith(("http://", "https://")):
+            clean["firecrawl_api_url"] = fc_url
     if isinstance(config.get("custom_providers"), list):
         safe_custom: list[dict[str, Any]] = []
         for cp in config["custom_providers"]:
@@ -1202,8 +1206,8 @@ async def invoke_with_resilient_retry(
                 if on_retry is not None:
                     try:
                         on_retry(rate_limit_attempt, elapsed, sleep_s, exc)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as cb_exc:  # noqa: BLE001
+                        logger.debug("on_retry callback error ignored: %s", cb_exc)
 
                 await asyncio.sleep(sleep_s)
                 continue
@@ -1215,7 +1219,7 @@ async def invoke_with_resilient_retry(
                     max_backoff_seconds,
                     max(0.05, base_backoff_seconds) * (2 ** (transient_attempt - 1)),
                 )
-                jitter = random.uniform(0.0, min(0.5, raw_backoff * 0.2))
+                jitter = random.uniform(0.0, min(0.5, raw_backoff * 0.2))  # noqa: S311
                 sleep_s = round(raw_backoff + jitter, 2)
                 logger.warning(
                     "Transient %s during %s on %s [provider=%s model=%s] "
@@ -1246,8 +1250,8 @@ async def invoke_with_resilient_retry(
                 if on_retry is not None:
                     try:
                         on_retry(transient_attempt, elapsed_total, sleep_s, exc)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as cb_exc:  # noqa: BLE001
+                        logger.debug("on_retry callback error ignored: %s", cb_exc)
 
                 await asyncio.sleep(sleep_s)
                 continue

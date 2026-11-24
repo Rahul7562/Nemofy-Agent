@@ -6,11 +6,11 @@ import asyncio
 import json
 import logging
 import os
-import re
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -34,6 +34,7 @@ from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from agent_core.config import AgentConfig, invoke_agent_hook
 from agent_core.context_manager import (
     AUTO_COMPACT_THRESHOLD_PERCENT,
     build_compacted_memory_block,
@@ -46,6 +47,7 @@ from agent_core.context_manager import (
 from agent_core.guardrails import (
     bind_run_access_mode,
     current_access_mode,
+    current_guardrail_policy,
     execute_tool_with_guardrails,
     normalize_tool_arguments,
 )
@@ -54,6 +56,57 @@ from agent_core.jobs import (
     current_progress_callback,
     emit_progress,
     track_active_task,
+)
+from agent_core.message_utils import (
+    BASH_EXIT_CODE_RE as _BASH_EXIT_CODE_RE,  # noqa: F401
+)
+from agent_core.message_utils import (
+    KNOWN_FINISH_REASONS as _KNOWN_FINISH_REASONS,  # noqa: F401
+)
+from agent_core.message_utils import (
+    THINK_TAG_RE as _THINK_TAG_RE,  # noqa: F401
+)
+from agent_core.message_utils import (
+    UNCLOSED_THINK_TAG_RE as _UNCLOSED_THINK_TAG_RE,  # noqa: F401
+)
+from agent_core.message_utils import (
+    build_empty_output_diagnostic as _build_empty_output_diagnostic,
+)
+from agent_core.message_utils import (
+    build_recovery_messages as _build_recovery_messages,
+)
+from agent_core.message_utils import (
+    extract_chunk_thinking_delta as _extract_chunk_thinking_delta,
+)
+from agent_core.message_utils import (
+    extract_reasoning_from_extra as _extract_reasoning_from_extra,  # noqa: F401
+)
+from agent_core.message_utils import (
+    extract_text_and_thinking as _extract_text_and_thinking,
+)
+from agent_core.message_utils import (
+    get_finish_reason as _get_finish_reason,
+)
+from agent_core.message_utils import (
+    is_tool_output_error as _is_tool_output_error,
+)
+from agent_core.message_utils import (
+    latest_ai_message as _latest_ai_message,
+)
+from agent_core.message_utils import (
+    latest_human_text as _latest_human_text,
+)
+from agent_core.message_utils import (
+    normalize_finish_reason as _normalize_finish_reason,
+)
+from agent_core.message_utils import (
+    sanitize_ai_message_for_history as _sanitize_ai_message_for_history,
+)
+from agent_core.message_utils import (
+    sanitize_messages_for_llm as _sanitize_messages_for_llm,
+)
+from agent_core.message_utils import (
+    summarize_tool_args as _summarize_tool_args,
 )
 from agent_core.models import (
     ModelConfigurationError,
@@ -95,8 +148,6 @@ from agent_core.skills import (
     parse_dynamic_skills_payload,
 )
 from agent_core.state import (
-    DEFAULT_MAX_TOOL_RETRIES,
-    DEFAULT_MAX_TURNS,
     AgentState,
     PlanStep,
     compact_tool_output,
@@ -104,7 +155,29 @@ from agent_core.state import (
 )
 from agent_core.subagents import make_spawn_subagent_tool
 from agent_core.tools.local import build_local_tools, current_session_id
-from MCPs.manager import MCPRegistryManager
+from agent_core.workspace_diff import (
+    IGNORED_WORKSPACE_DIRS as _IGNORED_WORKSPACE_DIRS,  # noqa: F401
+)
+from agent_core.workspace_diff import (
+    diff_workspace_snapshots as _diff_workspace_snapshots,
+)
+from agent_core.workspace_diff import (
+    snapshot_workspace as _snapshot_workspace,
+)
+
+try:
+    from MCPs.manager import MCPRegistryManager
+except ImportError:
+
+    class MCPRegistryManager:  # type: ignore[no-redef]
+        """No-op fallback when the optional sibling MCPs package is not installed."""
+
+        async def connect(self) -> list[BaseTool]:
+            return []
+
+        def health_status(self) -> dict[str, Any]:
+            return {"configured": 0, "connected": 0, "servers": [], "tools": []}
+
 
 logger = logging.getLogger(__name__)
 
@@ -137,16 +210,9 @@ current_uploads_dir: ContextVar[Path | None] = ContextVar(
 current_primary_meta: ContextVar[dict[str, Any] | None] = ContextVar(
     "current_primary_meta", default=None
 )
-
-_IGNORED_WORKSPACE_DIRS = {
-    ".git",
-    "__pycache__",
-    ".agent_logs",
-    ".cache",
-    ".venv",
-    "venv",
-    "node_modules",
-}
+current_run_deadline: ContextVar[float | None] = ContextVar(
+    "current_run_deadline", default=None
+)
 
 
 def _new_run_activity() -> dict[str, Any]:
@@ -188,115 +254,6 @@ def _record_run_file_changes(changes: list[dict[str, Any]]) -> None:
     activity = current_run_activity.get()
     if activity is not None:
         activity["file_changes"].extend(changes)
-
-
-def _summarize_tool_args(args: dict[str, Any]) -> str:
-    if not args:
-        return ""
-    parts: list[str] = []
-    for k, v in args.items():
-        if k in ("content", "new_str", "old_str") and isinstance(v, str) and len(v) > 48:
-            parts.append(f"{k}=<{len(v)} chars>")
-            continue
-        val_str = json.dumps(v, ensure_ascii=False, default=str) if not isinstance(v, str) else v
-        val_str = val_str.replace("\n", " ").strip()
-        if len(val_str) > 64:
-            val_str = val_str[:61] + "..."
-        parts.append(f"{k}={val_str}")
-        if len(parts) >= 3:
-            break
-    summary = ", ".join(parts)
-    return summary[:160]
-
-
-def _snapshot_workspace(ws_dir: Path) -> dict[str, tuple[bool, int, int]]:
-    """Return {rel_posix_path: (is_dir, size, mtime_ns)} for files and folders under ws_dir."""
-    snap: dict[str, tuple[bool, int, int]] = {}
-    if not ws_dir.exists():
-        return snap
-    try:
-        for root, dirs, files in os.walk(ws_dir):
-            dirs[:] = [d for d in dirs if d not in _IGNORED_WORKSPACE_DIRS]
-            root_path = Path(root)
-            for dname in dirs:
-                full = root_path / dname
-                try:
-                    rel = full.relative_to(ws_dir).as_posix()
-                    st = full.stat()
-                    snap[rel] = (True, 0, st.st_mtime_ns)
-                except OSError:
-                    continue
-            for fname in files:
-                full = root_path / fname
-                try:
-                    rel = full.relative_to(ws_dir).as_posix()
-                    st = full.stat()
-                    snap[rel] = (False, st.st_size, st.st_mtime_ns)
-                except OSError:
-                    continue
-    except OSError:
-        return snap
-    return snap
-
-
-def _diff_workspace_snapshots(
-    before: dict[str, tuple[bool, int, int]],
-    after: dict[str, tuple[bool, int, int]],
-    *,
-    tool_name: str,
-) -> list[dict[str, Any]]:
-    now_iso = datetime.now(UTC).isoformat()
-    changes: list[dict[str, Any]] = []
-
-    for rel in sorted(after.keys() - before.keys()):
-        is_dir = after[rel][0]
-        changes.append(
-            {
-                "kind": "dir" if is_dir else "file",
-                "action": "created",
-                "path": rel,
-                "tool": tool_name,
-                "timestamp": now_iso,
-            }
-        )
-
-    for rel in sorted(before.keys() & after.keys()):
-        b_dir, b_size, b_mtime = before[rel]
-        a_dir, a_size, a_mtime = after[rel]
-        if b_dir != a_dir:
-            changes.append(
-                {
-                    "kind": "dir" if a_dir else "file",
-                    "action": "modified",
-                    "path": rel,
-                    "tool": tool_name,
-                    "timestamp": now_iso,
-                }
-            )
-        elif not a_dir and (b_size != a_size or b_mtime != a_mtime):
-            changes.append(
-                {
-                    "kind": "file",
-                    "action": "modified",
-                    "path": rel,
-                    "tool": tool_name,
-                    "timestamp": now_iso,
-                }
-            )
-
-    for rel in sorted(before.keys() - after.keys()):
-        is_dir = before[rel][0]
-        changes.append(
-            {
-                "kind": "dir" if is_dir else "file",
-                "action": "deleted",
-                "path": rel,
-                "tool": tool_name,
-                "timestamp": now_iso,
-            }
-        )
-
-    return changes
 
 
 def _describe_model_instance(
@@ -379,6 +336,12 @@ class AgentRuntime:
     default_primary_summary: dict[str, Any] | None = None
     default_worker_summary: dict[str, Any] | None = None
     model_override_resolver: ModelOverrideResolver | None = None
+    config: AgentConfig = field(default_factory=AgentConfig)
+
+    @property
+    def tools(self) -> list[BaseTool]:
+        """Return all registered tools as a list."""
+        return list(self.tools_by_name.values())
 
     def make_config(self, thread_id: str, max_turns: int | None = None) -> dict[str, Any]:
         effective_turns = max_turns if max_turns is not None else self.max_turns
@@ -463,6 +426,14 @@ class AgentRuntime:
         elif isinstance(dynamic_skills, list):
             parsed_skills = parse_dynamic_skills_payload(dynamic_skills)
 
+        effective_access_mode = (
+            access_mode if access_mode is not None else self.config.default_access_mode
+        )
+        run_deadline = (
+            time.monotonic() + self.config.limits.max_wall_clock_seconds
+            if self.config.limits.max_wall_clock_seconds is not None
+            else None
+        )
         run_activity = _new_run_activity()
         token = current_session_id.set(thread_id)
         prim_tok = current_primary_model.set(prim_model)
@@ -476,7 +447,9 @@ class AgentRuntime:
         native_media_tok = current_native_media_attachments.set(None)
         fallback_fn_tok = current_accessory_fallback_fn.set(None)
         prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
-        access_mode_tok = bind_run_access_mode(access_mode)
+        access_mode_tok = bind_run_access_mode(effective_access_mode)
+        policy_tok = current_guardrail_policy.set(self.config.guardrail_policy)
+        deadline_tok = current_run_deadline.set(run_deadline)
 
         async def _run_accessory_for_modality(
             modality: MediaModality,
@@ -683,8 +656,19 @@ class AgentRuntime:
             if run_activity["accessory_reports"]:
                 existing_reports = list(result.get("subagent_reports") or [])
                 result["subagent_reports"] = [*run_activity["accessory_reports"], *existing_reports]
+            await invoke_agent_hook(
+                self.config.hooks.on_run_complete,
+                {
+                    "thread_id": thread_id,
+                    "status": result.get("status"),
+                    "turn_count": result.get("turn_count", 0),
+                    "tool_events": result.get("tool_events", []),
+                },
+            )
             return result
         finally:
+            current_run_deadline.reset(deadline_tok)
+            current_guardrail_policy.reset(policy_tok)
             current_access_mode.reset(access_mode_tok)
             current_primary_meta.reset(prim_meta_tok)
             current_accessory_fallback_fn.reset(fallback_fn_tok)
@@ -753,6 +737,14 @@ class AgentRuntime:
         elif isinstance(dynamic_skills, list):
             parsed_skills = parse_dynamic_skills_payload(dynamic_skills)
 
+        effective_access_mode = (
+            access_mode if access_mode is not None else self.config.default_access_mode
+        )
+        run_deadline = (
+            time.monotonic() + self.config.limits.max_wall_clock_seconds
+            if self.config.limits.max_wall_clock_seconds is not None
+            else None
+        )
         run_activity = _new_run_activity()
         token = current_session_id.set(thread_id)
         prim_tok = current_primary_model.set(prim_model)
@@ -763,7 +755,9 @@ class AgentRuntime:
         prog_tok = current_progress_callback.set(progress_callback)
         act_tok = current_run_activity.set(run_activity)
         prim_meta_tok = current_primary_meta.set(dict(active_models["primary"]))
-        access_mode_tok = bind_run_access_mode(access_mode)
+        access_mode_tok = bind_run_access_mode(effective_access_mode)
+        policy_tok = current_guardrail_policy.set(self.config.guardrail_policy)
+        deadline_tok = current_run_deadline.set(run_deadline)
         try:
             decision_label = (
                 str(decision.get("decision") or "approve")
@@ -792,8 +786,20 @@ class AgentRuntime:
                 result["thinking"] = "\n\n".join(run_activity["thinking_segments"]).strip()
             result["tool_events"] = list(run_activity["tool_events"])
             result["file_changes"] = list(run_activity["file_changes"])
+            await invoke_agent_hook(
+                self.config.hooks.on_run_complete,
+                {
+                    "thread_id": thread_id,
+                    "status": result.get("status"),
+                    "turn_count": result.get("turn_count", 0),
+                    "tool_events": result.get("tool_events", []),
+                    "resumed": True,
+                },
+            )
             return result
         finally:
+            current_run_deadline.reset(deadline_tok)
+            current_guardrail_policy.reset(policy_tok)
             current_access_mode.reset(access_mode_tok)
             current_primary_meta.reset(prim_meta_tok)
             current_run_activity.reset(act_tok)
@@ -843,179 +849,6 @@ class AgentRuntime:
             "context_usage": values.get("context_usage") or None,
             "error": values.get("error"),
         }
-
-
-def _latest_human_text(messages: list[BaseMessage]) -> str:
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            return str(msg.content).strip()
-    return "Complete the user task."
-
-
-def _latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            return msg
-    return None
-
-
-_THINK_TAG_RE = re.compile(r"<think>([\s\S]*?)</think>", flags=re.IGNORECASE)
-_UNCLOSED_THINK_TAG_RE = re.compile(r"<think>([\s\S]*)$", flags=re.IGNORECASE)
-_BASH_EXIT_CODE_RE = re.compile(r"^exit_code:\s*(-?\d+)\b", re.MULTILINE)
-_KNOWN_FINISH_REASONS: tuple[str, ...] = (
-    "length",
-    "max_tokens",
-    "stop",
-    "end_turn",
-    "tool_calls",
-    "function_call",
-    "content_filter",
-)
-
-
-def _normalize_finish_reason(raw: Any) -> str:
-    """Normalize provider finish_reason values, including duplicated chunk merges like 'lengthlength'."""
-    s = str(raw or "").strip().lower()
-    if not s:
-        return ""
-    if s in _KNOWN_FINISH_REASONS:
-        return "length" if s == "max_tokens" else ("stop" if s == "end_turn" else s)
-    for known in _KNOWN_FINISH_REASONS:
-        klen = len(known)
-        if len(s) % klen == 0 and s == known * (len(s) // klen):
-            return "length" if known == "max_tokens" else ("stop" if known == "end_turn" else known)
-    if "length" in s or "max_tokens" in s:
-        return "length"
-    if "tool_calls" in s:
-        return "tool_calls"
-    if "content_filter" in s:
-        return "content_filter"
-    if "stop" in s or "end_turn" in s:
-        return "stop"
-    return s
-
-
-def _is_tool_output_error(tool_name: str, raw_output: str) -> bool:
-    """Detect tool execution failures including non-zero exit codes or timeouts from bash_exec."""
-    if raw_output.startswith("ERROR:"):
-        return True
-    if tool_name == "bash_exec":
-        if "status: TIMED_OUT" in raw_output:
-            return True
-        match = _BASH_EXIT_CODE_RE.search(raw_output)
-        if match is not None:
-            try:
-                if int(match.group(1)) != 0:
-                    return True
-            except ValueError:
-                pass
-    return False
-
-
-def _extract_reasoning_from_extra(extra: dict[str, Any]) -> list[str]:
-    found: list[str] = []
-    for key in ("reasoning_content", "reasoning", "thinking"):
-        val = extra.get(key)
-        if isinstance(val, str) and val.strip():
-            found.append(val.strip())
-    if not found:
-        details = extra.get("reasoning_details")
-        if isinstance(details, list):
-            parts: list[str] = []
-            for item in details:
-                if isinstance(item, dict):
-                    item_type = str(item.get("type") or "").lower()
-                    if item_type and "encrypted" in item_type:
-                        continue
-                    t = item.get("text") or item.get("summary") or item.get("content")
-                    if isinstance(t, str) and t:
-                        parts.append(t)
-            joined = "".join(parts).strip()
-            if joined:
-                found.append(joined)
-    return found
-
-
-def _extract_text_and_thinking(ai_msg: AIMessage) -> tuple[str, str | None]:
-    """Safely extract clean response text and optional reasoning trace from an AIMessage."""
-    raw_content = ai_msg.content
-    thinking_parts: list[str] = []
-
-    if isinstance(raw_content, list):
-        text_chunks: list[str] = []
-        for item in raw_content:
-            if isinstance(item, str):
-                text_chunks.append(item)
-            elif isinstance(item, dict):
-                item_type = str(item.get("type") or "").lower()
-                if item_type in ("thinking", "reasoning"):
-                    val = item.get("thinking") or item.get("reasoning") or item.get("text")
-                    if isinstance(val, str) and val.strip():
-                        thinking_parts.append(val.strip())
-                elif isinstance(item.get("text"), str):
-                    text_chunks.append(item["text"])
-        text = "\n".join(text_chunks)
-    else:
-        text = str(raw_content or "")
-
-    # Check LangChain / OpenAI-compatible reasoning_content / reasoning_details in additional_kwargs
-    extra = getattr(ai_msg, "additional_kwargs", None) or {}
-    if isinstance(extra, dict):
-        thinking_parts.extend(_extract_reasoning_from_extra(extra))
-
-    # Strip inline closed <think>...</think> blocks emitted by R1/QwQ/Qwen3 models
-    inline_thinks = _THINK_TAG_RE.findall(text)
-    if inline_thinks:
-        for block in inline_thinks:
-            if block.strip():
-                thinking_parts.append(block.strip())
-        text = _THINK_TAG_RE.sub("", text)
-
-    # Also strip any unclosed trailing <think>... block (e.g. model truncated on max_tokens mid-thought)
-    unclosed_match = _UNCLOSED_THINK_TAG_RE.search(text)
-    if unclosed_match:
-        unclosed_inner = unclosed_match.group(1).strip()
-        if unclosed_inner:
-            thinking_parts.append(unclosed_inner)
-        text = text[: unclosed_match.start()]
-
-    clean_text = text.strip()
-    thinking = "\n\n".join(thinking_parts).strip() or None
-    return clean_text, thinking
-
-
-def _extract_chunk_thinking_delta(chunk: Any) -> str:
-    """Extract incremental reasoning/thinking text from a streamed AIMessageChunk."""
-    parts: list[str] = []
-    extra = getattr(chunk, "additional_kwargs", None) or {}
-    if isinstance(extra, dict):
-        found_plain = False
-        for key in ("reasoning_content", "reasoning", "thinking"):
-            val = extra.get(key)
-            if isinstance(val, str) and val:
-                parts.append(val)
-                found_plain = True
-        if not found_plain:
-            details = extra.get("reasoning_details")
-            if isinstance(details, list):
-                for item in details:
-                    if isinstance(item, dict):
-                        item_type = str(item.get("type") or "").lower()
-                        if item_type and "encrypted" in item_type:
-                            continue
-                        t = item.get("text") or item.get("summary") or item.get("content")
-                        if isinstance(t, str) and t:
-                            parts.append(t)
-    raw_content = getattr(chunk, "content", None)
-    if isinstance(raw_content, list):
-        for item in raw_content:
-            if isinstance(item, dict):
-                item_type = str(item.get("type") or "").lower()
-                if item_type in ("thinking", "reasoning"):
-                    val = item.get("thinking") or item.get("reasoning") or item.get("text")
-                    if isinstance(val, str) and val:
-                        parts.append(val)
-    return "".join(parts)
 
 
 async def _invoke_model_with_live_thinking(
@@ -1152,8 +985,8 @@ async def _invoke_model_with_live_thinking(
         if callable(aclose):
             try:
                 await aclose()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as close_exc:  # noqa: BLE001
+                logger.debug("Ignored stream aclose error: %s", close_exc)
 
     _flush_thinking(force=True)
 
@@ -1227,141 +1060,6 @@ async def _invoke_model_with_live_thinking(
     return AIMessage(**ai_kwargs)
 
 
-def _get_finish_reason(ai_msg: AIMessage | None) -> str:
-    if ai_msg is None:
-        return ""
-    meta = getattr(ai_msg, "response_metadata", None) or {}
-    return _normalize_finish_reason(
-        meta.get("finish_reason") or meta.get("normalized_finish_reason")
-    )
-
-
-def _sanitize_ai_message_for_history(ai_msg: AIMessage) -> AIMessage:
-    """Ensure saved AIMessages never retain invalid_tool_calls or mismatched raw tool_calls in additional_kwargs."""
-    valid_tcs = list(getattr(ai_msg, "tool_calls", None) or [])
-    extra = dict(getattr(ai_msg, "additional_kwargs", None) or {})
-    inv_tcs = list(getattr(ai_msg, "invalid_tool_calls", None) or [])
-    has_raw_ak = "tool_calls" in extra or "function_call" in extra
-
-    if not has_raw_ak and not inv_tcs:
-        return ai_msg
-
-    # Always strip raw additional_kwargs tool_calls/function_call (LangChain serializes
-    # AIMessage.tool_calls directly) and clear invalid_tool_calls so broken IDs never leak into history.
-    extra.pop("tool_calls", None)
-    extra.pop("function_call", None)
-    cleaned_kwargs: dict[str, Any] = {
-        "content": ai_msg.content,
-        "additional_kwargs": extra,
-        "response_metadata": dict(getattr(ai_msg, "response_metadata", None) or {}),
-        "tool_calls": valid_tcs,
-        "invalid_tool_calls": [],
-    }
-    if getattr(ai_msg, "id", None):
-        cleaned_kwargs["id"] = ai_msg.id
-    if getattr(ai_msg, "usage_metadata", None):
-        cleaned_kwargs["usage_metadata"] = ai_msg.usage_metadata
-    return AIMessage(**cleaned_kwargs)
-
-
-def _sanitize_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Repair orphaned assistant tool_calls AND drop orphaned ToolMessages before calling an LLM."""
-    sanitized: list[BaseMessage] = []
-    n = len(messages)
-    active_tool_ids: set[str] | None = None
-    active_allow_any_id = False
-
-    for idx, msg in enumerate(messages):
-        if isinstance(msg, ToolMessage):
-            tid = str(getattr(msg, "tool_call_id", "") or "")
-            if active_tool_ids is not None:
-                if active_allow_any_id:
-                    sanitized.append(msg)
-                elif tid and tid in active_tool_ids:
-                    active_tool_ids.remove(tid)
-                    sanitized.append(msg)
-            # Otherwise drop orphaned ToolMessage whose parent AIMessage was missing or stripped
-            continue
-
-        active_tool_ids = None
-        active_allow_any_id = False
-
-        if not isinstance(msg, AIMessage):
-            sanitized.append(msg)
-            continue
-
-        tcs = list(getattr(msg, "tool_calls", None) or [])
-        ak = dict(getattr(msg, "additional_kwargs", None) or {})
-        inv_tcs = list(getattr(msg, "invalid_tool_calls", None) or [])
-        has_raw_ak_tc = bool(ak.get("tool_calls") or ak.get("function_call"))
-        if not tcs and not has_raw_ak_tc and not inv_tcs:
-            sanitized.append(msg)
-            continue
-
-        expected_ids = {
-            str(tc.get("id")) for tc in tcs if isinstance(tc, dict) and tc.get("id")
-        }
-        seen_ids: set[str] = set()
-        j = idx + 1
-        while j < n and isinstance(messages[j], ToolMessage):
-            tid = str(getattr(messages[j], "tool_call_id", "") or "")
-            if tid:
-                seen_ids.add(tid)
-            j += 1
-
-        if tcs and (not expected_ids or expected_ids.issubset(seen_ids)):
-            sanitized.append(_sanitize_ai_message_for_history(msg))
-            active_tool_ids = set(expected_ids)
-            active_allow_any_id = len(expected_ids) == 0
-        else:
-            # Strip orphaned/incomplete tool_calls so OpenAI-compatible gateways never reject the thread with HTTP 400.
-            # Leaving active_tool_ids = None also drops any partial ToolMessages that immediately followed.
-            ak.pop("tool_calls", None)
-            ak.pop("function_call", None)
-            clean_text, _ = _extract_text_and_thinking(msg)
-            sanitized.append(
-                AIMessage(
-                    content=clean_text or "(Previous tool call was interrupted before execution.)",
-                    additional_kwargs=ak,
-                    response_metadata=dict(getattr(msg, "response_metadata", None) or {}),
-                    tool_calls=[],
-                    invalid_tool_calls=[],
-                )
-            )
-    return sanitized
-
-
-def _build_recovery_messages(
-    prompt_messages: list[BaseMessage],
-    nudge_text: str,
-) -> list[BaseMessage]:
-    """Construct role-alternation-safe retry messages accepted by strict OpenAI/Anthropic/Gemini gateways."""
-    msgs = list(prompt_messages)
-    if not msgs:
-        return [HumanMessage(content=nudge_text)]
-
-    last = msgs[-1]
-    if isinstance(last, HumanMessage):
-        if isinstance(last.content, list):
-            merged_content: Any = [*last.content, {"type": "text", "text": f"\n\n{nudge_text}"}]
-        else:
-            existing = str(last.content or "").rstrip()
-            merged_content = f"{existing}\n\n{nudge_text}" if existing else nudge_text
-        msgs[-1] = HumanMessage(
-            content=merged_content,
-            additional_kwargs=dict(getattr(last, "additional_kwargs", None) or {}),
-        )
-        return msgs
-
-    if isinstance(last, ToolMessage):
-        msgs.append(AIMessage(content="I reviewed the tool outputs above."))
-        msgs.append(HumanMessage(content=nudge_text))
-        return msgs
-
-    msgs.append(HumanMessage(content=nudge_text))
-    return msgs
-
-
 def _build_model_with_bumped_max_tokens(
     base_model: Any,
     active_tool_list: list[BaseTool],
@@ -1421,43 +1119,6 @@ def _build_model_with_bumped_max_tokens(
         return bound, base_model, cur_max if isinstance(cur_max, int) else None
 
 
-def _build_empty_output_diagnostic(
-    *,
-    last_ai: AIMessage | None,
-    plan: list[PlanStep],
-    turn_count: int,
-) -> str:
-    finish_reason = _get_finish_reason(last_ai)
-    completed_steps = [s for s in plan if s.get("status") == "completed"]
-    parts: list[str] = []
-
-    if finish_reason == "length":
-        parts.append(
-            "I hit the configured **Max Tokens** output limit before finishing my response or tool call "
-            "even after retrying."
-        )
-        parts.append(
-            "**How to fix this:** Open **Settings → LLM Config** and increase **Max Tokens** "
-            "(for example, to `16384`), or lower the **Thinking Mode** level for large file generation tasks."
-        )
-    else:
-        parts.append(
-            "The model returned an empty completion after retries without producing a visible message or valid tool call."
-        )
-        parts.append(
-            "You can send a follow-up message (for example, *\"Continue\"*) or check your provider settings."
-        )
-
-    if completed_steps:
-        step_lines = "\n".join(
-            f"- **{s['step_id']}** ({s['tool_or_action']}): {s['result'][:140] or s['description'][:140]}"
-            for s in completed_steps[-5:]
-        )
-        parts.append(f"**Completed before stopping (turn {turn_count}):**\n{step_lines}")
-
-    return "\n\n".join(parts)
-
-
 def build_supervisor_graph(
     *,
     primary_model: BaseChatModel,
@@ -1467,27 +1128,47 @@ def build_supervisor_graph(
     mcp_tools: list[BaseTool] | None = None,
     extra_tools: list[BaseTool] | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
-    max_turns: int = DEFAULT_MAX_TURNS,
-    max_tool_retries: int = DEFAULT_MAX_TOOL_RETRIES,
+    max_turns: int | None = None,
+    max_tool_retries: int | None = None,
     compaction_threshold: int | None = None,
     allow_private_web_fetch: bool = False,
+    config: AgentConfig | None = None,
+    model_override_resolver: ModelOverrideResolver | None = None,
 ) -> tuple[Any, dict[str, BaseTool], set[str]]:
+    cfg = config or AgentConfig()
+    effective_max_turns_default = max_turns if max_turns is not None else cfg.limits.max_turns
+    effective_max_tool_retries = (
+        max_tool_retries if max_tool_retries is not None else cfg.limits.max_tool_retries
+    )
+    effective_compaction_threshold = (
+        compaction_threshold
+        if compaction_threshold is not None
+        else cfg.limits.tool_output_compaction_threshold
+    )
+    auto_compact_threshold = cfg.limits.auto_compact_threshold
+    guardrail_policy = cfg.guardrail_policy
+
     resolved_sandbox = sandbox or SandboxManager()
     resolved_skills = skills or SkillRegistry()
     resolved_worker_model = worker_model or primary_model
 
-    local_tools = build_local_tools(
-        resolved_sandbox,
-        allow_private_web_fetch=allow_private_web_fetch,
-        extract_model_factory=lambda: current_worker_model.get() or resolved_worker_model,
+    local_tools: list[BaseTool] = (
+        build_local_tools(
+            resolved_sandbox,
+            allow_private_web_fetch=allow_private_web_fetch,
+            extract_model_factory=lambda: current_worker_model.get() or resolved_worker_model,
+            include_web_tools=cfg.enable_web_tools,
+        )
+        if cfg.include_default_tools
+        else []
     )
-    load_skill_tool = make_load_skill_tool(resolved_skills)
+    skill_tools: list[BaseTool] = [make_load_skill_tool(resolved_skills)] if cfg.enable_skills else []
 
     mcp_list = list(mcp_tools or [])
     mcp_names: set[str] = {t.name for t in mcp_list}
 
     base_tools: dict[str, BaseTool] = {}
-    for t in [*local_tools, load_skill_tool, *mcp_list, *(extra_tools or [])]:
+    for t in [*local_tools, *skill_tools, *mcp_list, *(extra_tools or [])]:
         base_tools[t.name] = t
 
     def _active_base_tools() -> dict[str, BaseTool]:
@@ -1502,18 +1183,21 @@ def build_supervisor_graph(
             return mcp_names
         return mcp_names | dyn_mcp
 
-    spawn_tool = make_spawn_subagent_tool(
-        worker_model_factory=lambda: current_worker_model.get() or resolved_worker_model,
-        available_tools=_active_base_tools,
-        mcp_tool_names=_active_mcp_names,
-        workspace_dir=str(resolved_sandbox.config.workspace_dir),
-    )
+    tools_by_name: dict[str, BaseTool] = dict(base_tools)
+    if cfg.enable_subagents:
+        spawn_tool = make_spawn_subagent_tool(
+            worker_model_factory=lambda: current_worker_model.get() or resolved_worker_model,
+            available_tools=_active_base_tools,
+            mcp_tool_names=_active_mcp_names,
+            workspace_dir=str(resolved_sandbox.config.workspace_dir),
+            guardrail_policy=guardrail_policy,
+        )
+        tools_by_name[spawn_tool.name] = spawn_tool
 
-    tools_by_name: dict[str, BaseTool] = {**base_tools, spawn_tool.name: spawn_tool}
     all_tool_list = list(tools_by_name.values())
     default_bound_model: Any = (
         primary_model.bind_tools(all_tool_list)
-        if hasattr(primary_model, "bind_tools")
+        if all_tool_list and hasattr(primary_model, "bind_tools")
         else primary_model
     )
 
@@ -1525,7 +1209,7 @@ def build_supervisor_graph(
 
     async def plan_node(state: AgentState) -> dict[str, Any]:
         turn_count = int(state.get("turn_count", 0)) + 1
-        effective_max = int(state.get("max_turns", max_turns))
+        effective_max = int(state.get("max_turns", effective_max_turns_default))
         messages = list(state.get("messages", []))
         current_plan: list[PlanStep] = list(state.get("plan", []))
         active_skills: list[str] = list(state.get("active_skills", []))
@@ -1543,12 +1227,35 @@ def build_supervisor_graph(
             steps_completed=completed_count,
             detail=start_detail,
         )
+        await invoke_agent_hook(
+            cfg.hooks.on_turn_start,
+            {
+                "thread_id": str(state.get("thread_id") or "default"),
+                "turn_count": turn_count,
+                "max_turns": effective_max,
+                "completed_steps": completed_count,
+            },
+        )
 
         if turn_count > effective_max:
             return {
                 "turn_count": turn_count,
                 "next_action": "complete",
                 "reflection": f"Reached MAX_TURNS ({effective_max}); stopping loop safely.",
+            }
+
+        deadline = current_run_deadline.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            limit_s = cfg.limits.max_wall_clock_seconds
+            timeout_note = (
+                f"Stopped after reaching max_wall_clock_seconds ({limit_s:g}s) safety limit "
+                f"at turn {turn_count - 1}/{effective_max}."
+            )
+            return {
+                "turn_count": turn_count - 1,
+                "next_action": "complete",
+                "reflection": timeout_note,
+                "final_response": timeout_note,
             }
 
         user_goal = _latest_human_text(messages)
@@ -1605,8 +1312,12 @@ def build_supervisor_graph(
 
         active_tools = _active_tools_map()
         active_tool_list = list(active_tools.values())
-        dynamic_skill_catalog = resolved_skills.format_catalog_for_prompt()
-        loaded_skills_text = build_loaded_skills_context(active_skills, resolved_skills)
+        dynamic_skill_catalog = (
+            resolved_skills.format_catalog_for_prompt() if cfg.enable_skills else ""
+        )
+        loaded_skills_text = (
+            build_loaded_skills_context(active_skills, resolved_skills) if cfg.enable_skills else ""
+        )
         compacted_summary = str(state.get("compacted_summary") or "")
         compaction_count = int(state.get("compaction_count") or 0)
         last_compacted_at: str | None = state.get("last_compacted_at")
@@ -1620,6 +1331,8 @@ def build_supervisor_graph(
                 plan=updated_plan,
                 turn_count=turn_count,
                 max_turns=effective_max,
+                persona=cfg.persona,
+                enable_skills=cfg.enable_skills,
             )
             return base_sys + build_compacted_memory_block(summary_text)
 
@@ -1630,10 +1343,10 @@ def build_supervisor_graph(
         if override_primary is not None:
             active_bound_model: Any = (
                 override_primary.bind_tools(active_tool_list)
-                if hasattr(override_primary, "bind_tools")
+                if active_tool_list and hasattr(override_primary, "bind_tools")
                 else override_primary
             )
-        elif has_dynamic_tools and hasattr(primary_model, "bind_tools"):
+        elif has_dynamic_tools and active_tool_list and hasattr(primary_model, "bind_tools"):
             active_bound_model = primary_model.bind_tools(active_tool_list)
         else:
             active_bound_model = default_bound_model
@@ -1691,9 +1404,10 @@ def build_supervisor_graph(
             compaction_count=compaction_count,
             last_compacted_at=last_compacted_at,
             tokens_saved_last_compaction=last_compaction_saved_tokens,
+            auto_compact_threshold=auto_compact_threshold,
         )
 
-        # Auto-compact conversation strictly at >= 80% of this model's known context window ONLY
+        # Auto-compact conversation strictly at >= configured threshold (default 80%) of known context window ONLY
         removal_messages: list[RemoveMessage] = []
         known_ctx_window = pre_context_usage.get("context_window")
         usage_ratio = (
@@ -1701,7 +1415,12 @@ def build_supervisor_graph(
             if isinstance(known_ctx_window, int) and known_ctx_window >= 512
             else 0.0
         )
-        if isinstance(known_ctx_window, int) and known_ctx_window >= 512 and should_auto_compact(usage_ratio, len(messages)):
+        if (
+            cfg.enable_auto_compaction
+            and isinstance(known_ctx_window, int)
+            and known_ctx_window >= 512
+            and should_auto_compact(usage_ratio, len(messages), threshold=auto_compact_threshold)
+        ):
             compact_ev_id = f"compact-{compaction_count + 1}-{turn_count}"
             compact_start_ev = {
                 "id": compact_ev_id,
@@ -1756,6 +1475,7 @@ def build_supervisor_graph(
                     compaction_count=compaction_count,
                     last_compacted_at=last_compacted_at,
                     tokens_saved_last_compaction=last_compaction_saved_tokens,
+                    auto_compact_threshold=auto_compact_threshold,
                 )
             compact_done_ev = {
                 "id": compact_ev_id,
@@ -1776,9 +1496,19 @@ def build_supervisor_graph(
                 tool_event=compact_done_ev,
                 context_usage=pre_context_usage,
                 detail=(
-                    f"Auto-compacted conversation at 80% threshold "
+                    f"Auto-compacted conversation at {pre_context_usage['auto_compact_threshold_percent']}% threshold "
                     f"(now {pre_context_usage['usage_percent']}%)"
                 ),
+            )
+            await invoke_agent_hook(
+                cfg.hooks.on_compaction,
+                {
+                    "thread_id": str(state.get("thread_id") or "default"),
+                    "turn_count": turn_count,
+                    "compaction_count": compaction_count,
+                    "tokens_saved": saved_tokens,
+                    "usage_percent_after": pre_context_usage.get("usage_percent"),
+                },
             )
 
         sanitized_history = _sanitize_messages_for_llm(messages)
@@ -1879,10 +1609,14 @@ def build_supervisor_graph(
                             "primary",
                             override={"provider": fb_provider, "model": fb_model_name},
                         )
-                        fb_llm = build_chat_model("primary", spec=fb_spec, require_api_key=True)
+                        fb_llm = (
+                            model_override_resolver("primary", fb_spec)
+                            if model_override_resolver is not None
+                            else build_chat_model("primary", spec=fb_spec, require_api_key=True)
+                        )
                         fb_bound: Any = (
                             fb_llm.bind_tools(active_tool_list)
-                            if hasattr(fb_llm, "bind_tools")
+                            if active_tool_list and hasattr(fb_llm, "bind_tools")
                             else fb_llm
                         )
                         reply = await _invoke_once(fb_bound)
@@ -2192,6 +1926,7 @@ def build_supervisor_graph(
             compaction_count=compaction_count,
             last_compacted_at=last_compacted_at,
             tokens_saved_last_compaction=last_compaction_saved_tokens,
+            auto_compact_threshold=auto_compact_threshold,
         )
 
         emit_progress(
@@ -2316,10 +2051,10 @@ def build_supervisor_graph(
 
             retry_key = f"{tc_name}:{json.dumps(tc_args, sort_keys=True, default=str)[:120]}"
             prior_failures = retry_counts.get(retry_key, 0)
-            if prior_failures >= max_tool_retries:
+            if prior_failures >= effective_max_tool_retries:
                 err_text = (
                     f"RETRY LIMIT EXCEEDED: Tool '{tc_name}' already failed "
-                    f"{prior_failures} times with the same arguments (limit={max_tool_retries}). "
+                    f"{prior_failures} times with the same arguments (limit={effective_max_tool_retries}). "
                     "Choose a different approach or inform the user."
                 )
                 tool_messages.append(
@@ -2363,8 +2098,17 @@ def build_supervisor_graph(
                 tool_event=start_tool_event,
                 detail=f"Running {tc_name}" + (f" ({args_summary})" if args_summary else ""),
             )
+            await invoke_agent_hook(
+                cfg.hooks.on_tool_start,
+                {
+                    "thread_id": thread_id,
+                    "tool": tc_name,
+                    "tool_call_id": tc_id,
+                    "arguments": tc_args,
+                },
+            )
 
-            before_snap = _snapshot_workspace(ws_dir)
+            before_snap = _snapshot_workspace(ws_dir) if cfg.enable_workspace_diff else {}
             tool_task_label = f"{tc_name} ({args_summary})" if args_summary else tc_name
             try:
                 with track_active_task(
@@ -2377,6 +2121,7 @@ def build_supervisor_graph(
                         tc_args,
                         is_mcp_tool=(tc_name in active_mcp_names),
                         source="supervisor",
+                        policy=guardrail_policy,
                     )
             except GraphInterrupt:
                 raise
@@ -2398,6 +2143,16 @@ def build_supervisor_graph(
                     tool_event=err_tool_event,
                     detail=f"Tool '{tc_name}' failed",
                 )
+                await invoke_agent_hook(
+                    cfg.hooks.on_tool_end,
+                    {
+                        "thread_id": thread_id,
+                        "tool": tc_name,
+                        "tool_call_id": tc_id,
+                        "status": "error",
+                        "error": err_text,
+                    },
+                )
                 tool_messages.append(
                     ToolMessage(content=err_text, tool_call_id=tc_id, name=tc_name)
                 )
@@ -2415,24 +2170,28 @@ def build_supervisor_graph(
                 obs_status = "ok"
                 retry_counts.pop(retry_key, None)
 
-            after_snap = _snapshot_workspace(ws_dir)
-            step_file_changes = _diff_workspace_snapshots(before_snap, after_snap, tool_name=tc_name)
-
-            # Fallback for identical-content overwrites via write_file/edit_file within same fs tick
-            if obs_status == "ok" and tc_name in ("write_file", "edit_file") and not step_file_changes:
-                raw_target = str(tc_args.get("path") or "").strip().lstrip("/")
-                if raw_target.startswith("workspace/"):
-                    raw_target = raw_target[len("workspace/") :]
-                if raw_target and raw_target in after_snap and not after_snap[raw_target][0]:
-                    step_file_changes.append(
-                        {
-                            "kind": "file",
-                            "action": "modified",
-                            "path": raw_target,
-                            "tool": tc_name,
-                            "timestamp": datetime.now(UTC).isoformat(),
-                        }
-                    )
+            if cfg.enable_workspace_diff:
+                after_snap = _snapshot_workspace(ws_dir)
+                step_file_changes = _diff_workspace_snapshots(
+                    before_snap, after_snap, tool_name=tc_name
+                )
+                # Fallback for identical-content overwrites via write_file/edit_file within same fs tick
+                if obs_status == "ok" and tc_name in ("write_file", "edit_file") and not step_file_changes:
+                    raw_target = str(tc_args.get("path") or "").strip().lstrip("/")
+                    if raw_target.startswith("workspace/"):
+                        raw_target = raw_target[len("workspace/") :]
+                    if raw_target and raw_target in after_snap and not after_snap[raw_target][0]:
+                        step_file_changes.append(
+                            {
+                                "kind": "file",
+                                "action": "modified",
+                                "path": raw_target,
+                                "tool": tc_name,
+                                "timestamp": datetime.now(UTC).isoformat(),
+                            }
+                        )
+            else:
+                step_file_changes = []
 
             _record_run_file_changes(step_file_changes)
 
@@ -2453,7 +2212,7 @@ def build_supervisor_graph(
                 tc_name,
                 raw_output,
                 workspace_dir=ws_dir,
-                threshold=compaction_threshold,
+                threshold=effective_compaction_threshold,
             )
 
             done_tool_event = {
@@ -2471,6 +2230,17 @@ def build_supervisor_graph(
                 tool_event=done_tool_event,
                 file_changes=step_file_changes,
                 detail=f"Finished {tc_name} ({obs_status})",
+            )
+            await invoke_agent_hook(
+                cfg.hooks.on_tool_end,
+                {
+                    "thread_id": thread_id,
+                    "tool": tc_name,
+                    "tool_call_id": tc_id,
+                    "status": obs_status,
+                    "audit": audit,
+                    "file_changes": step_file_changes,
+                },
             )
 
             tool_messages.append(
@@ -2552,7 +2322,7 @@ def build_supervisor_graph(
 
     async def reflect_node(state: AgentState) -> dict[str, Any]:
         turn_count = int(state.get("turn_count", 0))
-        effective_max = int(state.get("max_turns", max_turns))
+        effective_max = int(state.get("max_turns", effective_max_turns_default))
         observations = list(state.get("last_observations", []))
         last_ai = _latest_ai_message(list(state.get("messages", [])))
         emit_progress(
@@ -2575,6 +2345,18 @@ def build_supervisor_graph(
             return {
                 "next_action": "complete",
                 "reflection": f"Reached MAX_TURNS ({effective_max}); producing final summary.",
+            }
+
+        deadline = current_run_deadline.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            limit_s = cfg.limits.max_wall_clock_seconds
+            return {
+                "next_action": "complete",
+                "reflection": f"Reached max_wall_clock_seconds ({limit_s:g}s); producing final summary.",
+                "final_response": (
+                    f"Stopped after reaching max_wall_clock_seconds ({limit_s:g}s) safety limit "
+                    f"at turn {turn_count}/{effective_max}."
+                ),
             }
 
         if observations:
@@ -2619,7 +2401,7 @@ def build_supervisor_graph(
                 return {"final_response": text}
 
         turn_count = int(state.get("turn_count", 0))
-        effective_max = int(state.get("max_turns", max_turns))
+        effective_max = int(state.get("max_turns", effective_max_turns_default))
         plan = list(state.get("plan", []))
         completed_steps = [s for s in plan if s["status"] == "completed"]
         if turn_count >= effective_max:
@@ -2693,16 +2475,9 @@ async def create_agent_runtime(
     compaction_threshold: int | None = None,
     allow_private_web_fetch: bool = False,
     model_override_resolver: ModelOverrideResolver | None = None,
+    config: AgentConfig | None = None,
 ) -> AsyncIterator[AgentRuntime]:
-    def _prepare_db_path() -> Path:
-        resolved = Path(
-            checkpoint_db_path if checkpoint_db_path is not None else DEFAULT_CHECKPOINT_DB_PATH
-        ).resolve()
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        return resolved
-
-    db_path = await asyncio.to_thread(_prepare_db_path)
-
+    cfg = config or AgentConfig()
     resolved_sandbox = sandbox or SandboxManager()
     resolved_skills = skills or SkillRegistry()
     resolved_mcp = mcp_manager or MCPRegistryManager()
@@ -2714,14 +2489,81 @@ async def create_agent_runtime(
     resolved_primary = primary_model or get_primary_model()
     resolved_worker = worker_model or get_worker_model()
 
-    effective_max_turns = DEFAULT_MAX_TURNS if max_turns is None else max_turns
+    effective_max_turns = cfg.limits.max_turns if max_turns is None else max_turns
     effective_max_retries = (
-        DEFAULT_MAX_TOOL_RETRIES if max_tool_retries is None else max_tool_retries
+        cfg.limits.max_tool_retries if max_tool_retries is None else max_tool_retries
+    )
+    effective_compaction_threshold = (
+        cfg.limits.tool_output_compaction_threshold
+        if compaction_threshold is None
+        else compaction_threshold
     )
 
-    conn = await aiosqlite.connect(str(db_path))
+    default_prim_meta = (
+        load_model_spec("primary", include_persisted=True).safe_summary()
+        if primary_model is None
+        else _describe_model_instance(resolved_primary)
+    )
+    default_work_meta = (
+        load_model_spec("worker", include_persisted=True).safe_summary()
+        if worker_model is None
+        else _describe_model_instance(resolved_worker)
+    )
+
+    raw_db_arg = (
+        checkpoint_db_path if checkpoint_db_path is not None else DEFAULT_CHECKPOINT_DB_PATH
+    )
+    is_in_memory = str(raw_db_arg).strip() == ":memory:"
+
+    if cfg.custom_checkpointer is not None:
+        db_path = Path(":memory:") if is_in_memory else Path(raw_db_arg)
+        compiled, tools_by_name, mcp_names = build_supervisor_graph(
+            primary_model=resolved_primary,
+            worker_model=resolved_worker,
+            sandbox=resolved_sandbox,
+            skills=resolved_skills,
+            mcp_tools=mcp_tools,
+            extra_tools=extra_tools,
+            checkpointer=cfg.custom_checkpointer,
+            max_turns=effective_max_turns,
+            max_tool_retries=effective_max_retries,
+            compaction_threshold=effective_compaction_threshold,
+            allow_private_web_fetch=allow_private_web_fetch,
+            config=cfg,
+            model_override_resolver=model_override_resolver,
+        )
+        yield AgentRuntime(
+            graph=compiled,
+            sandbox=resolved_sandbox,
+            skills=resolved_skills,
+            mcp_manager=resolved_mcp,
+            tools_by_name=tools_by_name,
+            mcp_tool_names=mcp_names,
+            checkpoint_db_path=db_path,
+            max_turns=effective_max_turns,
+            max_tool_retries=effective_max_retries,
+            default_primary_summary=default_prim_meta,
+            default_worker_summary=default_work_meta,
+            model_override_resolver=model_override_resolver,
+            config=cfg,
+        )
+        return
+
+    if is_in_memory:
+        db_path = Path(":memory:")
+        conn = await aiosqlite.connect(":memory:")
+    else:
+        def _prepare_db_path() -> Path:
+            resolved = Path(raw_db_arg).resolve()
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            return resolved
+
+        db_path = await asyncio.to_thread(_prepare_db_path)
+        conn = await aiosqlite.connect(str(db_path))
+
     try:
-        await conn.execute("PRAGMA journal_mode=WAL;")
+        if not is_in_memory:
+            await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.commit()
 
@@ -2738,19 +2580,10 @@ async def create_agent_runtime(
             checkpointer=checkpointer,
             max_turns=effective_max_turns,
             max_tool_retries=effective_max_retries,
-            compaction_threshold=compaction_threshold,
+            compaction_threshold=effective_compaction_threshold,
             allow_private_web_fetch=allow_private_web_fetch,
-        )
-
-        default_prim_meta = (
-            load_model_spec("primary", include_persisted=True).safe_summary()
-            if primary_model is None
-            else _describe_model_instance(resolved_primary)
-        )
-        default_work_meta = (
-            load_model_spec("worker", include_persisted=True).safe_summary()
-            if worker_model is None
-            else _describe_model_instance(resolved_worker)
+            config=cfg,
+            model_override_resolver=model_override_resolver,
         )
 
         yield AgentRuntime(
@@ -2766,6 +2599,7 @@ async def create_agent_runtime(
             default_primary_summary=default_prim_meta,
             default_worker_summary=default_work_meta,
             model_override_resolver=model_override_resolver,
+            config=cfg,
         )
     finally:
         await conn.close()

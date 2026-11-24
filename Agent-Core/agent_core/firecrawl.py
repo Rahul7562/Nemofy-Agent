@@ -214,8 +214,8 @@ def _extract_error_details(resp: httpx.Response) -> tuple[str, str | None]:
                 val = data.get(key)
                 if isinstance(val, str) and val.strip():
                     return val.strip(), code
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Non-JSON Firecrawl error body: %s", exc)
     body = (resp.text or "").strip()
     return (body[:300] if body else f"HTTP {resp.status_code}"), code
 
@@ -370,7 +370,7 @@ class FirecrawlClient:
                         delay = (
                             retry_after
                             if retry_after is not None
-                            else min(8.0, (1.0 * (2 ** (attempt - 1))) + random.uniform(0.1, 0.4))
+                            else min(8.0, (1.0 * (2 ** (attempt - 1))) + random.uniform(0.1, 0.4))  # noqa: S311
                         )
                         logger.warning(
                             "firecrawl_retry endpoint=%s status=429 attempt=%d/%d delay_s=%.2f elapsed_ms=%d",
@@ -428,7 +428,7 @@ class FirecrawlClient:
                     return data if isinstance(data, dict) else {"success": True, "data": data}
 
             if last_err is not None and last_err.retryable and attempt < max_attempts:
-                delay = min(6.0, (0.8 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.35))
+                delay = min(6.0, (0.8 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.35))  # noqa: S311
                 logger.warning(
                     "firecrawl_retry endpoint=%s category=%s attempt=%d/%d delay_s=%.2f",
                     path,
@@ -479,8 +479,8 @@ class FirecrawlClient:
                             engine = body_json["engine"].strip()
                         if isinstance(body_json.get("version"), str):
                             version = body_json["version"].strip()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Non-JSON Firecrawl /health response: %s", exc)
 
                 mode = "firecrawl_local" if engine == "firecrawl-local" else default_mode
                 return {
@@ -576,17 +576,20 @@ class FirecrawlClient:
         and immediately shuts down the ephemeral listener. Keeps `firecrawl-local serve` locked
         against private/loopback SSRF while reusing the exact official Firecrawl document parsers.
         """
-        resolved = Path(file_path).resolve()
-        if not resolved.exists():
-            raise FileNotFoundError(f"Document not found: {file_path}")
-        if not resolved.is_file():
-            raise IsADirectoryError(f"Path is not a file: {file_path}")
+        def _read_local_doc(raw_path: str | Path) -> tuple[Path, bytes]:
+            target = Path(raw_path).resolve()
+            if not target.exists():
+                raise FileNotFoundError(f"Document not found: {raw_path}")
+            if not target.is_file():
+                raise IsADirectoryError(f"Path is not a file: {raw_path}")
+            data = target.read_bytes()
+            if len(data) > MAX_LOCAL_DOCUMENT_BYTES:
+                raise ValueError(
+                    f"Document exceeds maximum supported size ({len(data):,} > {MAX_LOCAL_DOCUMENT_BYTES:,} bytes)."
+                )
+            return target, data
 
-        raw_bytes = resolved.read_bytes()
-        if len(raw_bytes) > MAX_LOCAL_DOCUMENT_BYTES:
-            raise ValueError(
-                f"Document exceeds maximum supported size ({len(raw_bytes):,} > {MAX_LOCAL_DOCUMENT_BYTES:,} bytes)."
-            )
+        resolved, raw_bytes = await asyncio.to_thread(_read_local_doc, file_path)
 
         bin_path = binary_path or find_firecrawl_local_binary()
         if not bin_path:
@@ -650,7 +653,7 @@ class FirecrawlClient:
                     proc.communicate(),
                     timeout=effective_timeout + 5.0,
                 )
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 proc.kill()
                 await proc.communicate()
                 raise FirecrawlError(

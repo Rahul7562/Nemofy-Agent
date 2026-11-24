@@ -25,32 +25,21 @@ def main() -> int:
     mypy_bin = str(venv_bin / "mypy")
     pytest_bin = str(venv_bin / "pytest")
 
-    steps: list[tuple[str, list[str]]] = [
-        (
-            "Syntax Compile Check",
-            [
-                py,
-                "-m",
-                "py_compile",
-                "Agent-Core/main.py",
-                "Agent-Core/agent_core/models.py",
-                "Agent-Core/agent_core/state.py",
-                "Agent-Core/agent_core/planner.py",
-                "Agent-Core/agent_core/graph.py",
-                "Agent-Core/agent_core/skills.py",
-                "Agent-Core/agent_core/subagents.py",
-                "Agent-Core/agent_core/sandbox.py",
-                "Agent-Core/agent_core/guardrails.py",
-                "Agent-Core/agent_core/jobs.py",
-                "Agent-Core/agent_core/api.py",
-                "Agent-Core/agent_core/tools/local.py",
-                "MCPs/manager.py",
-            ],
-        ),
-        ("Ruff Linter", [ruff_bin, "check", "Agent-Core", "MCPs"]),
-        ("Mypy Type Checker", [mypy_bin, "Agent-Core/main.py", "Agent-Core/agent_core", "MCPs"]),
-        ("Pytest Full Verification Suite", [pytest_bin, "Agent-Core/tests", "-v"]),
+    py_files = [
+        "Agent-Core/main.py",
+        *[str(p) for p in sorted(Path("Agent-Core/agent_core").rglob("*.py"))],
+        "MCPs/manager.py",
     ]
+
+    steps: list[tuple[str, list[str]]] = [
+        ("Syntax Compile Check", [py, "-m", "py_compile", *py_files]),
+        ("Ruff Linter", [ruff_bin, "check", "Agent-Core", "MCPs"]),
+    ]
+    if Path(mypy_bin).exists():
+        steps.append(
+            ("Mypy Type Checker", [mypy_bin, "Agent-Core/main.py", "Agent-Core/agent_core", "MCPs"])
+        )
+    steps.append(("Pytest Full Verification Suite", [pytest_bin, "Agent-Core/tests", "-v"]))
 
     failed = 0
     for label, cmd in steps:

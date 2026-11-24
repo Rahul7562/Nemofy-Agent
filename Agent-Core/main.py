@@ -24,21 +24,25 @@ for _p in (str(_AGENT_CORE_DIR), str(_REPO_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
-from langgraph.types import Command
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.table import Table
+from dotenv import load_dotenv  # noqa: E402
+from langchain_core.messages import HumanMessage  # noqa: E402
+from langgraph.types import Command  # noqa: E402
+from MCPs.manager import MCPRegistryManager  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.panel import Panel  # noqa: E402
+from rich.prompt import Prompt  # noqa: E402
+from rich.table import Table  # noqa: E402
 
-from agent_core.graph import AgentRuntime, create_agent_runtime
-from agent_core.models import ModelConfigurationError, load_model_spec, probe_model_connectivity
-from agent_core.sandbox import SandboxManager
-from agent_core.skills import SkillRegistry
-from agent_core.state import PlanStep, make_initial_state
-from agent_core.tools.local import current_session_id
-from MCPs.manager import MCPRegistryManager
+from agent_core.graph import AgentRuntime, create_agent_runtime  # noqa: E402
+from agent_core.models import (  # noqa: E402
+    ModelConfigurationError,
+    load_model_spec,
+    probe_model_connectivity,
+)
+from agent_core.sandbox import SandboxManager  # noqa: E402
+from agent_core.skills import SkillRegistry  # noqa: E402
+from agent_core.state import PlanStep, make_initial_state  # noqa: E402
+from agent_core.tools.local import current_session_id  # noqa: E402
 
 load_dotenv()
 

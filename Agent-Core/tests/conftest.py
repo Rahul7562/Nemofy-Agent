@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +13,25 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
 from pydantic import PrivateAttr
+
+from agent_core.guardrails import set_runtime_access_mode
 from agent_core.sandbox import SandboxConfig, SandboxManager
 from agent_core.skills import SkillRegistry
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_config_and_access_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Prevent workspace data/llm_config.json (e.g. full_access) from leaking into unit tests."""
+    isolated_cfg = tmp_path / "isolated_llm_config.json"
+    monkeypatch.setenv("LLM_CONFIG_PATH", str(isolated_cfg))
+    set_runtime_access_mode("default")
+    try:
+        yield
+    finally:
+        set_runtime_access_mode("default")
 
 
 class ScriptedChatModel(BaseChatModel):

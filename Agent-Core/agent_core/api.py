@@ -34,6 +34,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, field_validator
 
+from agent_core.config import AgentConfig
+from agent_core.firecrawl import FirecrawlClient
 from agent_core.graph import (
     DEFAULT_CHECKPOINT_DB_PATH,
     AgentRuntime,
@@ -69,11 +71,37 @@ from agent_core.models import (
     resolve_model_spec_with_override,
     save_persisted_llm_config,
 )
-from agent_core.firecrawl import FirecrawlClient
 from agent_core.multimodal import MediaAttachment
 from agent_core.sandbox import SandboxManager
 from agent_core.skills import SkillRegistry, get_skills_health
-from MCPs.manager import MCPRegistryManager, MCPServerConfig, load_mcp_tools_from_configs
+
+try:
+    from MCPs.manager import MCPRegistryManager, MCPServerConfig, load_mcp_tools_from_configs
+except ImportError:
+
+    class MCPServerConfig(BaseModel):  # type: ignore[no-redef]
+        name: str = ""
+        transport: str = "stdio"
+        command: str | None = None
+        args: list[str] = Field(default_factory=list)
+        url: str | None = None
+        headers: dict[str, str] = Field(default_factory=dict)
+        env: dict[str, str] = Field(default_factory=dict)
+        enabled: bool = True
+
+    class MCPRegistryManager:  # type: ignore[no-redef]
+        async def connect(self) -> list[BaseTool]:
+            return []
+
+        def health_status(self) -> dict[str, Any]:
+            return {"configured": 0, "connected": 0, "servers": [], "tools": []}
+
+    async def load_mcp_tools_from_configs(  # type: ignore[misc]
+        configs: list[MCPServerConfig] | None,
+    ) -> tuple[dict[str, BaseTool], set[str], list[str]]:
+        if not configs:
+            return {}, set(), []
+        return {}, set(), ["Optional MCPs package is not installed; skipping dynamic MCP servers."]
 
 load_dotenv()
 
@@ -285,8 +313,10 @@ def create_app(
     max_turns: int | None = None,
     allow_private_web_fetch: bool = False,
     model_override_resolver: ModelOverrideResolver | None = None,
+    agent_config: AgentConfig | None = None,
 ) -> FastAPI:
     """Create the Pure-Python Agent-Core FastAPI application."""
+    resolved_agent_config = agent_config or AgentConfig()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -295,7 +325,9 @@ def create_app(
         app.state.runtime = None
         app.state.profile_secrets = {}
         app.state.profile_secrets_active = False
-        set_runtime_access_mode(load_persisted_access_mode())
+        set_runtime_access_mode(
+            resolved_agent_config.default_access_mode or load_persisted_access_mode()
+        )
 
         resolved_sandbox = sandbox or SandboxManager()
         # Synchronize persisted allow_unsafe_local_bash and firecrawl_api_url overrides if stored on disk
@@ -317,7 +349,15 @@ def create_app(
         raw_db_path = (
             checkpoint_db_path if checkpoint_db_path is not None else DEFAULT_CHECKPOINT_DB_PATH
         )
-        app.state.checkpoint_db_path = await asyncio.to_thread(lambda: Path(raw_db_path).resolve())
+        is_in_memory_db = str(raw_db_path).strip() == ":memory:"
+        app.state.checkpoint_in_memory = is_in_memory_db or (
+            resolved_agent_config.custom_checkpointer is not None
+        )
+        app.state.checkpoint_db_path = (
+            Path(":memory:")
+            if is_in_memory_db
+            else await asyncio.to_thread(lambda: Path(raw_db_path).resolve())
+        )
 
         resolved_primary = primary_model
         resolved_worker = worker_model
@@ -346,7 +386,7 @@ def create_app(
             async with create_agent_runtime(
                 primary_model=resolved_primary,
                 worker_model=resolved_worker,
-                checkpoint_db_path=app.state.checkpoint_db_path,
+                checkpoint_db_path=":memory:" if is_in_memory_db else app.state.checkpoint_db_path,
                 sandbox=resolved_sandbox,
                 skills=resolved_skills,
                 mcp_manager=resolved_mcp,
@@ -355,6 +395,7 @@ def create_app(
                 max_turns=max_turns,
                 allow_private_web_fetch=allow_private_web_fetch,
                 model_override_resolver=model_override_resolver,
+                config=resolved_agent_config,
             ) as runtime:
                 app.state.runtime = runtime
                 try:
@@ -372,9 +413,9 @@ def create_app(
                 resolved_sandbox.cleanup_all()
 
     app = FastAPI(
-        title="Nemofy Agent-Core API",
+        title=resolved_agent_config.app_title,
         version="2.0.0",
-        description="Pure-Python LangGraph Autonomous AI Agent API (Sandbox + Skills + MCPs).",
+        description=resolved_agent_config.app_description,
         lifespan=lifespan,
     )
 
@@ -482,12 +523,20 @@ def create_app(
         sandbox_health.pop("workspace_dir", None)
         skills_health = dict(get_skills_health(skills_reg))
         skills_health.pop("directory", None)
+        skills_health.pop("skills_dir", None)
         mcp_health = dict(mcp_mgr.health_status())
         mcp_health.pop("config_path", None)
         try:
             firecrawl_health = await FirecrawlClient().check_health(timeout_seconds=1.5)
         except Exception as fc_exc:  # noqa: BLE001
             firecrawl_health = {"healthy": False, "reachable": False, "detail": str(fc_exc)}
+
+        is_in_mem = bool(getattr(request.app.state, "checkpoint_in_memory", False))
+        checkpoint_info = (
+            {"exists": True, "in_memory": True}
+            if is_in_mem
+            else {"exists": await asyncio.to_thread(db_path.exists), "in_memory": False}
+        )
 
         overall = "ok" if runtime is not None else "degraded"
         return {
@@ -499,9 +548,7 @@ def create_app(
                 "primary": primary_summary,
                 "worker": worker_summary,
             },
-            "checkpoint": {
-                "exists": await asyncio.to_thread(db_path.exists),
-            },
+            "checkpoint": checkpoint_info,
             "sandbox": sandbox_health,
             "firecrawl": firecrawl_health,
             "skills": skills_health,
@@ -850,7 +897,7 @@ def create_app(
 
         if not payload.task.strip() and not payload.attachments:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422),
                 detail="task must not be blank when no attachments are provided.",
             )
         thread_id = payload.thread_id or f"thread-{uuid.uuid4().hex[:12]}"
@@ -946,7 +993,7 @@ def create_app(
 
         if not payload.task.strip() and not payload.attachments:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422),
                 detail="task must not be blank when no attachments are provided.",
             )
         _sync_env_with_profile_secrets()
