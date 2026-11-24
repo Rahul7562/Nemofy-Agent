@@ -892,11 +892,18 @@ async def probe_live_environment() -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.get("http://127.0.0.1:8100/health")
+            body = resp.json()
+            primary_meta = body.get("models", {}).get("primary", {})
+            worker_meta = body.get("models", {}).get("worker", {})
             live_daemon = {
                 "reachable": True,
                 "status_code": resp.status_code,
-                "status": resp.json().get("status"),
-                "skills_dir_leaked": "skills_dir" in resp.json().get("skills", {}),
+                "status": body.get("status"),
+                "skills_dir_leaked": "skills_dir" in body.get("skills", {}),
+                "primary_provider": primary_meta.get("provider"),
+                "primary_model": primary_meta.get("model"),
+                "primary_api_key_configured": bool(primary_meta.get("api_key_configured")),
+                "worker_api_key_configured": bool(worker_meta.get("api_key_configured")),
             }
     except Exception as exc:
         live_daemon = {"reachable": False, "detail": f"{type(exc).__name__}: {exc}"}
@@ -918,7 +925,7 @@ async def probe_live_environment() -> dict[str, Any]:
     ]
     return {
         "live_agent_core_8100": live_daemon,
-        "external_llm_api_keys_configured": provider_keys,
+        "shell_env_llm_keys_configured": provider_keys,
         "firecrawl_local_binary_installed": find_firecrawl_local_binary() is not None,
     }
 
