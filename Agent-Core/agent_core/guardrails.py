@@ -12,14 +12,11 @@ import shlex
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from pydantic import ValidationError
-
-if TYPE_CHECKING:
-    from agent_core.config import GuardrailPolicy
 
 SafetyLevel = Literal["SAFE", "SENSITIVE"]
 ExecutionAccessMode = Literal["default", "full_access"]
@@ -29,10 +26,6 @@ _RUNTIME_ACCESS_MODE_VERSION: int = 0
 # Stores (mode, runtime_version_when_bound) so live runtime mode switches take effect immediately
 current_access_mode: ContextVar[tuple[ExecutionAccessMode, int] | None] = ContextVar(
     "guardrails_access_mode",
-    default=None,
-)
-current_guardrail_policy: ContextVar[GuardrailPolicy | None] = ContextVar(
-    "guardrails_policy",
     default=None,
 )
 
@@ -67,20 +60,12 @@ def bind_run_access_mode(mode: str | None) -> Any:
     return current_access_mode.set((normalize_access_mode(mode), _RUNTIME_ACCESS_MODE_VERSION))
 
 
-def bind_guardrail_policy(policy: GuardrailPolicy | None) -> Any:
-    """Bind a runtime-scoped GuardrailPolicy to the active async execution context."""
-    return current_guardrail_policy.set(policy)
-
-
 def get_effective_access_mode() -> ExecutionAccessMode:
     bound = current_access_mode.get()
-    if bound is not None:
-        bound_mode, _bound_version = bound
-        return bound_mode
-    policy = current_guardrail_policy.get()
-    if policy is not None and policy.default_access_mode is not None:
-        return normalize_access_mode(policy.default_access_mode)
-    return _RUNTIME_ACCESS_MODE
+    if bound is None:
+        return _RUNTIME_ACCESS_MODE
+    bound_mode, _bound_version = bound
+    return bound_mode
 
 
 EXPLICIT_SAFE_TOOLS: frozenset[str] = frozenset(
@@ -396,25 +381,10 @@ def classify_tool_call(
     arguments: dict[str, Any] | None = None,
     *,
     is_mcp_tool: bool = False,
-    policy: GuardrailPolicy | None = None,
 ) -> ToolClassification:
     """Centrally classify any tool call as SAFE or SENSITIVE."""
     args = normalize_tool_arguments(tool_name, arguments or {})
     normalized = tool_name.strip().lower()
-    active_policy = policy if policy is not None else current_guardrail_policy.get()
-
-    if active_policy is not None:
-        if active_policy.custom_classifier is not None:
-            custom_result = active_policy.custom_classifier(tool_name, args, is_mcp_tool)
-            if custom_result is not None:
-                return custom_result
-        if normalized in active_policy.extra_sensitive_tools:
-            return ToolClassification(
-                tool_name=tool_name,
-                safety_level="SENSITIVE",
-                risk_reason=f"Tool '{tool_name}' is marked SENSITIVE by custom guardrail policy.",
-                expected_effect=_describe_expected_effect(tool_name, args),
-            )
 
     if normalized == "bash_exec":
         cmd = str(args.get("command", ""))
@@ -438,14 +408,6 @@ def classify_tool_call(
             tool_name=tool_name,
             safety_level="SAFE",
             risk_reason=reason,
-            expected_effect=_describe_expected_effect(tool_name, args),
-        )
-
-    if active_policy is not None and normalized in active_policy.extra_safe_tools:
-        return ToolClassification(
-            tool_name=tool_name,
-            safety_level="SAFE",
-            risk_reason=f"Tool '{tool_name}' is explicitly registered SAFE by guardrail policy.",
             expected_effect=_describe_expected_effect(tool_name, args),
         )
 
