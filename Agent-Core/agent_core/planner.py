@@ -168,22 +168,52 @@ def build_supervisor_system_prompt(
     plan: list[PlanStep],
     turn_count: int,
     max_turns: int,
+    prompt_config: Any | None = None,
 ) -> str:
-    """Build the LangGraph supervisor system prompt with compact skill catalog injection."""
+    """Build the LangGraph supervisor system prompt with compact skill catalog injection.
+
+    When ``prompt_config`` is supplied (an :class:`agent_core.config.PromptConfig`),
+    callers can customize the persona, product/agent identity, extra instructions, or
+    provide a full ``prompt_builder`` callback for future LangGraph applications.
+    """
+    if prompt_config is not None and getattr(prompt_config, "prompt_builder", None) is not None:
+        return str(
+            prompt_config.prompt_builder(
+                skill_catalog_text=skill_catalog_text,
+                loaded_skills_text=loaded_skills_text,
+                available_tool_names=available_tool_names,
+                plan=plan,
+                turn_count=turn_count,
+                max_turns=max_turns,
+            )
+        )
+
+    agent_name = (getattr(prompt_config, "agent_name", None) or "Nemo").strip()
+    product_name = (getattr(prompt_config, "product_name", None) or "Nemofy Agent").strip()
+    custom_persona = getattr(prompt_config, "persona", None)
+    extra_instructions = getattr(prompt_config, "extra_instructions", None)
+    include_workspace_rules = getattr(prompt_config, "include_workspace_rules", True)
+    include_firecrawl_rules = getattr(prompt_config, "include_firecrawl_rules", True)
+
     tools_line = ", ".join(sorted(available_tool_names)) if available_tool_names else "(none)"
     plan_text = format_plan_for_prompt(plan)
 
-    sections = [
-        (
-            "You are Nemo, the AI assistant working inside Nemofy Agent. "
+    persona_block = (
+        str(custom_persona).strip()
+        if isinstance(custom_persona, str) and custom_persona.strip()
+        else (
+            f"You are {agent_name}, the AI assistant working inside {product_name}. "
             "You are diligent, honest, warm, and friendly, capable of helping with everything "
             "from quick everyday questions and writing to complex multi-step research, data "
             "analysis, coding, and workspace automation. Never introduce yourself as a 'pure-Python "
             "agent' or describe internal graph plumbing unless the user specifically asks about "
             "the underlying architecture."
-        ),
-        (
-            "Workspace & capabilities:\n"
+        )
+    )
+
+    capability_lines: list[str] = ["Workspace & capabilities:"]
+    if include_workspace_rules:
+        capability_lines.append(
             "- Workspace & host tools: bash_exec, read_file, write_file, edit_file, and list_dir start "
             "with the workspace root (/workspace) as the default working directory. File tools accept "
             "relative paths (e.g. 'src/app.py'), '/workspace/...', or absolute host paths (including "
@@ -194,33 +224,51 @@ def build_supervisor_system_prompt(
             "use start_line and end_line to read large files sequentially without missing content. Inside "
             "scripts or code run via bash_exec, the current working directory (CWD) is already the workspace "
             "root and $WORKSPACE points to it — use relative paths (e.g. 'data.txt') or "
-            "os.environ.get('WORKSPACE', '.') rather than hardcoding literal '/workspace/...' paths.\n"
+            "os.environ.get('WORKSPACE', '.') rather than hardcoding literal '/workspace/...' paths."
+        )
+    if include_firecrawl_rules:
+        capability_lines.append(
             "- Web & document tools (Firecrawl Local): Use web_search(query, max_results) to search the live web, "
             "web_fetch(url) to scrape webpages (including JS-rendered pages via Chromium), remote PDFs, and "
             "remote Office documents (.docx, .xlsx, .pptx, .odt, .rtf, .epub) into Markdown, web_map(url, search) "
             "to discover URLs on a site, web_crawl(url, limit, max_depth) to crawl linked pages, and "
-            "web_extract(urls, prompt, schema_json) to extract structured data. Always preserve and cite exact source URLs.\n"
+            "web_extract(urls, prompt, schema_json) to extract structured data. Always preserve and cite exact source URLs."
+        )
+    capability_lines.extend(
+        [
             "- Multimodal inputs: When images, videos, or audio are attached, modalities your model "
             "accepts natively are embedded directly in the user message; unsupported modalities are "
             "analyzed automatically by a specialist Accessory sub-agent whose verified findings appear "
-            "under [MULTIMODAL ACCESSORY SUB-AGENT REPORTS]. Use those findings directly to answer.\n"
+            "under [MULTIMODAL ACCESSORY SUB-AGENT REPORTS]. Use those findings directly to answer.",
             "- External integrations: Connected Model Context Protocol (MCP) tools handle live "
-            "external services when configured.\n"
+            "external services when configured.",
             "- Skills: Call load_skill(name) FIRST whenever a task matches a skill in the catalog "
-            "and follow its instructions carefully.\n"
+            "and follow its instructions carefully.",
             "- Delegation: Use spawn_subagent for large independent workstreams (deep research, "
-            "repo audits, code review, data analysis, documentation).\n"
+            "repo audits, code review, data analysis, documentation).",
             "- Safety & honesty: Never fabricate tool outputs, file contents, or facts. If "
             "something is uncertain or fails, say so honestly and clearly. Sensitive actions pause "
-            "for explicit human approval."
-        ),
+            "for explicit human approval.",
+        ]
+    )
+
+    sections = [
+        persona_block,
+        "\n".join(capability_lines),
         f"Turn budget: {turn_count}/{max_turns}\nAvailable tools: {tools_line}",
-        f"Available skills (metadata only — call load_skill(name) to load full instructions):\n"
-        f"{skill_catalog_text}",
     ]
+
+    if skill_catalog_text and skill_catalog_text.strip():
+        sections.append(
+            "Available skills (metadata only — call load_skill(name) to load full instructions):\n"
+            f"{skill_catalog_text}"
+        )
 
     if loaded_skills_text:
         sections.append(f"Currently loaded skill instructions:\n{loaded_skills_text}")
+
+    if isinstance(extra_instructions, str) and extra_instructions.strip():
+        sections.append(f"Additional domain instructions:\n{extra_instructions.strip()}")
 
     sections.append(f"Current execution plan:\n{plan_text}")
     sections.append(

@@ -6,8 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
-.n8n-data/
-.n8n-runtime/node_modules/
+.nemofy-data/
+.logs/
+:memory:
 
 # Python & Agent Runtime
 .venv/
