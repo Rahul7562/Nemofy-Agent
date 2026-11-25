@@ -1,57 +1,309 @@
-# Nemofy Agent & Generalized `Agent-Core` LangGraph Platform
+# Nemofy Agent
 
-> **Production-ready, pure-Python LangGraph autonomous AI agent engine paired with a protected Express gateway, AES-256-GCM encrypted API key vault, sandboxed execution runtime, Firecrawl Local web research, and a Vercel-ready React + Tailwind CSS workspace.**
+> **Your private, self-hosted AI assistant that can think step by step, search the web, write and run code, organize files in a live workspace, and work with almost any AI model you choose.**
 
-```text
-+======================================================================================+
-|  VERIFICATION STATUS:  100/100 Python Tests (0 Warnings)  |  92/92 TypeScript Tests  |
-|  STATIC ANALYSIS:      0 Ruff Errors  |  0 tsc Errors  |  21/21 Python Modules OK    |
-|  LIVE BENCHMARKS:      6/6 Runtime Suites PASS  |  Live River AI & OpenRouter PASS   |
-+======================================================================================+
+![Nemofy Agent Welcome Screen](public/assets/aistudio/Screenshot_2026-11-25_183722_41ddddfe.png)
+
+---
+
+## What Is Nemofy Agent?
+
+Most AI chat apps only let you talk to a model in a text box. **Nemofy Agent** gives your AI assistant (**Nemo**) its own workspace and toolkit so it can actually *get work done* while keeping you in full control:
+
+- **Research the web** — Search live websites, pull clean summaries, and read PDFs, Word docs, spreadsheets, and slide decks.
+- **Write, run, and verify code** — Create scripts, analyze CSV datasets, test its own work, and show you the exact output.
+- **Work with real files** — Browse, edit, save, and organize files in a built-in `/workspace` drawer right beside your chat.
+- **Use any AI provider you like** — Plug in OpenRouter, River AI, OpenAI, Anthropic, Google Gemini, DeepSeek, Groq, NVIDIA, local Ollama models, or your own custom API endpoints.
+- **Stay private and safe** — Runs on your own machine or server behind a password-protected login, encrypts your API keys at rest, and asks for your approval before running sensitive actions.
+
+---
+
+## Quick Navigation
+
+- [Visual Tour: See Nemofy in Action](#visual-tour-see-nemofy-in-action)
+- [5-Minute Quickstart](#5-minute-quickstart)
+- [How Safety & Privacy Work](#how-safety--privacy-work)
+- [Key Capabilities at a Glance](#key-capabilities-at-a-glance)
+- [For Developers & Power Users](#for-developers--power-users)
+  - [Use `Agent-Core` in Your Own Python Projects](#use-agent-core-in-your-own-python-projects)
+  - [Run from the Terminal (CLI)](#run-from-the-terminal-cli)
+  - [System Architecture & Engine Details](#system-architecture--engine-details)
+  - [Project Structure](#project-structure)
+  - [Configuration & API Reference](#configuration--api-reference)
+  - [Tests & Live Benchmarks](#tests--live-benchmarks)
+- [Common Questions & Troubleshooting](#common-questions--troubleshooting)
+
+---
+
+## Visual Tour: See Nemofy in Action
+
+### 1. Private, Password-Protected Access
+When you open Nemofy Agent for the first time, you set up your own administrator username and password. Every chat, file, and API key stays protected behind your login, with a one-click **Light / Dark** theme toggle in the top corner.
+
+![Sign in to Nemofy Agent](public/assets/aistudio/Screenshot_2026-11-25_185131_72998bca.png)
+
+---
+
+### 2. Clean Chat with Live Thinking & Execution Plans
+Chat with Nemo just like any modern assistant—while seeing *how* it works behind the scenes:
+- Switch AI providers and models at the top bar **per conversation** without affecting your other chats.
+- Expand the **Thought** pill to inspect Nemo's reasoning process or check the **Execution plan** at the bottom of a reply.
+- Adjust **Thinking Depth** (`Off`, `Low`, `Medium`, `High`) and **Access Mode** (`Default` approvals vs. `Full Access`) right inside the message box.
+
+![Chatting with Nemo](public/assets/aistudio/Screenshot_2026-11-25_183907_dee4ea4c.png)
+
+---
+
+### 3. Autonomous File Creation & Live Workspace Drawer
+Ask Nemo to create files, crunch numbers, or test a script—it doesn't just paste code for you to copy. It builds files directly inside `/workspace`, runs verification commands, summarizes the results in clean tables (with one-click **Copy CSV**), and updates the **Workspace** panel in real time.
+
+![Autonomous File Creation and Live Workspace](public/assets/aistudio/Screenshot_2026-11-25_185003_1dee2032.png)
+
+---
+
+### 4. View & Edit Workspace Files Side by Side
+Click any file in the right-hand **Workspace** drawer (or click a file chip inside Nemo's message) to open it instantly. You can inspect, edit, save, or delete files without switching tabs or opening a separate editor.
+
+![Built-in Workspace File Viewer and Editor](public/assets/aistudio/Screenshot_2026-11-25_185024_dc2f2480.png)
+
+---
+
+### 5. Live Context Window Gauge & Automatic Memory Compaction
+Long AI conversations normally slow down or hit token limits unexpectedly. Click the circular gauge in the top-right corner at any time to see a live breakdown of how much context window is used by your system prompt, tools, skills, messages, and tool outputs.
+
+When a conversation reaches **80% capacity**, Nemo automatically summarizes older messages in the background so your chat stays fast and coherent—and you can even override the context limit per session if needed.
+
+![Context Window Breakdown and 80% Auto-Compaction](public/assets/aistudio/Screenshot_2026-11-25_183921_0e751479.png)
+
+---
+
+### 6. Dual-Model Setup: Main Agent + Fast Worker Sub-Agent
+Inside **Settings → LLM Config**, you can assign two separate models:
+- **Main Agent (Nemo)** — Your primary brain for planning, reasoning, and talking with you.
+- **Sub-Agent (Worker)** — A fast, cost-effective helper model that Nemo delegates parallel research or coding sub-tasks to.
+
+Pick from 12+ built-in providers, search live model catalogs with verified context limits, and click **Test** to confirm your connection in seconds.
+
+![Settings LLM Config for Main Agent and Sub-Agent](public/assets/aistudio/Screenshot_2026-11-25_185040_3fff3629.png)
+
+---
+
+### 7. Encrypted API Key Vault, Custom Providers & Reliability Controls
+Scroll down in **LLM Config** to fine-tune how Nemo handles real-world hiccups and custom endpoints:
+- **Timeouts, Retries & Automatic Fallback** — Automatically retry transient network errors or fall back to your secondary model if your primary model times out.
+- **Custom Model Providers** — Connect any self-hosted vLLM cluster, LiteLLM proxy, Azure gateway, or OpenAI/Anthropic-compatible relay.
+- **Profile API Key Vault** — Your API keys are encrypted on the server using **AES-256-GCM** and loaded automatically when you sign in—so you never have to leave raw keys sitting in plain text config files.
+
+![Settings Timeouts, Custom Providers, and Encrypted API Key Vault](public/assets/aistudio/Screenshot_2026-11-25_185116_33dd1088.png)
+
+---
+
+### 8. Teach Nemo New Playbooks with Skills & MCPs
+Want Nemo to follow your preferred workflow for coding, writing reports, or auditing data? Open **Settings → Skills & MCPs** to create or edit reusable Markdown playbooks (like `code_and_data` and `deep_research`) directly in the browser. Nemo loads only the skills it needs on demand, keeping chats lean. You can also connect external **MCP (Model Context Protocol)** tool servers from the same tab.
+
+![Settings Skills and MCPs Editor](public/assets/aistudio/Screenshot_2026-11-25_185057_1de991ee.png)
+
+---
+
+### 9. Flexible Deployment & Transparent Shell Safety Controls
+Open **Settings → Appearance & Runtime** to check your active runtime mode, point a Vercel-hosted frontend to your own remote Python backend URL, or review shell execution safety.
+
+By default, local shell execution stays locked down (`disabled`). If you're running on a trusted personal machine without Docker and want to allow unrestricted local shell commands, you can explicitly opt in with clear security warnings right in the UI.
+
+![Settings Appearance, Runtime, and Shell Execution Safety](public/assets/aistudio/Screenshot_2026-11-25_185050_69029409.png)
+
+---
+
+## 5-Minute Quickstart
+
+### What You Need
+- **Node.js 22+** and **npm**
+- **Python 3.11+**
+- *(Optional)* **Docker** — If you want one-command containerized deployment or Docker-isolated code execution.
+
+---
+
+### Option 1: Run Locally on Your Computer (Recommended)
+
+1. **Install Node.js packages:**
+   ```bash
+   npm install
+   ```
+
+2. **Install Python dependencies** *(optional — `npm run dev` can also set up `.venv` automatically on first run)*:
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install --upgrade pip
+   .venv/bin/pip install -e ".[dev]"
+   ```
+
+3. **Start Nemofy Agent:**
+   ```bash
+   npm run dev
+   ```
+   This starts everything in one command: the web interface (`http://localhost:3000`), the Python agent engine (`:8100`), and local web search (`:3002`, if installed).
+
+4. **Open [http://localhost:3000](http://localhost:3000) in your browser:**
+   - Create your admin username and password on the welcome gate.
+   - Open **Settings → LLM Config**, paste an API key for any provider you use (OpenRouter, River AI, OpenAI, Anthropic, Gemini, DeepSeek, Groq, or local Ollama), and click **Test**. *(No need to manually edit `.env` files!)*
+   - Say hello to Nemo and start building!
+
+---
+
+### Option 2: One-Command Docker Setup
+
+Prefer not to install Python, Chromium, or Rust tools manually? Docker builds the entire stack—including **Firecrawl Local** web research and **Chromium** for JavaScript-heavy pages—into one container with persistent data volumes:
+
+```bash
+# Build and start on http://localhost:3000
+npm run docker:up
+
+# View logs or stop later
+npm run docker:logs
+npm run docker:down
+```
+
+*(Optional)* Build the isolated Docker code-execution sandbox image:
+```bash
+docker build -f Agent-Core/Dockerfile.sandbox -t nemofy-agent-sandbox:latest Agent-Core
 ```
 
 ---
 
-## Table of Contents
+### Option 3: Host the Web UI on Vercel
 
-1. [What Is Nemofy Agent?](#1-what-is-nemofy-agent)
-2. [Full-Stack System Architecture (ASCII Diagram)](#2-full-stack-system-architecture)
-3. [Inside `Agent-Core`: Cyclic LangGraph Supervisor Engine](#3-inside-agent-core-cyclic-langgraph-supervisor-engine)
-4. [Feature Deep Dive](#4-feature-deep-dive)
-   - [4.1 Generalized Standalone `agent_core` Python Library](#41-generalized-standalone-agent_core-python-library)
-   - [4.2 Dual-Model, Multi-Provider & Multimodal Orchestration](#42-dual-model-multi-provider--multimodal-orchestration)
-   - [4.3 Security Model, Sandbox Isolation & HITL Guardrails](#43-security-model-sandbox-isolation--hitl-guardrails)
-   - [4.4 Context Window Budgeting & Strict 80% Auto-Compaction](#44-context-window-budgeting--strict-80-auto-compaction)
-   - [4.5 Dynamic Skills, Direct MCP Servers & Firecrawl Local](#45-dynamic-skills-direct-mcp-servers--firecrawl-local)
-   - [4.6 Protected Web Workspace (`Nemofy Agent/`)](#46-protected-web-workspace-nemofy-agent)
-5. [Repository Structure & Module Map](#5-repository-structure--module-map)
-6. [Live Benchmarks, Latency Analysis & Acceptance Evidence](#6-live-benchmarks-latency-analysis--acceptance-evidence)
-7. [Quickstart: How to Use After Downloading](#7-quickstart-how-to-use-after-downloading)
-   - [Mode A: Full-Stack Local Development](#mode-a-full-stack-local-development-recommended)
-   - [Mode B: Embed `Agent-Core` as a Standalone Python Library](#mode-b-embed-agent-core-as-a-standalone-python-library)
-   - [Mode C: Pure-Python Interactive CLI](#mode-c-pure-python-interactive-cli)
-   - [Mode D: Production Docker Compose Stack](#mode-d-production-docker-compose-stack)
-   - [Mode E: Deploy `Nemofy Agent/` Frontend on Vercel](#mode-e-deploy-nemofy-agent-frontend-on-vercel)
-8. [Configuration & Environment Variables](#8-configuration--environment-variables)
-9. [HTTP API Reference](#9-http-api-reference)
-10. [Testing, Self-Check & Benchmarking](#10-testing-self-check--benchmarking)
-11. [Troubleshooting & FAQ](#11-troubleshooting--faq)
+1. Import this repository into **Vercel** and set the **Root Directory** to `Nemofy Agent`.
+2. Vercel automatically detects Vite (`Nemofy Agent/vercel.json` is pre-configured).
+3. Point the UI to your hosted backend URL by setting `VITE_AGENT_API_URL` (or entering it directly in **Settings → Appearance & Runtime**).
 
 ---
 
-## 1. What Is Nemofy Agent?
+## How Safety & Privacy Work
 
-**Nemofy Agent** is an end-to-end autonomous AI agent platform built on two cleanly decoupled layers:
+Nemofy Agent is designed so you can trust an autonomous AI on your own machine:
 
-| Layer | Technology | Role |
-| :--- | :--- | :--- |
-| **`Agent-Core/`** | Python 3.11+, LangGraph, FastAPI, SQLite WAL, Docker SDK | Generalized cyclic LangGraph reasoning/execution runtime (`Plan → Act → Observe → Reflect → Response`), isolated sandbox, HITL guardrails, context compaction, skills, MCP client, sub-agents, and async job manager. Can be imported **standalone** in future Python projects. |
-| **`server.ts` & `server/`** | Node.js 22+, Express 4, TypeScript, AES-256-GCM | Unified API gateway on port `:3000`: server-enforced session auth, per-user encrypted API key vault, thread/filesystem persistence, provider model catalog, background job orchestration, and automatic supervision of Python `Agent-Core` (`:8100`) and `Firecrawl Local` (`:3002`). |
-| **`Nemofy Agent/`** | React 19, Vite 8, Tailwind CSS 4, TypeScript | Protected, Vercel-ready SPA with Light & Dark mode, multi-thread chat, live thinking/tool/file-diff activity stream, interactive HITL approval cards, context usage ring, `/workspace` file explorer, and unified Settings modal. |
+1. **You hold the keys:** API keys entered in Settings are encrypted with **AES-256-GCM** per user profile and are never written in plain text to `llm_config.json`.
+2. **Human-in-the-Loop approvals:** In **Default** mode, read-only actions happen automatically while sensitive actions (modifying system state, running write/shell commands, or calling external tools) pause and ask you to **Approve**, **Edit**, or **Reject** first. Want hands-free speed on a trusted task? Switch that individual chat to **Full Access**.
+3. **Confined workspace:** Files stay neatly inside `/workspace` with path-traversal and symlink-escape protection, and secrets are scrubbed from sandboxed subprocess environments.
+4. **Crash-safe memory:** Every step is saved to a local SQLite checkpoint database. Even if you restart the server while Nemo is waiting for your approval, it picks up right where it left off without repeating completed actions.
 
 ---
 
-## 2. Full-Stack System Architecture
+## Key Capabilities at a Glance
+
+| Capability | What It Does for You |
+| :--- | :--- |
+| **12+ Providers + Custom APIs** | River AI, OpenRouter, OpenAI, Anthropic, Google Gemini, NVIDIA NIM, DeepSeek, Groq, Together, Fireworks, Ollama, vLLM, plus unlimited custom OpenAI/Anthropic-compatible endpoints. |
+| **Multimodal Attachments** | Upload images, videos, or audio files. If your main chat model doesn't support a media type natively, Nemofy automatically routes it to a dedicated **Accessory** model behind the scenes. |
+| **Built-In Web Research & Docs** | Integrated with **Firecrawl Local** (`web_search`, `web_fetch`, `web_crawl`, `web_map`, `web_extract`) plus native parsing for PDF, DOCX, XLSX, and PPTX documents. |
+| **Smart Context Management** | Real-time token gauge, strict **80% auto-compaction**, and automatic archiving of huge tool logs (`>4,000` chars) to `/workspace/.logs/` so chats stay sharp. |
+| **Skills & MCP Ecosystem** | Add reusable Markdown instruction playbooks (`/Skills`) and connect external Model Context Protocol servers (`/MCPs/servers.json`). |
+| **Standalone Python Engine** | The core LangGraph engine (`Agent-Core/`) has zero UI coupling—reuse it directly inside your own Python apps or FastAPI services. |
+
+---
+
+## For Developers & Power Users
+
+### Use `Agent-Core` in Your Own Python Projects
+
+You can import `agent_core` directly in any Python project without running Express, React, or `MCPs/`:
+
+```python
+import asyncio
+from pathlib import Path
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+
+from agent_core import (
+    AgentConfig,
+    AgentHooks,
+    AgentPersona,
+    ExecutionLimits,
+    GuardrailPolicy,
+    SandboxConfig,
+    SandboxManager,
+    create_agent_runtime,
+)
+
+@tool("lookup_order")
+def lookup_order(order_id: str) -> str:
+    """Look up an order's shipping status."""
+    return f"Order {order_id}: out for delivery"
+
+async def main() -> None:
+    sandbox = SandboxManager(
+        SandboxConfig(workspace_dir=Path("./workspace"), backend="local_isolated")
+    )
+    config = AgentConfig(
+        persona=AgentPersona(
+            name="Support Agent",
+            organization="Acme Corp",
+            role_description="a concise order support specialist",
+            extra_instructions="Always confirm the order ID in your reply.",
+        ),
+        limits=ExecutionLimits(max_turns=12, max_wall_clock_seconds=45.0),
+        guardrail_policy=GuardrailPolicy().extend(add_safe_tools=("lookup_order",)),
+        hooks=AgentHooks(
+            on_tool_end=lambda ev: print(f"[hook] {ev['tool']} -> {ev['status']}"),
+            on_run_complete=lambda ev: print(f"[hook] run finished: {ev['status']}"),
+        ),
+        include_default_tools=False,
+        enable_skills=False,
+        enable_subagents=False,
+        custom_checkpointer=MemorySaver(),  # Or omit for durable SQLite WAL
+    )
+
+    async with create_agent_runtime(
+        sandbox=sandbox,
+        extra_tools=[lookup_order],
+        connect_mcp=False,
+        config=config,
+    ) as runtime:
+        result = await runtime.run_task("Where is order ORD-1042?", thread_id="ticket-42")
+        print(result["final_response"])
+
+asyncio.run(main())
+```
+
+Or expose it as a standalone FastAPI service:
+
+```python
+from agent_core import AgentConfig, create_app
+
+app = create_app(
+    checkpoint_db_path=":memory:",  # Pure in-memory SQLite (zero disk files)
+    connect_mcp=False,
+    agent_config=AgentConfig(app_title="Custom Domain Agent API"),
+)
+```
+
+For full library documentation, see [`Agent-Core/README.md`](Agent-Core/README.md).
+
+---
+
+### Run from the Terminal (CLI)
+
+Prefer working straight from your terminal?
+
+```bash
+# Check configuration, sandbox, skills, and model connectivity
+PYTHONPATH=Agent-Core:. .venv/bin/python Agent-Core/main.py --check
+
+# Start an interactive terminal session with Human-in-the-Loop approvals
+PYTHONPATH=Agent-Core:. .venv/bin/python Agent-Core/main.py --thread-id my-session
+```
+
+---
+
+### System Architecture & Engine Details
+
+Nemofy Agent is split into three clean layers:
+1. **`Nemofy Agent/`** (React 19 + Vite 8 + Tailwind CSS 4) — The web workspace UI.
+2. **`server.ts` & `server/`** (Node.js 22 + Express + TypeScript) — Auth, AES-256-GCM key vault, thread storage, model catalog, and process supervision on port `:3000`.
+3. **`Agent-Core/`** (Python 3.11+ + LangGraph + FastAPI + SQLite WAL) — Cyclic reasoning/execution engine (`Plan → Act → Observe → Reflect → Response`), sandbox isolation, guardrails, context compaction, skills, sub-agents, and MCP client on port `:8100`.
+
+<details>
+<summary><strong>Click to expand: Full-Stack System Architecture Diagram</strong></summary>
 
 ```text
 +======================================================================================+
@@ -103,11 +355,12 @@
 +======================================================================================+
 ```
 
----
+</details>
 
-## 3. Inside `Agent-Core`: Cyclic LangGraph Supervisor Engine
+<details>
+<summary><strong>Click to expand: Inside the Cyclic LangGraph Supervisor Engine</strong></summary>
 
-The heart of `Agent-Core` (`Agent-Core/agent_core/graph.py`) is a deterministic, checkpointed cyclic LangGraph state machine. Every node transition persists state to the active checkpointer so runs survive crashes, restarts, and Human-in-the-Loop pauses without ever re-executing completed side effects.
+`Agent-Core` executes **one tool call per checkpointed step**. If a model queues two tools and the second one pauses for human approval, the first tool is already saved in SQLite and is **never replayed** when you resume—even across a full restart.
 
 ```text
                                  User Task / Follow-Up
@@ -127,7 +380,6 @@ The heart of `Agent-Core` (`Agent-Core/agent_core/graph.py`) is a deterministic,
       |           |  - Build persona prompt + active skills catalog  |
       |           |  - Stream live <think>/reasoning tokens          |
       |           |  - Resilient retry + timeout fallback model      |
-      |           |  - Empty/truncated output auto-recovery          |
       |           +------------------------+-------------------------+
       |                                    |
       |                     +--------------+--------------+
@@ -169,7 +421,6 @@ The heart of `Agent-Core` (`Agent-Core/agent_core/graph.py`) is a deterministic,
       |           |  >4,000 chars?    |
       |           |  Archive raw log  |
       |           |  /workspace/.logs |
-      |           |  (read_file exempt)|
       |           +---------+---------+
       |                     |
       |                     v
@@ -181,456 +432,126 @@ The heart of `Agent-Core` (`Agent-Core/agent_core/graph.py`) is a deterministic,
       +-----------+-------------------+
 ```
 
-### Why 1 Tool Call Per Checkpoint Step Matters
-When a model emits multiple tool calls in a single turn (for example, `write_file` followed by a sensitive `gmail_send_email`), `act_node` executes **one pending tool call per LangGraph checkpoint step**. If tool #2 raises `GraphInterrupt` for human approval, tool #1 is already committed to the SQLite checkpoint and is **never replayed** when the user resumes—even across a full server restart.
+</details>
 
 ---
 
-## 4. Feature Deep Dive
-
-### 4.1 Generalized Standalone `agent_core` Python Library
-
-`Agent-Core/agent_core` is decoupled from Nemofy-specific branding and web infrastructure so you can reuse the exact same battle-tested LangGraph engine in any future Python project:
-
-- **`AgentConfig`** (`agent_core.config`): Single immutable configuration object controlling persona, execution limits, guardrail policy, lifecycle hooks, default access mode, feature toggles (`include_default_tools`, `enable_web_tools`, `enable_skills`, `enable_subagents`, `enable_workspace_diff`, `enable_auto_compaction`), FastAPI metadata, and custom checkpointer injection.
-- **`AgentPersona`**: Swap agent identity, organization, instructions, full `custom_system_prompt`, or a dynamic `system_prompt_builder` callable while keeping Nemofy's production prompt intact by default.
-- **`ExecutionLimits`**: Validated safety caps for `max_turns` (`1..180`), `max_tool_retries`, `tool_output_compaction_threshold`, `auto_compact_threshold` (`0.10..0.99`), and `max_wall_clock_seconds` (terminates runaway loops cleanly).
-- **`GuardrailPolicy`**: Immutable policy with `.extend(add_safe_tools=..., add_sensitive_tools=..., add_safe_bash_commands=..., custom_classifier=...)` so custom domain tools integrate with the central HITL interrupt system cleanly.
-- **`AgentHooks`**: Sync or async lifecycle callbacks (`on_turn_start`, `on_tool_start`, `on_tool_end`, `on_compaction`, `on_run_complete`) wrapped in defensive error isolation so a failing hook never crashes an agent run.
-- **Pluggable Persistence & Optional MCP**: Supports SQLite WAL (`checkpoints.db`), pure in-memory SQLite (`":memory:"`, creating zero files on disk), or any LangGraph `BaseCheckpointSaver` (e.g., `MemorySaver()`, PostgreSQL, Redis). Gracefully falls back to a no-op MCP manager when the sibling `MCPs/` folder is absent.
-- **Public Facade**: Import everything cleanly from `agent_core` (`from agent_core import AgentConfig, AgentPersona, GuardrailPolicy, ExecutionLimits, AgentHooks, create_agent_runtime, create_app`).
-
-### 4.2 Dual-Model, Multi-Provider & Multimodal Orchestration
-
-- **Main Agent (Brain)** + **Sub-Agent (Worker)** split: Assign a frontier reasoning model to planning/synthesis and a fast, economical model to isolated sub-agent tasks (`spawn_subagent`).
-- **12+ Built-in Providers + Unlimited Custom Providers**: River AI, OpenRouter, OpenAI, Anthropic, Google Gemini, NVIDIA NIM, DeepSeek, Groq, Together AI, Fireworks AI, Ollama, vLLM, plus user-defined custom OpenAI-compatible or Anthropic-compatible endpoints with per-provider encrypted API keys.
-- **Per-Session Isolation**: Every chat thread stores its own `ThreadSessionConfig` (provider, model, reasoning effort, context window, access mode). Switching providers/models in Thread A never mutates Thread B.
-- **Thinking & Reasoning Controls**: Supports adaptive reasoning effort (`off`, `low`, `medium`, `high`), streams `<think>` tags and provider-native `reasoning_content` / `reasoning_details` live to the UI, and preserves Gemini thought signatures across tool-call roundtrips.
-- **Multimodal Accessories**: Automatically detects whether the primary model natively supports `image`, `video`, or `audio`. Unsupported modalities are transparently routed to dedicated multimodal accessory models (`image`, `video`, `audio`), with an automatic runtime fallback if a model unexpectedly rejects a native media payload.
-- **Resilient Retry & Timeout Fallback**: Classifies transient 429 rate limits, read timeouts, and connection errors; applies jittered exponential backoff while keeping job heartbeats alive; optionally falls back to a configured secondary provider/model on timeout.
-
-### 4.3 Security Model, Sandbox Isolation & HITL Guardrails
-
-```text
-+------------------------------------------------------------------------------+
-|                         DEFENSE-IN-DEPTH SECURITY LAYERS                     |
-+------------------------------------------------------------------------------+
-| 1. Auth & Sessions     | scrypt password hashing + constant-time verify      |
-|                        | HttpOnly SameSite cookies; Bearer token on :8100    |
-+------------------------+-----------------------------------------------------+
-| 2. Encrypted Vault     | Per-user AES-256-GCM + scrypt KDF + AAD binding     |
-|                        | Plaintext API keys never written to llm_config.json |
-+------------------------+-----------------------------------------------------+
-| 3. Outbound URL Guard  | Blocks loopback, link-local, metadata (169.254/16)  |
-|                        | and private RFC1918 ranges on web/MCP/provider URLs |
-+------------------------+-----------------------------------------------------+
-| 4. Sandbox Confinement | Docker (non-root, no socket, 512m RAM, 128 PIDs) or |
-|                        | local_isolated (path + symlink escape rejection,    |
-|                        | secret env scrubbing, fail-closed bash_exec)        |
-+------------------------+-----------------------------------------------------+
-| 5. HITL Guardrails     | Read-only bash AST allowlist -> SAFE                |
-|                        | Destructive/mutating/external tools -> SENSITIVE    |
-|                        | Pauses via LangGraph interrupt() until approved     |
-+------------------------------------------------------------------------------+
-```
-
-- **Fail-Closed `bash_exec` Classifier**: Only strictly read-only shell pipelines (`ls`, `cat`, `grep`, `rg`, `git status/log/diff`, etc. without redirection `>`, subshells `$(...)`, or mutating flags like `sed -i` / `find -delete`) are auto-approved in `default` mode. Everything else requires explicit human approval unless the user explicitly switches the session to `full_access`.
-- **Interactive HITL Decisions**:
-  - **Approve**: Executes the paused tool call **exactly once** and continues the graph.
-  - **Edit**: Validates modified JSON arguments against the tool's Pydantic schema and prompts for re-approval before execution.
-  - **Reject**: Skips execution (`count == 0`), feeds the rejection reason back to the planner, and completes cleanly.
-
-### 4.4 Context Window Budgeting & Strict 80% Auto-Compaction
-
-```text
-Token Budget Breakdown (e.g. 128,000-token context window)
-[==== System + Tools ====|=== Active History ===|== Tool Outputs ==|     Free Headroom     ]
-0%                      12%                    45%                68%                     100%
-                                                                       ^
-                                                                       | 80.0% Trigger
-When usage_percent >= 80.0%:
-  1. Find safe split boundary (never splits an AIMessage tool_call from its ToolMessage)
-  2. Summarize older turns via resilient LLM compaction call -> compact summary block
-  3. Preserve recent turns + active system/skill context verbatim
-  4. Emit `auto_compact_context` event & update ContextUsageRing in real time
-```
-
-Additionally, any non-`read_file` tool output exceeding **4,000 characters** is automatically archived in full to `/workspace/.logs/<tool>_<timestamp>.log` and replaced in active context with a compact head/tail summary pointing to the archived path. `read_file` is intentionally exempt (with line pagination support) so source code reads stay exact.
-
-### 4.5 Dynamic Skills, Direct MCP Servers & Firecrawl Local
-
-- **Dynamic Skills (`/Skills/*.md`)**: Compact skill catalog is injected into the system prompt; full playbooks (such as `code_and_data.md` and `deep_research.md`, plus custom user-created Markdown skills) are loaded on demand via `load_skill` to keep baseline token overhead minimal.
-- **Direct Pure-Python MCP (`/MCPs/servers.json`)**: Connects directly to external Streamable HTTP / SSE Model Context Protocol servers via `langchain-mcp-adapters`, validates URLs against private-network targets, and degrades gracefully if an external MCP server is offline.
-- **Firecrawl Local Web Research (`agent_core/firecrawl.py`)**: Integrates the official Rust `firecrawl-local` v2 server (`:3002`) with 5 built-in tools (`web_search`, `web_fetch`, `web_crawl`, `web_map`, `web_extract`), native PDF/DOCX/XLSX/PPTX document extraction, and optional Chromium JS rendering—zero Redis, Postgres, or RabbitMQ sidecars required.
-
-### 4.6 Protected Web Workspace (`Nemofy Agent/`)
-
-- **Login Gate**: Administrator setup on first launch; instant password rotation with session invalidation.
-- **Autonomous Chat View**: Grouped thread history, live streaming thinking drawer, real-time tool execution badges, workspace file/folder diff tracker (`created` / `modified` / `deleted`), multimodal file uploads, inline HITL approval/edit/reject controls, and interactive `ContextUsageRing`.
-- **Workspace Filesystem Drawer**: Full `/workspace` tree browser, instant search, syntax-friendly viewer/editor, file & folder creation, and safe deletion.
-- **Unified Settings Modal**: Configure Main Agent, Sub-Agent, Accessories (Image/Video/Audio), Custom Providers, Encrypted API Key Vault, Thinking/Timeout policies, Execution Access Mode, Skills, MCP Servers, Password, and Light/Dark theme.
-
----
-
-## 5. Repository Structure & Module Map
+### Project Structure
 
 ```text
 nemofy-agent/
-├── Agent-Core/                          # Generalized pure-Python LangGraph engine
-│   ├── README.md                        # Standalone library usage & API guide
-│   ├── main.py                          # Interactive Rich CLI (`--check`, `--thread-id`)
-│   ├── Dockerfile.sandbox               # Hardened non-root Python + Playwright sandbox image
-│   ├── agent_core/
-│   │   ├── __init__.py                  # Clean public library facade (`__all__`)
-│   │   ├── config.py                    # AgentConfig, AgentPersona, ExecutionLimits, AgentHooks
-│   │   ├── graph.py                     # Cyclic LangGraph supervisor & AgentRuntime
-│   │   ├── state.py                     # Typed AgentState, PlanStep, 4k log compaction
-│   │   ├── planner.py                   # System prompt builder & structured plan parser
-│   │   ├── guardrails.py                # GuardrailPolicy, bash AST classifier, HITL gate
-│   │   ├── sandbox.py                   # Docker & local_isolated sandbox + path confinement
-│   │   ├── context_manager.py           # Exact token accounting & 80% auto-compaction
-│   │   ├── models.py                    # 12+ provider specs, retry engine, timeout fallback
-│   │   ├── multimodal.py                # Media capability detection & accessory sub-agents
-│   │   ├── firecrawl.py                 # Firecrawl Local v2 client & document extraction
-│   │   ├── skills.py                    # /Skills/*.md registry & on-demand loader
-│   │   ├── subagents.py                 # Isolated worker sub-agent graph runner
-│   │   ├── jobs.py                      # Async JobManager, heartbeats & stall watchdog
-│   │   ├── api.py                       # FastAPI service (`create_app`, Bearer auth)
-│   │   ├── message_utils.py             # Pure <think>/reasoning parser & history sanitizer
-│   │   ├── workspace_diff.py            # Workspace file/directory snapshot diffing
-│   │   └── tools/local.py               # Built-in file, bash, and Firecrawl tools
-│   ├── benchmarks/
-│   │   └── run_benchmarks.py            # Live 6-suite benchmark harness with acceptance caps
-│   └── tests/                           # 100+ pytest tests + self_test.py runner
-├── Nemofy Agent/                        # Standalone Vercel-deployable React + Vite SPA
-│   ├── package.json                     # Self-contained frontend dependencies (Vite 8 + React 19)
-│   ├── vercel.json                      # SPA rewrites & security headers
-│   └── src/
-│       ├── App.tsx                      # Top-level workspace & session state coordinator
-│       ├── components/                  # ChatView, AgentActivityPanel, ContextUsageRing,
-│       │                                # FilesystemView, SettingsModal, LoginGate, etc.
-│       ├── hooks/                       # useAgentExecution, useChatThreads
-│       └── lib/                         # apiClient, llmPresets, contextUtils, markdownRenderer
-│                                        # + 10 TypeScript unit test suites
-├── server.ts                            # Unified Express gateway (:3000) + Vite middleware
-├── server/                              # Backend gateway modules + 7 unit test suites
-│   ├── authStore.ts                     # scrypt password & session management
-│   ├── profileVault.ts                  # Per-user AES-256-GCM encrypted API key vault
-│   ├── configStore.ts                   # Atomic JSON stores for LLM config, threads, workspace
-│   ├── providerCatalog.ts               # Live model discovery, context metadata & SSRF guard
-│   ├── jobOrchestrator.ts               # Background job poller & thread concurrency locking
-│   ├── agentProcessManager.ts           # Auto-bootstraps .venv & supervises Agent-Core :8100
-│   ├── firecrawlProcessManager.ts       # Supervises local Firecrawl Rust binary :3002
-│   └── serverConfig.ts                  # CLI/env host & port resolution
-├── Skills/                              # Dynamic Markdown playbooks (code_and_data, deep_research)
-├── MCPs/                                # Pure-Python MCPRegistryManager & servers.json
-├── Web-design/                          # Nemofy brand design tokens & SVG logo
-├── scripts/                             # Runtime build, Firecrawl Local & Chromium installers
-├── Dockerfile                           # Multi-stage production container (Rust + Node + Python)
-├── docker-compose.yml                   # Single-container production stack with named volumes
-├── pyproject.toml                       # Python dependencies, pytest, ruff & mypy config
-├── package.json                         # Root workspace scripts & Express/Vite dependencies
-└── .env.example                         # Documented environment variable template
+├── Agent-Core/          # Standalone Python LangGraph engine, FastAPI service, CLI, tests & benchmarks
+├── Nemofy Agent/        # React 19 + Vite 8 + Tailwind CSS 4 web app (Vercel-ready)
+├── server.ts            # Unified Express API gateway (:3000)
+├── server/              # Auth, AES-256-GCM key vault, provider catalog, job & process managers
+├── Skills/              # Dynamic Markdown playbooks (code_and_data.md, deep_research.md)
+├── MCPs/                # External Model Context Protocol client & servers.json
+├── scripts/             # Installers for Firecrawl Local, Chromium & runtime dependencies
+├── Dockerfile           # All-in-one production container (Rust + Node + Python + Chromium)
+├── docker-compose.yml   # Single-command production deployment with persistent volumes
+└── .env.example         # Documented environment variable reference
 ```
 
 ---
 
-## 6. Live Benchmarks, Latency Analysis & Acceptance Evidence
+### Configuration & API Reference
 
-All benchmarks below were executed live on this repository via `Agent-Core/benchmarks/run_benchmarks.py` and live end-to-end API runs against configured encrypted-vault providers.
+Most settings can be managed directly in the web UI without touching `.env`. For advanced setups and integrations, expand the tables below.
 
-### 6.1 Runtime Benchmark Suite Scorecard (`6/6 PASS`)
-
-| # | Benchmark Suite | Measured Result | Acceptance Criterion | Verdict |
-| :-: | :--- | :--- | :--- | :-: |
-| 1 | **Supervisor Graph Latency & Persistence** (SQLite WAL, `:memory:`, `MemorySaver`) | Direct p50 `39.2 ms` / p95 `41.9 ms`<br>Multi-step p50 `102.3 ms` / p95 `106.2 ms`<br>`:memory:` disk leak: `False` | Direct p95 `< 350 ms`<br>Multi-step p95 `< 600 ms`<br>Zero `:memory:` file created | **PASS** |
-| 2 | **Sandbox Safety & Perf (`local_isolated`)** (10 Python runs + timeout + escapes) | Exec p50 `102.5 ms` / p95 `113.3 ms`<br>1s timeout kill: `1054.0 ms`<br>Traversal, symlink, env scrub: `100%` | Exec p95 `< 500 ms`<br>Timeout kill `< 2500 ms`<br>100% security blocks | **PASS** |
-| 3 | **Guardrails, HITL & Wall-Clock Safety Cap** | Approve side-effects: `1`, Reject: `0`<br>Hooks: `10` events (error isolated)<br>Wall-clock halt: `305.7 ms` (`2` turns) | Approve `== 1`, Reject `== 0`<br>Wall-clock halt `< 1000 ms`<br>Runaway turns `< 5` | **PASS** |
-| 4 | **Context Accounting & 80% Auto-Compaction** | Turn 1: `59.9%` (`0` compactions)<br>Turn 2: `63.0%` (`0` compactions)<br>Turn 3: `>= 80%` -> `1` compaction | Turns 1–2 uncompacted<br>Turn 3 compacted `>= 1`<br>Summary tokens `> 0` | **PASS** |
-| 5 | **Concurrent SQLite WAL Isolation** (12 parallel multi-step threads) | `12/12` completed in `961.4 ms` wall<br>Thread p95 `864.1 ms`<br>Cross-thread bleed / lock errors: `0` | `12/12` pass, `0` bleed<br>Total wall `< 10,000 ms` | **PASS** |
-| 6 | **FastAPI Auth, Async Jobs & Cancellation** | `/health` clean (`skills_dir` absent)<br>Unauth `401` enforced; `8/8` jobs p95 `461.6 ms`<br>In-flight job cancel: `4.8 ms` | `401` unauth, `8/8` jobs<br>Cancel `< 1000 ms`<br>Zero host-path leaks | **PASS** |
-
-### 6.2 Measured Latency Distribution (ASCII Bar Chart)
-
-```text
-Agent-Core Local Engine Latency (lower is better, p95 vs acceptance budget)
-----------------------------------------------------------------------------------------
-In-Flight Job Cancel          | #                                  4.8 ms  (cap: 1000ms)
-Direct LangGraph Turn (p95)   | ####                              41.9 ms  (cap:  350ms)
-Multi-Step Tool Loop (p95)    | ##########                       106.2 ms  (cap:  600ms)
-Isolated Sandbox Exec (p95)   | ###########                      113.3 ms  (cap:  500ms)
-Wall-Clock Runaway Halt       | ##############################   305.7 ms  (cap: 1000ms)
-8x Concurrent Async Jobs (p95)| ############################################## 461.6 ms
-12x Parallel WAL Threads (p95)| ######################################################## 864.1 ms
-----------------------------------------------------------------------------------------
-                              0ms       200ms      400ms      600ms      800ms     1000ms
-```
-
-### 6.3 Live Cloud LLM End-to-End Verification (Configured Encrypted Vault Providers)
-
-Executed live through the running Express/FastAPI stack (`127.0.0.1:8100`) using AES-256-GCM vault keys synced in memory:
-
-| Live Scenario | Active Provider & Model | Latency | Turns | Verified Outcome |
-| :--- | :--- | :---: | :---: | :--- |
-| **Multi-Step Tool Loop** (`write_file` → `read_file` → synthesis) | `river_ai` / `deepseek-ai/DeepSeek-V4.1-Flash` | `4,578 ms` | 2 | **PASS** — Both tools `ok`, file diff `created` tracked, `64` chars reasoning, `3,829 / 1,048,576` tokens (`0.4%`) |
-| **Dynamic Provider Switch** (per-request override) | `openrouter` / `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` | `1,574 ms` | 1 | **PASS** — Exact target response returned, `238` chars reasoning extracted |
-| **Sub-Agent Delegation + Fail-Closed Sandbox** (`spawn_subagent`) | `river_ai` / `deepseek-ai/DeepSeek-V4.1-Flash` (Primary + Worker) | `14,348 ms` | 3 | **PASS** — Sub-agent report returned (`17 × 23 = 391`); blocked `bash_exec` gracefully reported without crash |
-
-### 6.4 Automated Test & Quality Gate Summary
-
-```text
-Check                                           Result                 Notes
-------------------------------------------------------------------------------------------------
-Python py_compile (Agent-Core + MCPs)           21 / 21 PASS           All modules clean
-Ruff Linter (Agent-Core + tests + benchmarks)   0 errors PASS          Includes ASYNC & S rules
-Pytest Full Suite (Agent-Core/tests)            100 PASS / 0 FAIL      0 warnings (1 optional skip*)
-TypeScript Tests (server + Nemofy Agent/src)    92 PASS / 0 FAIL       Auth, vault, catalog, UI logic
-TypeScript Typecheck (root & Nemofy Agent)      0 errors PASS          Strict mode enabled
-Vite Production Build (`npm run build`)         PASS                   Frontend bundle built cleanly
-Headless Chromium Verification (:3000)          PASS                   Clean desktop render, 0 app errors
-```
-
-*\*1 skipped test (`test_firecrawl_pdf_and_office_documents_remote_and_local` step 3) skips cleanly only when the optional Rust `firecrawl-local` binary is not yet installed on the host; steps 1 & 2 always run, and Docker builds include `firecrawl-local` + Chromium automatically.*
-
----
-
-## 7. Quickstart: How to Use After Downloading
-
-### Prerequisites
-
-- **Node.js 22+** and **npm**
-- **Python 3.11+**
-- *(Optional)* **Docker** — for container-isolated sandbox execution (`Agent-Core/Dockerfile.sandbox`) or one-command `docker compose` deployment
-- *(Optional)* **Rust / Cargo** — only if you want to compile `firecrawl-local` locally outside Docker (`npm run firecrawl:install`)
-
----
-
-### Mode A: Full-Stack Local Development (Recommended)
-
-1. **Install Node dependencies**:
-   ```bash
-   npm install
-   ```
-
-2. **Install Python `Agent-Core` dependencies** *(optional — `npm run dev` also auto-bootstraps `.venv` automatically on cold start)*:
-   ```bash
-   python3 -m venv .venv
-   .venv/bin/pip install --upgrade pip
-   .venv/bin/pip install -e ".[dev]"
-   ```
-
-3. **Optional environment configuration**:
-   ```bash
-   cp .env.example .env
-   # You do NOT need to put LLM API keys in .env — you can enter them securely
-   # inside the web UI Settings modal where they are stored encrypted (AES-256-GCM).
-   ```
-
-4. **Launch the unified server** (starts Express + Vite on `:3000`, Python `Agent-Core` on `:8100`, and `Firecrawl Local` on `:3002` if installed):
-   ```bash
-   npm run dev
-   ```
-
-5. **Open `http://localhost:3000`**:
-   - Create your administrator username & password on the **Protected Access Gate** (first run).
-   - Open **Settings → LLM Config**, add your provider API key (e.g., OpenAI, OpenRouter, River AI, Anthropic, Gemini, NVIDIA, DeepSeek, or local Ollama), pick your **Main Agent** & **Sub-Agent** models, and click **Test Connection**.
-   - Start chatting, watch live thinking/tools/file changes, inspect `/workspace` in the Filesystem drawer, and approve/edit/reject sensitive actions via HITL prompts.
-
----
-
-### Mode B: Embed `Agent-Core` as a Standalone Python Library
-
-Use `agent_core` directly in your own LangGraph projects without needing Express, React, or `MCPs/`:
-
-```python
-import asyncio
-from pathlib import Path
-from langchain_core.tools import tool
-from langgraph.checkpoint.memory import MemorySaver
-
-from agent_core import (
-    AgentConfig,
-    AgentHooks,
-    AgentPersona,
-    ExecutionLimits,
-    GuardrailPolicy,
-    SandboxConfig,
-    SandboxManager,
-    create_agent_runtime,
-)
-
-@tool("lookup_order")
-def lookup_order(order_id: str) -> str:
-    """Look up an order's shipping status."""
-    return f"Order {order_id}: out for delivery"
-
-async def main() -> None:
-    sandbox = SandboxManager(
-        SandboxConfig(workspace_dir=Path("./workspace"), backend="local_isolated")
-    )
-    config = AgentConfig(
-        persona=AgentPersona(
-            name="Support Agent",
-            organization="Acme Corp",
-            role_description="a concise order support specialist",
-            extra_instructions="Always confirm the order ID in your reply.",
-        ),
-        limits=ExecutionLimits(max_turns=12, max_wall_clock_seconds=45.0),
-        guardrail_policy=GuardrailPolicy().extend(add_safe_tools=("lookup_order",)),
-        hooks=AgentHooks(
-            on_tool_end=lambda ev: print(f"[hook] {ev['tool']} -> {ev['status']}"),
-            on_run_complete=lambda ev: print(f"[hook] run finished: {ev['status']}"),
-        ),
-        include_default_tools=False,   # Expose ONLY your domain tools
-        enable_skills=False,
-        enable_subagents=False,
-        custom_checkpointer=MemorySaver(),  # Or omit for durable SQLite WAL
-    )
-
-    async with create_agent_runtime(
-        sandbox=sandbox,
-        extra_tools=[lookup_order],
-        connect_mcp=False,
-        config=config,
-    ) as runtime:
-        result = await runtime.run_task("Where is order ORD-1042?", thread_id="ticket-42")
-        print(result["final_response"])
-
-asyncio.run(main())
-```
-
-Or mount `Agent-Core` as a standalone FastAPI microservice:
-
-```python
-from agent_core import AgentConfig, create_app
-
-app = create_app(
-    checkpoint_db_path=":memory:",   # Pure in-memory SQLite (zero disk artifacts)
-    connect_mcp=False,
-    agent_config=AgentConfig(app_title="Custom Domain Agent API"),
-)
-```
-
-See [`Agent-Core/README.md`](Agent-Core/README.md) for the full standalone library guide.
-
----
-
-### Mode C: Pure-Python Interactive CLI
-
-```bash
-# Verify configuration, sandbox, skills, and model reachability
-PYTHONPATH=Agent-Core:. .venv/bin/python Agent-Core/main.py --check
-
-# Launch interactive terminal agent session with HITL prompts
-PYTHONPATH=Agent-Core:. .venv/bin/python Agent-Core/main.py --thread-id my-session
-```
-
----
-
-### Mode D: Production Docker Compose Stack
-
-The multi-stage `Dockerfile` compiles the official Rust `firecrawl-local` binary, installs Chromium, Node 22, and Python 3.11 `.venv`, builds the React frontend, and runs everything inside a single self-contained image with persistent volumes (`nemofy_data`, `nemofy_workspace`):
-
-```bash
-# Build and start in detached mode on http://localhost:3000
-npm run docker:up
-
-# View logs / stop
-npm run docker:logs
-npm run docker:down
-```
-
-*(Optional)* Build the hardened Docker sandbox image for container-isolated code execution:
-```bash
-docker build -f Agent-Core/Dockerfile.sandbox -t nemofy-agent-sandbox:latest Agent-Core
-```
-
----
-
-### Mode E: Deploy `Nemofy Agent/` Frontend on Vercel
-
-1. Import this repository in **Vercel** and set **Root Directory** to `Nemofy Agent`.
-2. Vercel auto-detects **Vite** (`npm run build` → `dist`, SPA rewrites & security headers pre-configured in `Nemofy Agent/vercel.json`).
-3. Set environment variable `VITE_AGENT_API_URL` to your hosted Express gateway URL (or set it inside **Settings → Appearance & Runtime**).
-
----
-
-## 8. Configuration & Environment Variables
-
-All supported variables are listed in `.env.example`. Most settings can also be managed live through the web UI without editing `.env`.
+<details>
+<summary><strong>Click to expand: Environment Variables (.env.example)</strong></summary>
 
 | Category | Key Variables | Default / Behavior |
 | :--- | :--- | :--- |
 | **Ports & Auth** | `PORT`, `AGENT_API_PORT`, `AGENT_API_TOKEN`, `NEMOFY_ADMIN_PASSWORD`, `VAULT_MASTER_KEY` | Web `:3000`, Agent-Core `:8100`; tokens/vault keys auto-generated securely if omitted |
 | **Primary / Worker Models** | `PRIMARY_PROVIDER`, `PRIMARY_MODEL`, `PRIMARY_BASE_URL`, `PRIMARY_TEMPERATURE`, `PRIMARY_MAX_TOKENS`, `PRIMARY_REASONING_EFFORT` (and `WORKER_*`) | Defaults configurable via UI (`data/llm_config.json`) |
-| **Provider API Keys** | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `RIVER_AI_API`, `NVIDIA_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY` | Recommended: store via UI in encrypted `data/vaults/<user>.vault.json` (AES-256-GCM) |
+| **Provider API Keys** | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `RIVER_AI_API`, `NVIDIA_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY` | Recommended: enter via UI so keys stay encrypted in `data/vaults/<user>.vault.json` |
 | **Resilience & Limits** | `MAX_TURNS`, `MODEL_CONNECT_TIMEOUT_SECONDS`, `MODEL_READ_TIMEOUT_SECONDS`, `MODEL_MAX_RETRIES` | `30` turns (`1..180`), `15s` connect, `180s` read, `2` retries |
 | **Sandbox** | `SANDBOX_BACKEND` (`auto` \| `docker` \| `local_isolated`), `ALLOW_UNSAFE_LOCAL_BASH`, `SANDBOX_TIMEOUT_SECONDS`, `WORKSPACE_DIR` | Fail-closed (`ALLOW_UNSAFE_LOCAL_BASH=false`), `300s` timeout |
-| **Firecrawl Local** | `FIRECRAWL_API_URL`, `FIRECRAWL_PORT`, `FIRECRAWL_LOCAL_AUTOSTART`, `FIRECRAWL_CHROME_PATH`, `FIRECRAWL_API_KEY` | `http://127.0.0.1:3002`, auto-starts if binary installed |
+| **Firecrawl Local** | `FIRECRAWL_API_URL`, `FIRECRAWL_PORT`, `FIRECRAWL_LOCAL_AUTOSTART`, `FIRECRAWL_CHROME_PATH`, `FIRECRAWL_API_KEY` | `http://127.0.0.1:3002`, auto-starts if installed |
 | **Storage & Paths** | `CHECKPOINT_DB_PATH`, `LLM_CONFIG_PATH`, `SKILLS_DIR`, `MCP_CONFIG_PATH` | `data/checkpoints.db`, `data/llm_config.json`, `Skills/`, `MCPs/servers.json` |
 
----
+</details>
 
-## 9. HTTP API Reference
+<details>
+<summary><strong>Click to expand: HTTP API Endpoints (Express Gateway :3000 & Agent-Core :8100)</strong></summary>
 
-### Express Gateway (`http://localhost:3000`)
+#### Express Gateway (`http://localhost:3000`)
 
 | Endpoint | Auth | Purpose |
 | :--- | :---: | :--- |
 | `GET /api/health` | Public | Gateway & Agent-Core readiness probe |
 | `POST /api/auth/setup` / `login` / `logout` / `change-password` | Public / Cookie | Administrator authentication & session rotation |
 | `GET/POST/DELETE /api/threads` | Cookie | Multi-thread chat history & per-session model config |
-| `POST /api/chat/send` / `resume` / `cancel` | Cookie | Launch/resume/cancel background agent jobs |
+| `POST /api/chat/send` / `resume` / `cancel` | Cookie | Launch, approve/resume, or cancel background agent jobs |
 | `GET /api/chat/jobs/:jobId` | Cookie | Live polling for thinking, tools, file diffs & context usage |
 | `GET/PUT/POST/DELETE /api/workspace/*` | Cookie | Confined `/workspace` file & directory CRUD |
 | `GET/PUT /api/settings/llm` & `POST /api/settings/probe` | Cookie | Dual-model, accessory, custom provider & vault management |
 | `GET/PUT/DELETE /api/skills` & `GET/PUT /api/mcps` | Cookie | Manage dynamic Markdown skills and MCP servers |
 
-### Agent-Core FastAPI Service (`http://127.0.0.1:8100`)
+#### Agent-Core FastAPI Service (`http://127.0.0.1:8100`)
 
 | Endpoint | Auth | Purpose |
 | :--- | :---: | :--- |
-| `GET /health` | Public | Runtime, models, checkpoint, sandbox, Firecrawl, skills & MCP health (zero host-path leaks) |
+| `GET /health` | Public | Runtime, models, checkpoint, sandbox, Firecrawl, skills & MCP health |
 | `POST /agent/run` & `POST /agent/resume` | Bearer | Synchronous LangGraph execution & HITL approval resume |
 | `POST /agent/jobs/run` & `POST /agent/jobs/resume` | Bearer | Non-blocking async jobs (HTTP `202 Accepted`) |
 | `GET /agent/jobs/{job_id}?wait_ms=...` | Bearer | Long-poll progress heartbeats, thinking stream & result |
 | `POST /agent/jobs/{job_id}/cancel` | Bearer | Immediate cooperative cancellation of in-flight jobs |
 | `POST /config/secrets` / `DELETE /config/secrets` | Bearer | In-memory sync of decrypted vault secrets from gateway |
 
+</details>
+
 ---
 
-## 10. Testing, Self-Check & Benchmarking
+### Tests & Live Benchmarks
 
-Run the complete verification suite anytime from the repository root:
+Nemofy Agent is continuously verified across **100 Python tests**, **92 TypeScript unit tests**, static type checks, and a **6-suite live benchmark harness** covering latency, sandbox confinement, HITL safety, 80% auto-compaction, concurrent SQLite WAL threads, and live cloud LLM execution.
+
+<details>
+<summary><strong>Click to expand: Benchmark Scorecard & Verification Commands</strong></summary>
+
+| # | Benchmark Suite | Measured Result | Verdict |
+| :-: | :--- | :--- | :-: |
+| 1 | **Supervisor Graph Latency & Persistence** | Direct p95 `41.9 ms` (`< 350 ms`); Multi-step p95 `106.2 ms` (`< 600 ms`); `:memory:` zero disk leak | **PASS** |
+| 2 | **Sandbox Safety & Perf (`local_isolated`)** | Exec p95 `113.3 ms`; 1s timeout kill `1054 ms`; 100% traversal, symlink & env scrub blocks | **PASS** |
+| 3 | **Guardrails, HITL & Wall-Clock Safety Cap** | Approve side-effects `1`, Reject `0`; Runaway loop halted in `305.7 ms` (`2` turns) | **PASS** |
+| 4 | **Context Accounting & 80% Auto-Compaction** | Turns 1–2 uncompacted (`59.9%`, `63.0%`); Turn 3 (`>= 80%`) auto-compacted cleanly | **PASS** |
+| 5 | **Concurrent SQLite WAL Isolation** | `12/12` parallel multi-step threads in `961.4 ms` wall; `0` cross-thread bleed or lock errors | **PASS** |
+| 6 | **FastAPI Auth, Async Jobs & Cancellation** | `401` enforced; `8/8` jobs p95 `461.6 ms`; In-flight job cancel `4.8 ms` | **PASS** |
+
+Run the verification suites yourself anytime:
 
 ```bash
-# 1. Python syntax compile + Ruff lint + Full Pytest verification suite
+# 1. Python syntax check + Ruff lint + Pytest suite (100 tests)
 PYTHONPATH=Agent-Core:. .venv/bin/python Agent-Core/tests/self_test.py
 
-# 2. TypeScript server + frontend library unit tests (92 tests)
+# 2. TypeScript server + frontend unit tests (92 tests)
 npx --yes tsx --test server/*.test.ts "Nemofy Agent/src/lib/"*.test.ts
 
-# 3. TypeScript strict typecheck (root + standalone Nemofy Agent)
+# 3. TypeScript strict typecheck (root + standalone frontend)
 npm run lint
 npx tsc -p "Nemofy Agent/tsconfig.json" --noEmit
 
-# 4. Live 6-suite Agent-Core benchmark harness (latency, sandbox, HITL, compaction, WAL concurrency, HTTP jobs)
+# 4. 6-suite Agent-Core benchmark harness
 PYTHONPATH=Agent-Core:. .venv/bin/python Agent-Core/benchmarks/run_benchmarks.py
 
 # 5. Production build
 npm run build
 ```
 
+</details>
+
 ---
 
-## 11. Troubleshooting & FAQ
+## Common Questions & Troubleshooting
 
-- **`bash_exec` returns an error saying Docker is unavailable and unisolated local fallback is disabled**:
-  This is intentional fail-closed security (`ALLOW_UNSAFE_LOCAL_BASH=false`). Either run Docker with `Agent-Core/Dockerfile.sandbox`, or explicitly enable **Allow local bash fallback** in **Settings → Appearance & Runtime** (or set `ALLOW_UNSAFE_LOCAL_BASH=true`) on trusted personal machines.
-- **Firecrawl web tools report `127.0.0.1:3002` unavailable locally**:
-  Run `npm run firecrawl:install` (requires Rust/Cargo + C compiler) or run via `npm run docker:up`, which pre-compiles `firecrawl-local` and bundles Chromium automatically. Alternatively, add a `FIRECRAWL_API_KEY` in Settings to use Firecrawl Cloud.
-- **How do I reset my administrator password or encrypted vault?**
-  Stop the server and remove `data/auth.json` (and `data/vaults/` if rotating the vault master key), then restart `npm run dev` to run the clean first-time setup flow.
+- **Why did Nemo say shell execution (`bash_exec`) is disabled?**
+  For your safety, Nemofy blocks direct host shell commands when Docker isn't running. You can either build the Docker sandbox (`Agent-Core/Dockerfile.sandbox`) or—if you're on a trusted personal computer—turn on **Unsafe Local Shell Execution** under **Settings → Appearance & Runtime**.
+- **Web search says `127.0.0.1:3002` (Firecrawl Local) isn't running. How do I enable it?**
+  You have three easy choices: run via Docker (`npm run docker:up`, which includes Firecrawl + Chromium automatically), install it locally with `npm run firecrawl:install` (requires Rust/Cargo), or paste a Firecrawl Cloud API key in Settings.
+- **I forgot my admin password—how do I reset it?**
+  Stop the server, delete `data/auth.json` (and `data/vaults/` if you also want a fresh API key vault), and run `npm run dev` again to recreate your admin account.
 
 ---
 
