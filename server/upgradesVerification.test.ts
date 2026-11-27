@@ -567,6 +567,18 @@ test('Docker setup hardening prevents context pollution, DNS/apt failures, missi
     sandboxDockerfile.includes('Acquire::ForceIPv4'),
     'Agent-Core/Dockerfile.sandbox must configure apt IPv4/retry resilience',
   );
+
+  // 5. package.json must not pin stale esbuild <0.27 that causes npm ERESOLVE with Vite 8
+  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf-8')) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  };
+  const pinnedEsbuild = pkg.devDependencies?.esbuild || pkg.dependencies?.esbuild || '';
+  assert.equal(
+    /^[\^~]?0\.2[0-6]\./.test(pinnedEsbuild),
+    false,
+    `package.json must not pin incompatible esbuild version (${pinnedEsbuild}) with Vite 8`,
+  );
 });
 
 
