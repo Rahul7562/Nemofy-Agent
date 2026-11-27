@@ -18,6 +18,7 @@ x-logging: &default-logging
 
 services:
   nemofy-app:
+      container_name: nemofy-agent
     build:
       context: .
       dockerfile: Dockerfile
