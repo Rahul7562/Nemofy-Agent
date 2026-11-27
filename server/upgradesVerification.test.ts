@@ -507,4 +507,67 @@ test('Docker and Firecrawl Local infrastructure files define clean embedded fire
   assert.ok(dockerfile.includes('chromium --version'), 'Dockerfile must verify Chromium alongside firecrawl-local');
 });
 
+test('Docker setup hardening prevents context pollution, DNS/apt failures, missing README.md, PID 1 leaks, and sandbox lockouts', () => {
+  const repoRoot = path.resolve(process.cwd());
+  const dockerignorePath = path.join(repoRoot, '.dockerignore');
+  const dockerfile = fs.readFileSync(path.join(repoRoot, 'Dockerfile'), 'utf-8');
+  const compose = fs.readFileSync(path.join(repoRoot, 'docker-compose.yml'), 'utf-8');
+  const sandboxDockerfile = fs.readFileSync(path.join(repoRoot, 'Agent-Core', 'Dockerfile.sandbox'), 'utf-8');
+
+  // 1. .dockerignore must exist and exclude host build outputs, venvs, and secrets
+  assert.equal(fs.existsSync(dockerignorePath), true, '.dockerignore must exist');
+  const dockerignore = fs.readFileSync(dockerignorePath, 'utf-8');
+  for (const requiredEntry of ['node_modules', '.venv', 'dist', '.env', 'data', 'workspace', '.git', '.firecrawl']) {
+    assert.ok(
+      dockerignore.split(/\r?\n/).some((line) => line.trim() === requiredEntry),
+      `.dockerignore must exclude ${requiredEntry}`,
+    );
+  }
+  assert.ok(dockerignore.includes('!.env.example'), '.dockerignore should keep .env.example');
+
+  // 2. Dockerfile must include apt IPv4/retry resilience, libssl-dev/perl, tini/procps, README.md before pip install, production mode, and direct tsx CMD
+  assert.ok(dockerfile.includes('Acquire::ForceIPv4'), 'Dockerfile must force IPv4 for apt network resilience');
+  assert.ok(dockerfile.includes('Acquire::Retries'), 'Dockerfile must configure apt retries');
+  assert.ok(dockerfile.includes('libssl-dev'), 'firecrawl-builder must install libssl-dev');
+  assert.ok(dockerfile.includes('CARGO_PROFILE_RELEASE_LTO=thin'), 'firecrawl-builder must avoid OOM-prone fat LTO');
+  assert.ok(dockerfile.includes('tini'), 'runtime stage must install tini for PID 1 reaping');
+  assert.ok(dockerfile.includes('procps'), 'runtime stage must install procps for pkill');
+  assert.ok(
+    dockerfile.includes('COPY pyproject.toml README.md ./'),
+    'Dockerfile must copy README.md alongside pyproject.toml before pip install -e .',
+  );
+  assert.ok(
+    dockerfile.includes('SKIP_RUNTIME_DEPS_BUILD=1 npm run build'),
+    'Dockerfile frontend build must skip redundant host runtime-dep installers',
+  );
+  assert.ok(dockerfile.includes('ENV NODE_ENV=production'), 'Dockerfile must set NODE_ENV=production after build');
+  assert.ok(dockerfile.includes('ENTRYPOINT ["/usr/bin/tini", "--"]'), 'Dockerfile must use tini as ENTRYPOINT');
+  assert.ok(
+    dockerfile.includes('CMD ["./node_modules/.bin/tsx", "server.ts"]'),
+    'Dockerfile must execute local tsx directly instead of npx',
+  );
+  assert.equal(dockerfile.includes('CMD ["npx"'), false, 'Dockerfile must not use npx as container CMD');
+
+  // 3. docker-compose.yml must configure host build network, shm_size, init, HOST=0.0.0.0, and SANDBOX_BACKEND
+  assert.ok(compose.includes('network: host'), 'docker-compose.yml build must use host network to avoid bridge DNS failures');
+  assert.ok(compose.includes('init: true'), 'docker-compose.yml must enable init process reaping');
+  assert.ok(compose.includes('shm_size:'), 'docker-compose.yml must increase /dev/shm for Chromium');
+  assert.ok(compose.includes('HOST: "0.0.0.0"'), 'docker-compose.yml must bind HOST=0.0.0.0');
+  assert.ok(
+    compose.includes('SANDBOX_BACKEND: ${SANDBOX_BACKEND:-local_isolated}'),
+    'docker-compose.yml must default SANDBOX_BACKEND to local_isolated inside container',
+  );
+
+  // 4. Sandbox Dockerfile must pin Bookworm (avoiding Debian Trixie libasound2/libatk renames) and set apt resilience
+  assert.ok(
+    sandboxDockerfile.includes('FROM python:3.12-slim-bookworm'),
+    'Agent-Core/Dockerfile.sandbox must pin python:3.12-slim-bookworm',
+  );
+  assert.ok(
+    sandboxDockerfile.includes('Acquire::ForceIPv4'),
+    'Agent-Core/Dockerfile.sandbox must configure apt IPv4/retry resilience',
+  );
+});
+
+
 

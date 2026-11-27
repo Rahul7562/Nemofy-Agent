@@ -57,8 +57,8 @@ echo "[chromium] No Chrome/Chromium binary found — installing Chromium alongsi
 
 # 1. On Debian/Ubuntu hosts running as root (Docker/VM builds), install system chromium directly
 if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium fonts-liberation ca-certificates
+  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends chromium fonts-liberation ca-certificates
   rm -rf /var/lib/apt/lists/*
   if INSTALLED_CHROME="$(find_chrome)"; then
     echo "[chromium] Installed system Chromium: ${INSTALLED_CHROME}"

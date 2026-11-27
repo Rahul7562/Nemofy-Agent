@@ -1,0 +1,37 @@
+# Version control, editor & tooling artifacts
+.git
+.gitignore
+.aistudio
+.playwright-cli
+.DS_Store
+Thumbs.db
+*.log
+
+# Node build outputs & dependencies (never let host node_modules overwrite Linux container deps)
+node_modules
+**/node_modules
+dist
+**/dist
+build
+coverage
+.firecrawl
+
+# Python virtualenvs & caches (never let host .venv overwrite /app/.venv)
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+**/*$py.class
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Runtime data, user workspaces, and local secrets (never bake secrets into Docker image layers)
+.env
+.env.*
+!.env.example
+data
+workspace
+.nemofy-data
+:memory:

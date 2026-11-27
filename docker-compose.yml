@@ -22,6 +22,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Use host network during build so BuildKit inherits host DNS/VPN routing
+      # and avoids "Temporary failure resolving 'deb.debian.org'" on bridge DNS setups.
+      network: host
+    init: true
+    shm_size: "1gb"
+    stop_grace_period: 15s
     restart: unless-stopped
     ports:
       - "${PORT:-3000}:3000"
@@ -30,8 +36,11 @@ services:
         required: false
     environment:
       NODE_ENV: production
+      HOST: "0.0.0.0"
       PORT: "3000"
       AGENT_API_PORT: ${AGENT_API_PORT:-8100}
+      SANDBOX_BACKEND: ${SANDBOX_BACKEND:-local_isolated}
+      ALLOW_UNSAFE_LOCAL_BASH: ${ALLOW_UNSAFE_LOCAL_BASH:-false}
       FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-http://127.0.0.1:3002}
       FIRECRAWL_PORT: ${FIRECRAWL_PORT:-3002}
       FIRECRAWL_CLOUD: ${FIRECRAWL_CLOUD:-auto}
@@ -41,7 +50,6 @@ services:
       FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
       FIRECRAWL_LOCAL_TOKEN: ${FIRECRAWL_LOCAL_TOKEN:-}
       FIRECRAWL_TIMEOUT_SECONDS: ${FIRECRAWL_TIMEOUT_SECONDS:-45}
-      ALLOW_UNSAFE_LOCAL_BASH: ${ALLOW_UNSAFE_LOCAL_BASH:-false}
       MODEL_CONNECT_TIMEOUT_SECONDS: ${MODEL_CONNECT_TIMEOUT_SECONDS:-15}
       MODEL_READ_TIMEOUT_SECONDS: ${MODEL_READ_TIMEOUT_SECONDS:-180}
       MODEL_MAX_RETRIES: ${MODEL_MAX_RETRIES:-2}
@@ -53,7 +61,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 45s
     logging: *default-logging
 
 volumes:
