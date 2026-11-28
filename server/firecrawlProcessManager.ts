@@ -101,6 +101,78 @@ export function prepareChromeExecutable(
   }
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0']);
+
+/**
+ * Returns true if `rawUrl` points to a loopback address or to the local
+ * `firecrawl-local` server itself (`host:port`).
+ */
+export function isLoopbackOrSelfUrl(rawUrl: string, host?: string, port?: number): boolean {
+  const cleaned = (rawUrl || '').trim();
+  if (!cleaned) return false;
+  try {
+    const parsed = new URL(cleaned);
+    const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (LOOPBACK_HOSTS.has(hostname) || hostname.endsWith('.localhost')) {
+      return true;
+    }
+    if (host) {
+      const normalizedHost = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+      const parsedPort = parsed.port ? Number(parsed.port) : parsed.protocol === 'https:' ? 443 : 80;
+      if (hostname === normalizedHost && (!port || parsedPort === port)) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the sanitized environment for spawning `firecrawl-local serve`.
+ *
+ * CRITICAL: The Nemofy app uses `FIRECRAWL_API_URL` to tell its Python client where
+ * the local Firecrawl server listens (e.g. `http://127.0.0.1:3002`), whereas the
+ * `firecrawl-local` binary interprets `FIRECRAWL_API_URL` as the upstream cloud API
+ * endpoint to forward `/v2/search` and `/v2/extract` requests to. Passing a loopback
+ * or self-referential `FIRECRAWL_API_URL` into the child with `FIRECRAWL_CLOUD=auto`
+ * causes infinite self-forwarding recursion. Strip it unconditionally when it points
+ * to loopback/self, and optionally honor an explicit non-loopback `FIRECRAWL_CLOUD_API_URL`.
+ */
+export function buildFirecrawlChildEnv(
+  baseEnv: Record<string, string | undefined>,
+  extraEnv: Record<string, string | undefined>,
+  options: {
+    host: string;
+    port: number;
+    dataHome: string;
+    chromePath?: string | null;
+  },
+): NodeJS.ProcessEnv {
+  const merged: NodeJS.ProcessEnv = {
+    ...baseEnv,
+    ...extraEnv,
+    FIRECRAWL_LOCAL_HOME: options.dataHome,
+    FIRECRAWL_CLOUD: ((extraEnv.FIRECRAWL_CLOUD ?? baseEnv.FIRECRAWL_CLOUD) || 'auto').trim() || 'auto',
+    FIRECRAWL_LOCAL_BROWSER:
+      ((extraEnv.FIRECRAWL_LOCAL_BROWSER ?? baseEnv.FIRECRAWL_LOCAL_BROWSER) || 'auto').trim() || 'auto',
+    ...(options.chromePath ? { FIRECRAWL_CHROME_PATH: options.chromePath } : {}),
+  };
+
+  const inheritedApiUrl = (merged.FIRECRAWL_API_URL || '').trim();
+  if (inheritedApiUrl && isLoopbackOrSelfUrl(inheritedApiUrl, options.host, options.port)) {
+    delete merged.FIRECRAWL_API_URL;
+  }
+
+  const explicitCloudUrl = (merged.FIRECRAWL_CLOUD_API_URL || '').trim();
+  if (explicitCloudUrl && !isLoopbackOrSelfUrl(explicitCloudUrl, options.host, options.port)) {
+    merged.FIRECRAWL_API_URL = explicitCloudUrl;
+  }
+
+  return merged;
+}
+
 export class FirecrawlLocalProcessManager {
   private child: ChildProcess | null = null;
   private readonly cwd: string;
@@ -176,9 +248,10 @@ export class FirecrawlLocalProcessManager {
     return null;
   }
 
-  async isHealthy(): Promise<boolean> {
+  async isHealthy(extraEnv?: Record<string, string>): Promise<boolean> {
     try {
-      const token = (process.env.FIRECRAWL_LOCAL_TOKEN || '').trim();
+      const mergedExtra = extraEnv ?? (this.getExtraEnv ? this.getExtraEnv() : {});
+      const token = (mergedExtra.FIRECRAWL_LOCAL_TOKEN || process.env.FIRECRAWL_LOCAL_TOKEN || '').trim();
       const headers: Record<string, string> = {};
       if (token) headers.Authorization = `Bearer ${token}`;
       const res = await fetch(`${this.baseUrl}/health`, {
@@ -196,10 +269,10 @@ export class FirecrawlLocalProcessManager {
     }
   }
 
-  private async waitForHealth(timeoutMs = 15_000): Promise<boolean> {
+  private async waitForHealth(timeoutMs = 15_000, extraEnv?: Record<string, string>): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (await this.isHealthy()) return true;
+      if (await this.isHealthy(extraEnv)) return true;
       if (!this.child && this.state === 'error') return false;
       await new Promise((r) => setTimeout(r, 300));
     }
@@ -213,13 +286,7 @@ export class FirecrawlLocalProcessManager {
     }
     const configuredUrl = (extraEnv.FIRECRAWL_API_URL || process.env.FIRECRAWL_API_URL || '').trim();
     if (!configuredUrl) return true;
-    try {
-      const parsed = new URL(configuredUrl);
-      const host = parsed.hostname.toLowerCase();
-      return host === '127.0.0.1' || host === 'localhost' || host === '::1';
-    } catch {
-      return true;
-    }
+    return isLoopbackOrSelfUrl(configuredUrl, this.host, this.port);
   }
 
   async start(): Promise<void> {
@@ -236,7 +303,7 @@ export class FirecrawlLocalProcessManager {
           return;
         }
 
-        if (await this.isHealthy()) {
+        if (await this.isHealthy(extraEnv)) {
           console.log(`[firecrawl-local] Connected to running Firecrawl Local at ${this.baseUrl}`);
           return;
         }
@@ -276,16 +343,16 @@ export class FirecrawlLocalProcessManager {
             '...',
         );
 
+        const childEnv = buildFirecrawlChildEnv(process.env, extraEnv, {
+          host: this.host,
+          port: this.port,
+          dataHome,
+          chromePath,
+        });
+
         this.child = spawn(bin, args, {
           cwd: this.cwd,
-          env: {
-            ...process.env,
-            ...extraEnv,
-            FIRECRAWL_LOCAL_HOME: dataHome,
-            FIRECRAWL_CLOUD: (process.env.FIRECRAWL_CLOUD || 'auto').trim() || 'auto',
-            FIRECRAWL_LOCAL_BROWSER: (process.env.FIRECRAWL_LOCAL_BROWSER || 'auto').trim() || 'auto',
-            ...(chromePath ? { FIRECRAWL_CHROME_PATH: chromePath } : {}),
-          },
+          env: childEnv,
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
@@ -306,7 +373,7 @@ export class FirecrawlLocalProcessManager {
           }
         });
 
-        const ok = await this.waitForHealth(15_000);
+        const ok = await this.waitForHealth(15_000, extraEnv);
         if (ok) {
           this.state = 'ready';
           this.lastError = null;

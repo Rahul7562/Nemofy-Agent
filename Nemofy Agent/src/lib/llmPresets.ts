@@ -374,9 +374,12 @@ export function normalizeAccessoriesConfig(
         ...defaults[mod],
         ...incoming,
         enabled: typeof incoming.enabled === 'boolean' ? incoming.enabled : defaults[mod].enabled,
-        provider: (incoming.provider || defaults[mod].provider).trim(),
-        model: (incoming.model || defaults[mod].model).trim(),
-        base_url: (incoming.base_url || defaults[mod].base_url).trim(),
+        provider:
+          typeof incoming.provider === 'string' && incoming.provider.trim()
+            ? incoming.provider.trim()
+            : defaults[mod].provider,
+        model: typeof incoming.model === 'string' ? incoming.model : defaults[mod].model,
+        base_url: typeof incoming.base_url === 'string' ? incoming.base_url : defaults[mod].base_url,
         temperature:
           typeof incoming.temperature === 'number' && Number.isFinite(incoming.temperature)
             ? incoming.temperature
@@ -385,7 +388,10 @@ export function normalizeAccessoriesConfig(
           typeof incoming.max_tokens === 'number' && Number.isFinite(incoming.max_tokens)
             ? Math.round(incoming.max_tokens)
             : defaults[mod].max_tokens,
-        reasoning_effort: (incoming.reasoning_effort || defaults[mod].reasoning_effort).trim(),
+        reasoning_effort:
+          typeof incoming.reasoning_effort === 'string' && incoming.reasoning_effort.trim()
+            ? incoming.reasoning_effort.trim()
+            : defaults[mod].reasoning_effort,
       };
     }
   }

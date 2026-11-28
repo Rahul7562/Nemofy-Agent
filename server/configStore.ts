@@ -587,8 +587,9 @@ export function getDefaultAccessoriesConfig(): AccessoriesConfig {
 function normalizeAccessoryConfig(
   raw: Partial<AccessoryLLMConfig> | undefined,
   fallback: AccessoryLLMConfig,
+  customProviders?: CustomProviderConfig[],
 ): AccessoryLLMConfig {
-  const roleNormalized = normalizeRoleConfig(raw, fallback);
+  const roleNormalized = normalizeRoleConfig(raw, fallback, { customProviders });
   return {
     ...roleNormalized,
     enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : fallback.enabled,
@@ -1081,8 +1082,9 @@ export class WorkspaceAndConfigStore {
       }
     }
     const content = rawBuf.toString('utf-8');
+    const wsReal = this.getWorkspaceRealDir();
     return {
-      path: path.relative(this.workspaceDir, full).replace(/\\/g, '/'),
+      path: path.relative(wsReal, full).replace(/\\/g, '/'),
       content,
       size: stat.size,
       modifiedAt: stat.mtime.toISOString(),
@@ -1126,8 +1128,13 @@ export class WorkspaceAndConfigStore {
 
   createWorkspaceFolder(relPath: string): { path: string } {
     const full = this.resolveWorkspacePath(relPath);
+    const wsReal = this.getWorkspaceRealDir();
     fs.mkdirSync(full, { recursive: true });
-    return { path: path.relative(this.workspaceDir, full).replace(/\\/g, '/') };
+    const createdReal = fs.realpathSync(full);
+    if (createdReal !== wsReal && !createdReal.startsWith(wsReal + path.sep)) {
+      throw new Error('Resolved folder path escapes /workspace.');
+    }
+    return { path: path.relative(wsReal, createdReal).replace(/\\/g, '/') };
   }
 
   deleteWorkspaceEntry(relPath: string): void {
@@ -1367,9 +1374,9 @@ export class WorkspaceAndConfigStore {
         }),
         worker: normalizeRoleConfig(parsed.worker, defaults.worker, { customProviders }),
         accessories: {
-          image: normalizeAccessoryConfig(parsed.accessories?.image, defaults.accessories.image),
-          video: normalizeAccessoryConfig(parsed.accessories?.video, defaults.accessories.video),
-          audio: normalizeAccessoryConfig(parsed.accessories?.audio, defaults.accessories.audio),
+          image: normalizeAccessoryConfig(parsed.accessories?.image, defaults.accessories.image, customProviders),
+          video: normalizeAccessoryConfig(parsed.accessories?.video, defaults.accessories.video, customProviders),
+          audio: normalizeAccessoryConfig(parsed.accessories?.audio, defaults.accessories.audio, customProviders),
         },
         max_turns:
           typeof parsed.max_turns === 'number' && Number.isFinite(parsed.max_turns)
@@ -1417,9 +1424,9 @@ export class WorkspaceAndConfigStore {
       }),
       worker: normalizeRoleConfig(next.worker, current.worker, { customProviders }),
       accessories: {
-        image: normalizeAccessoryConfig(next.accessories?.image, current.accessories.image),
-        video: normalizeAccessoryConfig(next.accessories?.video, current.accessories.video),
-        audio: normalizeAccessoryConfig(next.accessories?.audio, current.accessories.audio),
+        image: normalizeAccessoryConfig(next.accessories?.image, current.accessories.image, customProviders),
+        video: normalizeAccessoryConfig(next.accessories?.video, current.accessories.video, customProviders),
+        audio: normalizeAccessoryConfig(next.accessories?.audio, current.accessories.audio, customProviders),
       },
       max_turns:
         typeof next.max_turns === 'number' && Number.isFinite(next.max_turns)
@@ -1572,7 +1579,8 @@ export class WorkspaceAndConfigStore {
   }
 
   deleteSkill(name: string): void {
-    const safeName = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_');
+    const safeName = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!safeName) return;
     const full = path.join(this.skillsDir, `${safeName}.md`);
     if (fs.existsSync(full)) fs.unlinkSync(full);
   }

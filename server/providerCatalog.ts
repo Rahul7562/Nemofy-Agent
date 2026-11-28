@@ -1380,7 +1380,8 @@ export async function listProviderModelsDirect(params: {
     };
   }
 
-  const allowLoopback = defaults?.requiresKey === false;
+  const allowLoopback =
+    defaults?.requiresKey === false || Boolean(params.customProvider && prov.startsWith('custom_'));
   const urlCheck = await validateOutboundProviderUrl(baseUrl, {
     allowLoopback,
     resolveDns: !params.fetchImpl,
@@ -1611,7 +1612,8 @@ export async function probeProviderModelDirect(params: {
   if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
     return { ...baseResult, error: `A valid http(s) Base URL is required for '${prov}'.` };
   }
-  const allowLoopback = defaults?.requiresKey === false;
+  const allowLoopback =
+    defaults?.requiresKey === false || Boolean(params.customProvider && prov.startsWith('custom_'));
   const urlCheck = await validateOutboundProviderUrl(baseUrl, {
     allowLoopback,
     resolveDns: !params.fetchImpl,

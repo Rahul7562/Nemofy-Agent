@@ -80,6 +80,61 @@ FIRECRAWL_DOCUMENT_MIME_TYPES: dict[str, str] = {
     ".epub": "application/epub+zip",
 }
 
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+_ALLOWED_CLI_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "FIRECRAWL_LOCAL_HOME",
+        "FIRECRAWL_CHROME_PATH",
+        "FIRECRAWL_LOCAL_BROWSER",
+    }
+)
+
+
+def is_loopback_firecrawl_url(raw_url: str | None) -> bool:
+    """Return True if raw_url points to a local loopback address."""
+    cleaned = (raw_url or "").strip()
+    if not cleaned:
+        return False
+    try:
+        parsed = urlparse(cleaned)
+        host = (parsed.hostname or "").strip().lower().strip("[]")
+        return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_firecrawl_cli_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a minimal, sanitized environment for local `firecrawl-local scrape` CLI invocations.
+
+    Strips loopback `FIRECRAWL_API_URL` (preventing self-forwarding recursion), disables cloud
+    forwarding (`FIRECRAWL_CLOUD=off`) for purely local document parsing, and omits unrelated
+    LLM API keys/secrets.
+    """
+    source = os.environ if env is None else env
+    clean: dict[str, str] = {}
+    for key in _ALLOWED_CLI_ENV_KEYS:
+        val = source.get(key)
+        if val is not None:
+            clean[key] = val
+    clean["FIRECRAWL_CLOUD"] = "off"
+    clean.pop("FIRECRAWL_API_URL", None)
+    return clean
+
 
 def is_firecrawl_document_path(path: str | Path) -> bool:
     """Return True if path has a PDF or Office document extension supported natively by firecrawl-local."""
@@ -645,6 +700,7 @@ class FirecrawlClient:
                 "--timeout",
                 str(timeout_ms),
                 ephemeral_url,
+                env=build_firecrawl_cli_subprocess_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

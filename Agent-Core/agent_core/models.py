@@ -432,12 +432,17 @@ def load_persisted_access_mode(config_path: Path | None = None) -> Literal["defa
     return "full_access" if raw == "full_access" else "default"
 
 
-def load_persisted_accessories_config(config_path: Path | None = None) -> dict[str, dict[str, Any]]:
+def load_persisted_accessories_config(
+    config_path: Path | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Load persisted Accessories configuration merged over sensible defaults."""
     from agent_core.multimodal import default_accessories_config
 
     defaults = default_accessories_config()
-    persisted = load_persisted_llm_config(config_path).get("accessories")
+    resolved_path = _resolve_llm_config_path(config_path, env=env)
+    persisted = load_persisted_llm_config(resolved_path).get("accessories")
     if not isinstance(persisted, dict):
         return defaults
     merged: dict[str, dict[str, Any]] = {}
@@ -445,6 +450,12 @@ def load_persisted_accessories_config(config_path: Path | None = None) -> dict[s
         base = dict(defaults[mod])
         raw_mod = persisted.get(mod)
         if isinstance(raw_mod, dict):
+            default_provider = canonicalize_provider(str(base.get("provider") or "openrouter"))
+            raw_provider = raw_mod.get("provider")
+            if raw_provider and canonicalize_provider(str(raw_provider)) != default_provider:
+                raw_base = raw_mod.get("base_url")
+                if not isinstance(raw_base, str) or not raw_base.strip():
+                    base.pop("base_url", None)
             for k, v in raw_mod.items():
                 if k != "api_key" and v is not None:
                     base[k] = v
@@ -460,7 +471,7 @@ def resolve_accessory_model_spec(
 ) -> tuple[ModelSpec, bool]:
     """Resolve an Accessory ModelSpec and enabled flag for image, video, or audio sub-agents."""
     source_env = dict(os.environ) if env is None else env
-    persisted = load_persisted_accessories_config().get(modality, {})
+    persisted = load_persisted_accessories_config(env=source_env).get(modality, {})
     merged: dict[str, Any] = dict(persisted)
 
     if isinstance(override, dict):
@@ -475,7 +486,19 @@ def resolve_accessory_model_spec(
 
     enabled = bool(merged.get("enabled", True))
     provider = canonicalize_provider(str(merged.get("provider") or "openrouter"))
-    default_base = PROVIDER_BASE_URLS.get(provider, "https://openrouter.ai/api/v1")
+    custom_prov = find_persisted_custom_provider(provider, env=source_env)
+    default_base = (
+        str(custom_prov.get("base_url") or "").strip()
+        if custom_prov
+        else PROVIDER_BASE_URLS.get(provider, "https://openrouter.ai/api/v1")
+    )
+    protocol = (
+        str(merged.get("protocol") or (custom_prov.get("protocol") if custom_prov else "") or "openai_compatible")
+        .strip()
+        .lower()
+    )
+    if protocol != "anthropic_compatible":
+        protocol = "openai_compatible"
     base_url = str(merged.get("base_url") or default_base).strip().rstrip("/")
     model = str(merged.get("model") or "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free").strip()
     explicit_key = str(merged.get("api_key") or "").strip() or None
@@ -483,7 +506,7 @@ def resolve_accessory_model_spec(
         provider,
         "WORKER_API_KEY",
         source_env,
-        allow_explicit_fallback=(provider == "custom"),
+        allow_explicit_fallback=is_custom_provider_id(provider),
     )
     temperature = _parse_float(str(merged.get("temperature", 0.2)), 0.2, min_val=0.0)
     max_tokens = _parse_int(str(merged.get("max_tokens", 4096)), 4096, min_val=64)
@@ -509,6 +532,7 @@ def resolve_accessory_model_spec(
         timeout_seconds=timeout_seconds,
         max_retries=max_retries,
         reasoning_effort=reasoning_effort,
+        protocol=protocol,
     )
     return spec, enabled
 
@@ -1602,11 +1626,15 @@ def build_chat_model(
 ) -> BaseChatModel:
     """Instantiate a LangChain OpenAI-compatible chat model for the requested role."""
     resolved = spec or load_model_spec(role, include_persisted=True)
-    needs_key = require_api_key and resolved.provider not in LOCAL_NO_KEY_PROVIDERS
+    is_named_custom = resolved.provider.startswith("custom_")
+    needs_key = require_api_key and resolved.provider not in LOCAL_NO_KEY_PROVIDERS and not is_named_custom
     if needs_key and not (resolved.api_key and resolved.api_key.strip()):
-        expected_vars = ", ".join(
-            PROVIDER_ENV_KEY_MAP.get(resolved.provider, ("RIVER_AI_API", "OPENAI_API_KEY"))
+        expected_tuple = (
+            (custom_provider_env_var(resolved.provider),)
+            if is_named_custom
+            else PROVIDER_ENV_KEY_MAP.get(resolved.provider, ("RIVER_AI_API", "OPENAI_API_KEY"))
         )
+        expected_vars = ", ".join(expected_tuple)
         raise ModelConfigurationError(
             f"Missing API key for {resolved.role} model '{resolved.model}' "
             f"(provider='{resolved.provider}'). Set {expected_vars} in your environment."
@@ -1738,15 +1766,21 @@ def _is_likely_chat_llm(model_id: str, raw_item: dict[str, Any]) -> bool:
     return not any(kw in lowered for kw in _NON_CHAT_MODEL_KEYWORDS)
 
 
-def _build_provider_headers(provider: str, api_key: str | None) -> dict[str, str]:
+def _build_provider_headers(
+    provider: str,
+    api_key: str | None,
+    *,
+    protocol: str | None = None,
+) -> dict[str, str]:
     headers: dict[str, str] = {"Accept": "application/json"}
     prov = canonicalize_provider(provider)
+    is_anthropic = prov == "anthropic" or (protocol or "").strip().lower() == "anthropic_compatible"
     if api_key and api_key.strip():
         clean_key = api_key.strip()
         headers["Authorization"] = f"Bearer {clean_key}"
-        if prov == "anthropic":
+        if is_anthropic:
             headers["x-api-key"] = clean_key
-    if prov == "anthropic":
+    if is_anthropic:
         headers["anthropic-version"] = "2023-06-01"
     return headers
 
@@ -1884,7 +1918,12 @@ def _is_non_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
     )
 
 
-def _validate_outbound_provider_url(url: str, provider: str) -> tuple[bool, str | None]:
+def _validate_outbound_provider_url(
+    url: str,
+    provider: str,
+    *,
+    allow_loopback_override: bool = False,
+) -> tuple[bool, str | None]:
     """Validate that a provider base URL is safe for server-side outbound HTTP requests."""
     cleaned = (url or "").strip()
     parsed = urlparse(cleaned)
@@ -1894,7 +1933,7 @@ def _validate_outbound_provider_url(url: str, provider: str) -> tuple[bool, str 
         return False, "Provider Base URL must not contain embedded credentials."
 
     host = parsed.hostname.lower().rstrip(".")
-    allow_loopback = canonicalize_provider(provider) in LOCAL_NO_KEY_PROVIDERS
+    allow_loopback = allow_loopback_override or canonicalize_provider(provider) in LOCAL_NO_KEY_PROVIDERS
 
     if host in ("localhost",) or host.endswith(".localhost"):
         if not allow_loopback:
@@ -1965,7 +2004,14 @@ async def list_provider_models(
     """Query the selected provider's models endpoint and extract available LLM model IDs."""
     source_env = dict(os.environ) if env is None else env
     prov = canonicalize_provider(provider)
-    resolved_base = (base_url or PROVIDER_BASE_URLS.get(prov) or "").strip().rstrip("/")
+    custom_prov = find_persisted_custom_provider(prov, env=source_env)
+    resolved_base = (
+        base_url
+        or (str(custom_prov.get("base_url") or "") if custom_prov else "")
+        or PROVIDER_BASE_URLS.get(prov)
+        or ""
+    ).strip().rstrip("/")
+    protocol = str(custom_prov.get("protocol") or "openai_compatible") if custom_prov else "openai_compatible"
     role_env_var = "WORKER_API_KEY" if role == "worker" else "PRIMARY_API_KEY"
     explicit_key = api_key.strip() if api_key and api_key.strip() else ""
     server_env_key = (
@@ -1979,7 +2025,11 @@ async def list_provider_models(
         )
     )
 
-    url_ok, url_err = _validate_outbound_provider_url(resolved_base, prov)
+    url_ok, url_err = _validate_outbound_provider_url(
+        resolved_base,
+        prov,
+        allow_loopback_override=bool(custom_prov and prov.startswith("custom_")),
+    )
     if not url_ok:
         return {
             "ok": False,
@@ -2014,7 +2064,7 @@ async def list_provider_models(
         "error": None,
     }
 
-    headers = _build_provider_headers(prov, resolved_key)
+    headers = _build_provider_headers(prov, resolved_key, protocol=protocol)
     models_url = f"{resolved_base}/models"
 
     try:
@@ -2095,7 +2145,16 @@ async def probe_model_connectivity(
         "error": None,
     }
 
-    url_ok, url_err = _validate_outbound_provider_url(resolved.base_url, resolved.provider)
+    custom_prov = (
+        find_persisted_custom_provider(resolved.provider)
+        if resolved.provider.startswith("custom_")
+        else None
+    )
+    url_ok, url_err = _validate_outbound_provider_url(
+        resolved.base_url,
+        resolved.provider,
+        allow_loopback_override=bool(custom_prov),
+    )
     if not url_ok:
         result["error"] = url_err
         return result
@@ -2113,12 +2172,14 @@ async def probe_model_connectivity(
         )
         return result
 
-    headers = _build_provider_headers(resolved.provider, effective_key)
+    headers = _build_provider_headers(resolved.provider, effective_key, protocol=resolved.protocol)
     models_url = f"{resolved.base_url}/models"
-    needs_key = resolved.provider not in LOCAL_NO_KEY_PROVIDERS
+    needs_key = resolved.provider not in LOCAL_NO_KEY_PROVIDERS and not resolved.provider.startswith("custom_")
     has_key = bool(effective_key and effective_key.strip())
-    env_hint = ", ".join(
-        PROVIDER_ENV_KEY_MAP.get(resolved.provider, ("PRIMARY_API_KEY",))
+    env_hint = (
+        custom_provider_env_var(resolved.provider)
+        if resolved.provider.startswith("custom_")
+        else ", ".join(PROVIDER_ENV_KEY_MAP.get(resolved.provider, ("PRIMARY_API_KEY",)))
     )
 
     try:

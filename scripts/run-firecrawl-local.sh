@@ -49,6 +49,20 @@ export FIRECRAWL_LOCAL_BROWSER="${FIRECRAWL_LOCAL_BROWSER:-auto}"
 export FIRECRAWL_LOCAL_HOME="${FIRECRAWL_LOCAL_HOME:-${ROOT_DIR}/data/firecrawl-local}"
 mkdir -p "${FIRECRAWL_LOCAL_HOME}"
 
+# Prevent infinite self-forwarding recursion: Nemofy sets FIRECRAWL_API_URL for the Python client
+# (e.g. http://127.0.0.1:3002), whereas firecrawl-local treats FIRECRAWL_API_URL as the upstream
+# cloud endpoint for /v2/search and /v2/extract.
+if [ -n "${FIRECRAWL_API_URL:-}" ]; then
+  case "${FIRECRAWL_API_URL}" in
+    http://127.0.0.1*|https://127.0.0.1*|http://localhost*|https://localhost*|http://\[::1\]*|https://\[::1\]*|http://0.0.0.0*|https://0.0.0.0*|http://"${HOST}":"${PORT}"*|https://"${HOST}":"${PORT}"*)
+      unset FIRECRAWL_API_URL
+      ;;
+  esac
+fi
+if [ -n "${FIRECRAWL_CLOUD_API_URL:-}" ]; then
+  export FIRECRAWL_API_URL="${FIRECRAWL_CLOUD_API_URL}"
+fi
+
 ARGS=("serve" "--host" "${HOST}" "--port" "${PORT}")
 if [ -n "${FIRECRAWL_LOCAL_TOKEN:-}" ]; then
   ARGS+=("--token" "${FIRECRAWL_LOCAL_TOKEN}")

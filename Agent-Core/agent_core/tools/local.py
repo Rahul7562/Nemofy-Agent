@@ -262,6 +262,21 @@ def _parse_llm_json_payload(raw_text: str) -> Any:
         return json.loads(cleaned[start : end + 1])
 
 
+def _extract_message_text(raw_content: Any) -> str:
+    """Safely extract text from LangChain message content (string or structured content blocks)."""
+    if isinstance(raw_content, list):
+        parts: list[str] = []
+        for part in raw_content:
+            if isinstance(part, dict):
+                text_val = part.get("text")
+                if text_val is not None:
+                    parts.append(str(text_val))
+            elif part is not None:
+                parts.append(str(part))
+        return "".join(parts)
+    return str(raw_content or "")
+
+
 async def extract_structured_with_llm(
     fetched_pages: list[tuple[str, str]],
     *,
@@ -283,8 +298,9 @@ async def extract_structured_with_llm(
     sys_msg = SystemMessage(
         content=(
             "You are a precise structured data extraction engine. "
-            "Extract ONLY facts explicitly present in the provided source pages. "
-            "Do not fabricate values; use null if a field is absent. "
+            "Extract facts explicitly present in the provided source pages, including any Page Title "
+            "and Page Description metadata headers. "
+            "Do not fabricate values; use null only if a field is genuinely absent from both metadata and body. "
             "Return ONLY valid JSON with no surrounding commentary or markdown fences."
             + schema_instruction
         )
@@ -294,14 +310,7 @@ async def extract_structured_with_llm(
     )
 
     response = await model.ainvoke([sys_msg, user_msg])
-    raw_content = getattr(response, "content", response)
-    if isinstance(raw_content, list):
-        raw_text = "".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part)
-            for part in raw_content
-        )
-    else:
-        raw_text = str(raw_content or "")
+    raw_text = _extract_message_text(getattr(response, "content", response))
 
     try:
         return _parse_llm_json_payload(raw_text)
@@ -314,8 +323,7 @@ async def extract_structured_with_llm(
             )
         )
         repaired = await model.ainvoke([sys_msg, repair_msg])
-        rep_content = getattr(repaired, "content", repaired)
-        rep_text = str(rep_content or "")
+        rep_text = _extract_message_text(getattr(repaired, "content", repaired))
         return _parse_llm_json_payload(rep_text)
 
 
@@ -669,8 +677,27 @@ def build_local_tools(
                 try:
                     scraped = await fc_client.scrape(target, only_main_content=True)
                     md = str(scraped.get("markdown") or "").strip()
-                    if md:
-                        scraped_pages.append((str(scraped.get("url") or target), md))
+                    if not md:
+                        # Retry full-page scrape when main-content extraction stripped everything
+                        scraped_full = await fc_client.scrape(target, only_main_content=False)
+                        if str(scraped_full.get("markdown") or "").strip():
+                            scraped = scraped_full
+                            md = str(scraped.get("markdown") or "").strip()
+                    meta_obj = scraped.get("metadata") if isinstance(scraped.get("metadata"), dict) else {}
+                    title = str(scraped.get("title") or meta_obj.get("title") or "").strip()
+                    desc = str(scraped.get("description") or meta_obj.get("description") or "").strip()
+                    meta_lines: list[str] = []
+                    if title:
+                        meta_lines.append(f"Page Title: {title}")
+                    if desc:
+                        meta_lines.append(f"Page Description: {desc}")
+                    if meta_lines or md:
+                        body_parts = ["\n".join(meta_lines)] if meta_lines else []
+                        if md:
+                            body_parts.append(md)
+                        scraped_pages.append(
+                            (str(scraped.get("url") or target), "\n\n".join(body_parts))
+                        )
                 except FirecrawlError as scrape_exc:
                     return f"ERROR [firecrawl/{scrape_exc.category}]: {scrape_exc}"
 
